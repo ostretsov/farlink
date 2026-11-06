@@ -5,7 +5,7 @@
 use crate::codec::{Frame, MonitorEncoder, prepare};
 use crate::config::{HostConfig, save_json};
 use crate::desktop::{Desktop, TestPattern, open_desktop};
-use crate::proto::{AgentMsg, MonitorInfo, SessionMsg};
+use crate::proto::{AgentMsg, MonitorInfo, PREVIEW_MAX, PreviewShot, SessionMsg};
 use crate::quality::Quality;
 use crate::update::EXIT_UPDATED;
 use crate::util::{current_target, hostname, os_label, url_encode, ws_url};
@@ -20,6 +20,8 @@ use tokio_tungstenite::tungstenite::Message;
 /// How often the host asks for updates on its own (the server also pushes).
 const UPDATE_CHECK: Duration = Duration::from_secs(6 * 3600);
 const HEARTBEAT: Duration = Duration::from_secs(30);
+/// A screen still for this long gets its rough JPEG parts sent again sharp.
+const REFINE_AFTER: Duration = Duration::from_millis(300);
 
 #[derive(Clone)]
 pub struct HostOptions {
@@ -68,7 +70,7 @@ async fn agent_connection(
     last_update_check: &mut Instant,
 ) -> Result<Option<i32>> {
     let url = ws_url(&cfg.server_url, "/ws/agent");
-    let (ws, _) = tokio_tungstenite::connect_async(url.as_str()).await.with_context(|| format!("connecting to {url}"))?;
+    let (ws, _) = tokio_tungstenite::connect_async_with_config(url.as_str(), None, true).await.with_context(|| format!("connecting to {url}"))?;
     let (mut sink, mut stream) = ws.split();
     let demo = opts.demo;
     let monitors = tokio::task::spawn_blocking(move || current_monitors(demo)).await.unwrap_or_default();
@@ -85,10 +87,19 @@ async fn agent_connection(
     sink.send(Message::Text(serde_json::to_string(&register)?.into())).await?;
     log::info!("connected to {}", cfg.server_url);
 
+    // Preview pictures are taken on their own thread (screen APIs block).
+    let (preview_tx, preview_rx) = std::sync::mpsc::channel::<u32>();
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<AgentMsg>();
+    std::thread::Builder::new().name("preview".into()).spawn(move || preview_worker(demo, preview_rx, reply_tx))?;
+
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
     heartbeat.tick().await;
     loop {
         tokio::select! {
+            reply = reply_rx.recv() => {
+                let Some(reply) = reply else { continue };
+                sink.send(Message::Text(serde_json::to_string(&reply)?.into())).await?;
+            }
             msg = stream.next() => {
                 let Some(msg) = msg else { return Ok(None) };
                 let text = match msg? {
@@ -123,11 +134,27 @@ async fn agent_connection(
                             }
                         });
                     }
-                    AgentMsg::UpdateAvailable { version } => {
-                        if !opts.no_update && crate::version::is_newer(&version, crate::VERSION)
-                            && let Some(code) = try_update(&cfg.server_url).await {
-                                return Ok(Some(code));
+                    AgentMsg::PreviewRequest { req } => {
+                        let _ = preview_tx.send(req);
+                    }
+                    AgentMsg::UpdateAvailable { version, force } => {
+                        if !force && (opts.no_update || !crate::version::is_newer(&version, crate::VERSION)) {
+                            continue;
+                        }
+                        let result = if opts.no_update {
+                            Err("updates are switched off on this computer".to_string())
+                        } else {
+                            run_update(&cfg.server_url, force).await
+                        };
+                        match result {
+                            Ok(Some(code)) => return Ok(Some(code)),
+                            Ok(None) => {}
+                            Err(error) => {
+                                log::warn!("update to {version} failed: {error}");
+                                let msg = AgentMsg::UpdateFailed { version, error };
+                                sink.send(Message::Text(serde_json::to_string(&msg)?.into())).await?;
                             }
+                        }
                     }
                     _ => {}
                 }
@@ -146,19 +173,86 @@ async fn agent_connection(
     }
 }
 
-async fn try_update(server: &str) -> Option<i32> {
-    let server = server.to_string();
-    match tokio::task::spawn_blocking(move || crate::update::update_self(&server, "farlink-host")).await {
-        Ok(Ok(Some(v))) => {
-            log::info!("updated to {v}, restarting");
-            Some(EXIT_UPDATED)
+/// Keep the desktop open this long after the last preview (Windows screen
+/// capture takes a moment to start; previews come every few seconds).
+const PREVIEW_KEEP_OPEN: Duration = Duration::from_secs(60);
+
+/// Answers [`AgentMsg::PreviewRequest`]s until the connection ends.
+fn preview_worker(demo: bool, rx: std::sync::mpsc::Receiver<u32>, tx: tokio::sync::mpsc::UnboundedSender<AgentMsg>) {
+    let mut desk: Option<Box<dyn Desktop>> = None;
+    loop {
+        let first = match rx.recv_timeout(PREVIEW_KEEP_OPEN) {
+            Ok(req) => req,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                desk = None;
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+        // Requests that piled up meanwhile all get the same pictures.
+        let reqs: Vec<u32> = std::iter::once(first).chain(rx.try_iter()).collect();
+        if desk.is_none() {
+            desk = desktop(demo).map_err(|e| log::debug!("preview: {e:#}")).ok();
         }
-        Ok(Ok(None)) => None,
-        Ok(Err(e)) => {
-            log::warn!("update failed: {e:#}");
+        let shots = match desk.as_mut().map(|d| preview_shots(d.as_mut())) {
+            Some(Ok(s)) => s,
+            Some(Err(e)) => {
+                log::debug!("preview: {e:#}");
+                desk = None; // e.g. the desktop switched; open it again next time
+                Vec::new()
+            }
+            None => Vec::new(),
+        };
+        for req in reqs {
+            if tx.send(AgentMsg::Preview { req, shots: shots.clone() }).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// Small JPEG pictures of every monitor.
+pub fn preview_shots(desk: &mut dyn Desktop) -> Result<Vec<PreviewShot>> {
+    let _ = desk.changed(); // lets change-tracking capture (DXGI) take the newest picture
+    let mut shots = Vec::new();
+    for m in desk.monitors()? {
+        let frame = desk.capture(&m)?;
+        let (width, height, jpeg) = crate::codec::thumbnail_jpeg(&frame, PREVIEW_MAX, 70)?;
+        shots.push(PreviewShot { index: m.index, width, height, jpeg: crate::util::base64_encode(&jpeg) });
+    }
+    Ok(shots)
+}
+
+/// Regular update check: logs failures, returns the exit code if updated.
+async fn try_update(server: &str) -> Option<i32> {
+    match run_update(server, false).await {
+        Ok(code) => code,
+        Err(e) => {
+            log::warn!("update failed: {e}");
             None
         }
-        Err(_) => None,
+    }
+}
+
+/// Update to the published version (`force`: even if not newer). Returns
+/// [`EXIT_UPDATED`] after installing it.
+async fn run_update(server: &str, force: bool) -> Result<Option<i32>, String> {
+    let server = server.to_string();
+    let job = tokio::task::spawn_blocking(move || {
+        if force {
+            crate::update::install_published(&server, "farlink-host").map(Some)
+        } else {
+            crate::update::update_self(&server, "farlink-host")
+        }
+    });
+    match job.await {
+        Ok(Ok(Some(v))) => {
+            log::info!("updated to {v}, restarting");
+            Ok(Some(EXIT_UPDATED))
+        }
+        Ok(Ok(None)) => Ok(None),
+        Ok(Err(e)) => Err(format!("{e:#}")),
+        Err(e) => Err(format!("{e}")),
     }
 }
 
@@ -168,7 +262,7 @@ pub async fn run_session(server: String, machine_id: String, secret: String, ses
         &server,
         &format!("/ws/host-session/{}?machine={}&secret={}", url_encode(&session_id), url_encode(&machine_id), url_encode(&secret)),
     );
-    let (ws, _) = tokio_tungstenite::connect_async(url.as_str()).await.context("opening session")?;
+    let (ws, _) = tokio_tungstenite::connect_async_with_config(url.as_str(), None, true).await.context("opening session")?;
     let (mut sink, mut stream) = ws.split();
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<SessionMsg>();
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(32);
@@ -259,6 +353,8 @@ pub fn screen_loop(
     let mut encoders: Vec<MonitorEncoder> = monitors.iter().map(|_| MonitorEncoder::default()).collect();
     // Last full-size picture per monitor: unchanged screens are not scaled or encoded.
     let mut prev_raw: Vec<Option<Frame>> = monitors.iter().map(|_| None).collect();
+    // When each monitor's picture last changed (rough parts are sharpened after a pause).
+    let mut last_change: Vec<Instant> = monitors.iter().map(|_| Instant::now()).collect();
     // Monitors the viewer has on screen (None = all).
     let mut watch: Option<Vec<u8>> = None;
     let mut idle = IdleTracker::new(Instant::now());
@@ -316,6 +412,7 @@ pub fn screen_loop(
                 monitors = now;
                 encoders = monitors.iter().map(|_| MonitorEncoder::default()).collect();
                 prev_raw = monitors.iter().map(|_| None).collect();
+                last_change = monitors.iter().map(|_| Instant::now()).collect();
                 if !send_json(&SessionMsg::Monitors { monitors: monitors.clone() }) {
                     return;
                 }
@@ -333,6 +430,34 @@ pub fn screen_loop(
             acked = last_sent;
         }
         waiting_since = None;
+
+        // Auto quality: parts first sent as rough JPEG (photos, video) are
+        // sent again sharp once that screen has been still for a moment.
+        let mut refined = false;
+        for (i, m) in monitors.iter().enumerate() {
+            if watch.as_ref().is_some_and(|w| !w.contains(&m.index))
+                || !encoders[i].needs_refine()
+                || last_change[i].elapsed() < REFINE_AFTER
+            {
+                continue;
+            }
+            seq = seq.wrapping_add(1).max(1);
+            match encoders[i].refine(&quality, m.index, seq) {
+                Ok(msgs) => {
+                    for msg in msgs {
+                        refined = true;
+                        if tx.blocking_send(Message::Binary(msg.into())).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => log::warn!("encode: {e}"),
+            }
+        }
+        if refined {
+            last_sent = seq;
+            continue; // flow control first, then look at the screen again
+        }
 
         // Nothing changed on screen (X11 tells us), and no safety re-check is
         // due: don't even read the screen.
@@ -368,13 +493,21 @@ pub fn screen_loop(
                     continue;
                 }
             };
-            if prev_raw[i].as_ref() == Some(&frame) {
-                continue; // identical picture: skip scaling and compression
-            }
-            let prepared = prepare(&frame, &quality);
-            prev_raw[i] = Some(frame);
+            let prepared = if quality.scale_pct >= 100 && quality.color == crate::quality::ColorDepth::Full {
+                frame // nothing to prepare; the encoder skips unchanged parts itself
+            } else {
+                if prev_raw[i].as_ref() == Some(&frame) {
+                    continue; // identical picture: skip scaling and compression
+                }
+                let prepared = prepare(&frame, &quality);
+                prev_raw[i] = Some(frame);
+                prepared
+            };
             match encoders[i].encode(prepared, &quality, m.index, seq) {
                 Ok(msgs) => {
+                    if !msgs.is_empty() {
+                        last_change[i] = Instant::now();
+                    }
                     for msg in msgs {
                         sent_any = true;
                         if tx.blocking_send(Message::Binary(msg.into())).is_err() {
@@ -735,5 +868,43 @@ mod tests {
         assert_eq!(tile_monitors(&one), HashSet::from([1]), "screen 1 window closed: not captured");
         let none = run_loop(vec![SessionMsg::Quality { quality: fast }, SessionMsg::Watch { monitors: vec![] }], 400);
         assert!(tile_monitors(&none).is_empty(), "all windows minimised: nothing captured");
+    }
+
+    #[test]
+    fn preview_has_a_small_picture_of_every_screen() {
+        let mut desk = TestPattern::dual();
+        let shots = preview_shots(&mut desk).unwrap();
+        assert_eq!(shots.iter().map(|s| (s.index, s.width, s.height)).collect::<Vec<_>>(), vec![(0, 480, 270), (1, 480, 384)]);
+        for s in &shots {
+            let jpeg = crate::util::base64_decode(&s.jpeg).unwrap();
+            let f = crate::codec::decode_tile(crate::proto::TileFormat::Jpeg, &jpeg).unwrap();
+            assert_eq!((f.width, f.height), (s.width, s.height));
+            assert!(jpeg.len() < 100_000, "previews stay small: {} bytes", jpeg.len());
+        }
+    }
+
+    #[test]
+    fn preview_worker_answers_every_request_and_stops_with_the_connection() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Several requests at once share one set of pictures.
+        for req in [7, 8, 9] {
+            tx.send(req).unwrap();
+        }
+        let th = std::thread::spawn(move || preview_worker(true, rx, out_tx));
+        let mut answered = Vec::new();
+        for _ in 0..3 {
+            match out_rx.blocking_recv().unwrap() {
+                AgentMsg::Preview { req, shots } => {
+                    assert_eq!(shots.len(), 2);
+                    answered.push(req);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(answered, vec![7, 8, 9]);
+        drop(tx);
+        th.join().unwrap();
+        assert!(out_rx.blocking_recv().is_none(), "worker ended when the connection went away");
     }
 }

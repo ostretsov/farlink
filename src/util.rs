@@ -73,6 +73,42 @@ pub fn url_encode(s: &str) -> String {
     out
 }
 
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64 with padding (small pictures inside JSON).
+pub fn base64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            if i <= c.len() {
+                out.push(B64[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// Decode [`base64_encode`]'s output. `None` for anything malformed.
+pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim_end_matches('=').as_bytes();
+    if s.len() % 4 == 1 {
+        return None;
+    }
+    let val = |b: u8| B64.iter().position(|&x| x == b).map(|v| v as u32);
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    for c in s.chunks(4) {
+        let mut n = 0u32;
+        for (i, &b) in c.iter().enumerate() {
+            n |= val(b)? << (18 - 6 * i);
+        }
+        out.extend_from_slice(&n.to_be_bytes()[1..c.len()]);
+    }
+    Some(out)
+}
+
 /// Human friendly "in 2 h 5 min" / "3 min ago" text.
 pub fn human_duration(secs: u64) -> String {
     if secs < 60 {
@@ -250,5 +286,19 @@ mod tests {
     fn exe_names() {
         assert_eq!(exe_name("farlink-host", "x86_64-pc-windows-gnu"), "farlink-host.exe");
         assert_eq!(exe_name("farlink-host", "x86_64-unknown-linux-gnu"), "farlink-host");
+    }
+
+    #[test]
+    fn base64_round_trip() {
+        assert_eq!(base64_encode(b"Man"), "TWFu");
+        assert_eq!(base64_encode(b"Ma"), "TWE=");
+        assert_eq!(base64_encode(b"M"), "TQ==");
+        assert_eq!(base64_encode(b""), "");
+        for n in 0..300usize {
+            let data: Vec<u8> = (0..n).map(|i| (i * 37 % 256) as u8).collect();
+            assert_eq!(base64_decode(&base64_encode(&data)).unwrap(), data);
+        }
+        assert!(base64_decode("T").is_none());
+        assert!(base64_decode("T!==").is_none());
     }
 }

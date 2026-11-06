@@ -1,7 +1,8 @@
 //! Desktop viewer networking: the server API and live sessions.
 
 use crate::codec::Canvas;
-use crate::proto::{FileChunk, FsEntry, MonitorInfo, SessionMsg, TileHeader};
+use crate::codec::Frame;
+use crate::proto::{FileChunk, FsEntry, MonitorInfo, PREVIEW_MAX, Preview, PreviewShot, SessionMsg, TileHeader};
 use crate::quality::Quality;
 use crate::server::Overview;
 use crate::util::{url_encode, ws_url};
@@ -66,6 +67,19 @@ impl Api {
         Ok(r.body_mut().read_json()?)
     }
 
+    /// Small pictures of a computer's screens (taken by its helper right now).
+    pub fn preview(&self, machine_id: &str) -> Result<Preview> {
+        let mut r = ureq::get(&self.url(&format!("/api/machines/{}/preview", url_encode(machine_id))))
+            .header("Authorization", &self.auth())
+            .call()
+            .map_err(|e| match e {
+                ureq::Error::StatusCode(503) => anyhow!("This computer is offline right now"),
+                ureq::Error::StatusCode(504) => anyhow!("No preview from this computer (its helper may be too old)"),
+                e => api_error(e),
+            })?;
+        Ok(r.body_mut().read_json()?)
+    }
+
     pub fn create_grant(&self, machine_id: &str, minutes: u64, view_only: bool, label: &str) -> Result<String> {
         let mut r = ureq::post(&self.url("/api/grants"))
             .header("Authorization", &self.auth())
@@ -84,6 +98,39 @@ impl Api {
         Ok(())
     }
 
+    /// Make a computer's helper install the published version now
+    /// (administrator only). Returns that version.
+    pub fn update_machine(&self, machine_id: &str) -> Result<String> {
+        let v = self.post_reading_error(&format!("/api/machines/{}/update", url_encode(machine_id)))?;
+        v["version"].as_str().map(str::to_string).context("unexpected server answer")
+    }
+
+    /// Update every online helper older than the published version. Returns how many.
+    pub fn update_all(&self) -> Result<u64> {
+        let v = self.post_reading_error("/api/machines/update-all")?;
+        v["updating"].as_u64().context("unexpected server answer")
+    }
+
+    /// POST without a body; a refusal shows the server's own explanation.
+    fn post_reading_error(&self, path: &str) -> Result<serde_json::Value> {
+        let mut r = ureq::post(&self.url(path))
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .header("Authorization", &self.auth())
+            .send_empty()
+            .map_err(api_error)?;
+        let status = r.status().as_u16();
+        let v: serde_json::Value = r.body_mut().read_json().unwrap_or_default();
+        match status {
+            200..=299 => Ok(v),
+            _ => match v["error"].as_str() {
+                Some(e) => Err(anyhow!("{e}")),
+                None => Err(api_error(ureq::Error::StatusCode(status))),
+            },
+        }
+    }
+
     pub fn revoke(&self, token: &str) -> Result<()> {
         ureq::delete(&self.url(&format!("/api/grants/{token}"))).header("Authorization", &self.auth()).call().map_err(api_error)?;
         Ok(())
@@ -92,6 +139,31 @@ impl Api {
     pub fn logout(&self) {
         let _ = ureq::post(&self.url("/api/logout")).header("Authorization", &self.auth()).send_empty();
     }
+}
+
+/// Decode the pictures of a [`Preview`] (broken ones are left out).
+pub fn decode_preview(p: &Preview) -> Vec<(u8, Frame)> {
+    p.shots
+        .iter()
+        .filter_map(|s| {
+            let jpeg = crate::util::base64_decode(&s.jpeg)?;
+            let f = crate::codec::decode_tile(crate::proto::TileFormat::Jpeg, &jpeg).ok()?;
+            Some((s.index, f))
+        })
+        .collect()
+}
+
+/// Preview of a sample computer (demo mode): the fake desktop of each monitor.
+pub fn demo_preview(monitors: &[MonitorInfo], tick: u32) -> Preview {
+    let shots = monitors
+        .iter()
+        .filter_map(|m| {
+            let f = crate::desktop::TestPattern::render(m, tick, Some((m.width as i32 / 2, m.height as i32 / 2)));
+            let (width, height, jpeg) = crate::codec::thumbnail_jpeg(&f, PREVIEW_MAX, 70).ok()?;
+            Some(PreviewShot { index: m.index, width, height, jpeg: crate::util::base64_encode(&jpeg) })
+        })
+        .collect();
+    Preview { taken: crate::util::now_secs(), shots }
 }
 
 /// A temporary access link: `https://server/g/<token>`.
@@ -288,6 +360,13 @@ impl SessionShared {
 
     /// Apply one incoming message. Returns a reply to send (ack / refresh).
     pub fn apply(&mut self, msg: &Message, quality: &Quality) -> Vec<SessionMsg> {
+        self.apply_decoded(msg, None, quality)
+    }
+
+    /// Like [`apply`](Self::apply), with the picture part already decoded by
+    /// [`decode_picture`] (done before taking the lock, so the UI never waits
+    /// for decoding).
+    pub fn apply_decoded(&mut self, msg: &Message, decoded: Option<crate::codec::Frame>, quality: &Quality) -> Vec<SessionMsg> {
         let mut replies = Vec::new();
         match msg {
             Message::Text(t) => match serde_json::from_str::<SessionMsg>(t) {
@@ -318,8 +397,9 @@ impl SessionShared {
                 if let Some((c, data)) = FileChunk::decode(b) {
                     self.file_chunk(c, data);
                 } else if let Some((h, data)) = TileHeader::decode(b) {
-                    if let Err(e) = self.canvases.entry(h.monitor).or_default().apply(&h, data) {
-                        log::debug!("bad tile: {e}");
+                    match decoded.map(Ok).unwrap_or_else(|| crate::codec::decode_tile(h.format, data)) {
+                        Ok(tile) => self.canvases.entry(h.monitor).or_default().apply_tile(&h, &tile),
+                        Err(e) => log::debug!("bad tile: {e}"),
                     }
                     if h.is_last() {
                         self.window_frames += 1;
@@ -340,6 +420,16 @@ impl SessionShared {
         }
         replies
     }
+}
+
+/// Decode the picture in a binary message (`None` for anything else).
+pub fn decode_picture(msg: &Message) -> Option<crate::codec::Frame> {
+    let Message::Binary(b) = msg else { return None };
+    if FileChunk::decode(b).is_some() {
+        return None;
+    }
+    let (h, data) = TileHeader::decode(b)?;
+    crate::codec::decode_tile(h.format, data).ok()
 }
 
 /// Handle the UI keeps for an open session.
@@ -504,7 +594,7 @@ async fn network_task(
             s.state = ConnState::Closed(reason);
         }
     };
-    let ws = match tokio_tungstenite::connect_async(url.as_str()).await {
+    let ws = match tokio_tungstenite::connect_async_with_config(url.as_str(), None, true).await {
         Ok((ws, _)) => ws,
         Err(e) => {
             close(match e {
@@ -527,7 +617,8 @@ async fn network_task(
                     Some(Err(_)) | None => { close("Connection lost".into()); break; }
                 };
                 if let Message::Close(_) = msg { close("Connection closed".into()); break; }
-                let replies = shared.lock().unwrap().apply(&msg, &quality);
+                let decoded = decode_picture(&msg);
+                let replies = shared.lock().unwrap().apply_decoded(&msg, decoded, &quality);
                 for r in replies {
                     if sink.send(Message::Text(serde_json::to_string(&r).unwrap().into())).await.is_err() { break; }
                 }
@@ -574,7 +665,8 @@ async fn demo_task(
         tokio::select! {
             out = out_rx.recv() => match out {
                 Some(msg) => {
-                    let replies = shared.lock().unwrap().apply(&msg, &quality);
+                    let decoded = decode_picture(&msg);
+                    let replies = shared.lock().unwrap().apply_decoded(&msg, decoded, &quality);
                     for r in replies { let _ = cmd_tx.send(r); }
                     repaint();
                 }
@@ -676,5 +768,17 @@ mod tests {
         let closed = SessionMsg::Closed { reason: "bye".into() };
         s.apply(&Message::Text(serde_json::to_string(&closed).unwrap().into()), &q);
         assert_eq!(s.state, ConnState::Closed("bye".into()));
+    }
+
+    #[test]
+    fn demo_previews_decode_and_broken_pictures_are_skipped() {
+        let mons = crate::desktop::TestPattern::dual().monitors;
+        let mut p = demo_preview(&mons, 1);
+        assert_eq!(p.shots.len(), 2);
+        let frames = decode_preview(&p);
+        assert_eq!(frames.iter().map(|(i, f)| (*i, f.width, f.height)).collect::<Vec<_>>(), vec![(0, 480, 270), (1, 480, 384)]);
+        p.shots[0].jpeg = "not base64!".into();
+        p.shots[1].jpeg = crate::util::base64_encode(b"not a jpeg");
+        assert!(decode_preview(&p).is_empty());
     }
 }

@@ -22,6 +22,11 @@ pub struct UpdateInfo {
 /// Ask the server what is published for `app` on this platform.
 /// Returns `Some` only if it is newer than the running version.
 pub fn check(server: &str, app: &str, target: &str, installed: &str) -> Result<Option<UpdateInfo>> {
+    Ok(published(server, app, target)?.filter(|info| crate::version::is_newer(&info.version, installed)))
+}
+
+/// What the server publishes for `app` on `target` (`None`: nothing for this platform).
+pub fn published(server: &str, app: &str, target: &str) -> Result<Option<UpdateInfo>> {
     let url = format!(
         "{}/api/update?app={}&target={}",
         server.trim_end_matches('/'),
@@ -33,8 +38,7 @@ pub fn check(server: &str, app: &str, target: &str, installed: &str) -> Result<O
         Err(ureq::Error::StatusCode(404)) => return Ok(None),
         Err(e) => return Err(e).context("asking server for updates"),
     };
-    let info: UpdateInfo = resp.body_mut().read_json()?;
-    Ok(crate::version::is_newer(&info.version, installed).then_some(info))
+    Ok(Some(resp.body_mut().read_json()?))
 }
 
 pub fn download(server: &str, info: &UpdateInfo) -> Result<Vec<u8>> {
@@ -103,11 +107,28 @@ pub fn update_self(server: &str, app: &str) -> Result<Option<String>> {
     let Some(info) = check(server, app, target, crate::VERSION)? else {
         return Ok(None);
     };
-    let bytes = download(server, &info)?;
+    install(server, app, &info).map(Some)
+}
+
+/// Install whatever version the server publishes, as long as it differs from
+/// the running one (the administrator asked for it, so also an older one).
+pub fn install_published(server: &str, app: &str) -> Result<String> {
+    let target = crate::util::current_target();
+    let Some(info) = published(server, app, target)? else {
+        bail!("the server has no {app} for {target}");
+    };
+    if info.version == crate::VERSION {
+        bail!("already running {}", info.version);
+    }
+    install(server, app, &info)
+}
+
+fn install(server: &str, app: &str, info: &UpdateInfo) -> Result<String> {
+    let bytes = download(server, info)?;
     let exe = std::env::current_exe()?;
     replace_exe(&exe, &bytes)?;
     log::info!("updated {app} {} -> {}", crate::VERSION, info.version);
-    Ok(Some(info.version))
+    Ok(info.version.clone())
 }
 
 #[cfg(test)]

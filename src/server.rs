@@ -10,7 +10,7 @@
 
 use crate::config::{ServerConfig, load_json, save_json};
 use crate::grants::{Grant, HostInfo, Machine, Store, Who};
-use crate::proto::{AgentMsg, SessionMsg};
+use crate::proto::{AgentMsg, Preview, PreviewShot, SessionMsg};
 use crate::update::UpdateInfo;
 use crate::util::{exe_name, now_secs, random_token, sha256_hex};
 use anyhow::Result;
@@ -26,7 +26,8 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{mpsc, oneshot, watch};
 
 const ADMIN_HTML: &str = include_str!("web/admin.html");
@@ -81,7 +82,32 @@ pub struct Relay {
     update_status: Mutex<crate::server_update::UpdateStatus>,
     /// Wakes the update loop for a check right now.
     pub update_now: tokio::sync::Notify,
+    /// Preview requests waiting for the host: req -> (machine, answer).
+    previews: Mutex<HashMap<u32, (String, oneshot::Sender<Vec<PreviewShot>>)>>,
+    preview_seq: AtomicU32,
+    /// Latest preview per machine, shared by everyone looking at it.
+    preview_cache: Mutex<HashMap<String, (Instant, Preview)>>,
+    /// Updates the administrator asked for, per machine (not saved).
+    forced_updates: Mutex<HashMap<String, ForcedUpdate>>,
 }
+
+/// An "Update" the administrator pressed for one computer.
+#[derive(Clone, Debug)]
+struct ForcedUpdate {
+    /// Version the helper was told to install.
+    version: String,
+    asked: Instant,
+    /// What went wrong, as reported by the helper.
+    error: Option<String>,
+}
+
+/// After this long without the helper coming back, "updating" is no longer shown.
+const FORCED_UPDATE_WAIT: Duration = Duration::from_secs(180);
+
+/// Previews younger than this are served from the cache.
+const PREVIEW_CACHE: Duration = Duration::from_secs(3);
+/// How long the relay waits for a host's preview pictures.
+const PREVIEW_TIMEOUT: Duration = Duration::from_secs(8);
 
 pub type Shared = Arc<Relay>;
 
@@ -122,6 +148,10 @@ impl Relay {
             sha_cache: Mutex::new(HashMap::new()),
             update_status: Mutex::new(update_status),
             update_now: tokio::sync::Notify::new(),
+            previews: Mutex::new(HashMap::new()),
+            preview_seq: AtomicU32::new(1),
+            preview_cache: Mutex::new(HashMap::new()),
+            forced_updates: Mutex::new(HashMap::new()),
         };
         Ok((Arc::new(relay), first_password))
     }
@@ -204,11 +234,54 @@ impl Relay {
         let agents = self.agents.lock().unwrap();
         let mut n = 0;
         for a in agents.values() {
-            if crate::version::is_newer(&v, &a.version) && a.tx.send(AgentMsg::UpdateAvailable { version: v.clone() }).is_ok() {
+            if crate::version::is_newer(&v, &a.version) && a.tx.send(AgentMsg::UpdateAvailable { version: v.clone(), force: false }).is_ok() {
                 n += 1;
             }
         }
         n
+    }
+
+    /// Tell one online helper to install the published version now, even if
+    /// it would not do so on its own. Returns that version.
+    pub fn force_update(&self, machine_id: &str) -> Result<String, String> {
+        let v = self.release_version().ok_or("No version is published for computers yet")?;
+        let agents = self.agents.lock().unwrap();
+        let a = agents.get(machine_id).ok_or("This computer is offline")?;
+        if a.version == v {
+            return Err(format!("Already running {v}"));
+        }
+        a.tx.send(AgentMsg::UpdateAvailable { version: v.clone(), force: true }).map_err(|_| "This computer is offline")?;
+        let asked = ForcedUpdate { version: v.clone(), asked: Instant::now(), error: None };
+        self.forced_updates.lock().unwrap().insert(machine_id.to_string(), asked);
+        log::info!("administrator asked {machine_id} to update {} -> {v}", a.version);
+        Ok(v)
+    }
+
+    /// [`Relay::force_update`] for every online helper older than the
+    /// published version (except those already updating).
+    pub fn force_update_all(&self) -> usize {
+        let Some(v) = self.release_version() else { return 0 };
+        let older: Vec<String> = {
+            let agents = self.agents.lock().unwrap();
+            agents.iter().filter(|(_, a)| crate::version::is_newer(&v, &a.version)).map(|(id, _)| id.clone()).collect()
+        };
+        let older: Vec<String> = older.into_iter().filter(|id| !self.forced_update_state(id, true).0).collect();
+        older.iter().filter(|id| self.force_update(id).is_ok()).count()
+    }
+
+    /// (`updating`, last error) of an update the administrator asked for.
+    fn forced_update_state(&self, machine_id: &str, online: bool) -> (bool, Option<String>) {
+        match self.forced_updates.lock().unwrap().get(machine_id) {
+            Some(f) => (online && f.error.is_none() && f.asked.elapsed() < FORCED_UPDATE_WAIT, f.error.clone()),
+            None => (false, None),
+        }
+    }
+
+    fn update_failed(&self, machine_id: &str, version: String, error: String) {
+        log::warn!("{machine_id} could not update to {version}: {error}");
+        let mut forced = self.forced_updates.lock().unwrap();
+        let f = forced.entry(machine_id.to_string()).or_insert_with(|| ForcedUpdate { version, asked: Instant::now(), error: None });
+        f.error = Some(error);
     }
 
     /// End sessions matching `pred`, telling the viewer why.
@@ -281,6 +354,46 @@ impl Relay {
     }
 }
 
+impl Relay {
+    /// Small pictures of a machine's screens (from the cache or asked from the host).
+    pub async fn preview(&self, machine_id: &str) -> std::result::Result<Preview, (StatusCode, &'static str)> {
+        if let Some((at, p)) = self.preview_cache.lock().unwrap().get(machine_id)
+            && at.elapsed() < PREVIEW_CACHE
+        {
+            return Ok(p.clone());
+        }
+        let tx = self.agents.lock().unwrap().get(machine_id).map(|a| a.tx.clone());
+        let Some(tx) = tx else { return Err((StatusCode::SERVICE_UNAVAILABLE, "This computer is offline right now")) };
+        let req = self.preview_seq.fetch_add(1, Ordering::Relaxed);
+        let (otx, orx) = oneshot::channel();
+        self.previews.lock().unwrap().insert(req, (machine_id.to_string(), otx));
+        if tx.send(AgentMsg::PreviewRequest { req }).is_err() {
+            self.previews.lock().unwrap().remove(&req);
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "This computer just went offline"));
+        }
+        let shots = match tokio::time::timeout(PREVIEW_TIMEOUT, orx).await {
+            Ok(Ok(shots)) => shots,
+            _ => {
+                self.previews.lock().unwrap().remove(&req);
+                return Err((StatusCode::GATEWAY_TIMEOUT, "The computer did not send a preview"));
+            }
+        };
+        let p = Preview { taken: now_secs(), shots };
+        self.preview_cache.lock().unwrap().insert(machine_id.to_string(), (Instant::now(), p.clone()));
+        Ok(p)
+    }
+
+    /// A host answered a preview request (only its own requests count).
+    fn preview_arrived(&self, machine_id: &str, req: u32, shots: Vec<PreviewShot>) {
+        let mut pending = self.previews.lock().unwrap();
+        if pending.get(&req).is_some_and(|(m, _)| m == machine_id)
+            && let Some((_, tx)) = pending.remove(&req)
+        {
+            let _ = tx.send(shots);
+        }
+    }
+}
+
 fn safe_segment(s: &str) -> bool {
     !s.is_empty() && s.len() < 100 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') && !s.contains("..")
 }
@@ -308,6 +421,9 @@ pub fn router(relay: Shared) -> Router {
         .route("/api/machines/{id}/rename", post(api_rename))
         .route("/api/machines/{id}", delete(api_remove_machine))
         .route("/api/machines/{id}/owner", post(api_set_owner))
+        .route("/api/machines/{id}/preview", get(api_preview))
+        .route("/api/machines/{id}/update", post(api_update_machine))
+        .route("/api/machines/update-all", post(api_update_all))
         .route("/api/users", post(api_create_user))
         .route("/api/users/{id}", delete(api_delete_user))
         .route("/api/users/{id}/password", post(api_user_password))
@@ -513,12 +629,43 @@ if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
   Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -Command `"$cmd`""
   return
 }}
-$tmp = Join-Path $env:TEMP 'farlink-host-setup.exe'
+function Fail($msg) {{
+  Write-Host ''
+  Write-Host $msg -ForegroundColor Red
+  Write-Host ''
+  Read-Host 'Install failed. Press Enter to close'
+  exit 1
+}}
+# Windows Defender often flags new, unsigned remote-control programs. Allow
+# the Farlink folders (and a private download folder) before downloading.
+$dl = Join-Path $env:TEMP 'farlink-setup'
+$allowed = @("$env:ProgramFiles\Farlink", "$env:ProgramData\Farlink", $dl)
+try {{ Add-MpPreference -ExclusionPath $allowed -ErrorAction Stop }} catch {{ Write-Host "Note: could not add Windows Defender exclusions ($($_.Exception.Message))." }}
+New-Item -ItemType Directory -Force $dl | Out-Null
+$tmp = Join-Path $dl 'farlink-host-setup.exe'
 Write-Host 'Downloading the Farlink helper...'
-Invoke-WebRequest -UseBasicParsing -Uri "$server/download/x86_64-pc-windows-gnu/farlink-host.exe" -OutFile $tmp
+try {{
+  Invoke-WebRequest -UseBasicParsing -Uri "$server/download/x86_64-pc-windows-gnu/farlink-host.exe" -OutFile $tmp
+}} catch {{
+  Fail "Could not download the Farlink helper from $server : $($_.Exception.Message)"
+}}
+Start-Sleep -Seconds 2
+if (-not (Test-Path $tmp)) {{
+  Fail ("The downloaded helper disappeared - most likely your antivirus (Windows Defender) removed it.`n" +
+        "Open Windows Security > Virus & threat protection > Protection history, allow 'farlink-host', then run this install link again.")
+}}
 & $tmp install --server $server --token $token
+$code = $LASTEXITCODE
 Remove-Item $tmp -ErrorAction SilentlyContinue
-Write-Host 'Done. This computer now appears in your Farlink list.'
+try {{ Remove-MpPreference -ExclusionPath $dl -ErrorAction Stop }} catch {{ }}
+if ($code -ne 0) {{
+  Fail "The Farlink installer failed (exit code $code). See the messages above."
+}}
+if (-not (Get-Service FarlinkHost -ErrorAction SilentlyContinue)) {{
+  Fail ("The Farlink service was not installed - most likely your antivirus removed the program.`n" +
+        "Check Windows Security > Protection history, allow 'farlink-host', then run this install link again.")
+}}
+Write-Host 'Done. This computer now appears in your Farlink list.' -ForegroundColor Green
 Start-Sleep -Seconds 5
 "#
     )
@@ -627,6 +774,12 @@ pub struct MachineView {
     /// Name of the person this computer belongs to.
     #[serde(default)]
     pub owner_name: Option<String>,
+    /// The administrator pressed "Update" and the helper has not come back yet.
+    #[serde(default)]
+    pub updating: bool,
+    /// Why the last update of this helper failed.
+    #[serde(default)]
+    pub update_error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -734,12 +887,18 @@ pub fn overview(r: &Relay) -> Overview {
         let mut machines: Vec<MachineView> = s
             .machines
             .values()
-            .map(|m| MachineView {
-                machine: m.into(),
-                online: r.is_online(&m.id),
-                sessions: sessions.iter().filter(|x| x.machine_id == m.id).count(),
-                up_to_date: release.as_ref().is_none_or(|v| !crate::version::is_newer(v, &m.version)),
-                owner_name: m.owner.as_ref().and_then(|o| s.users.get(o)).map(|u| u.name.clone()),
+            .map(|m| {
+                let online = r.is_online(&m.id);
+                let (updating, update_error) = r.forced_update_state(&m.id, online);
+                MachineView {
+                    machine: m.into(),
+                    online,
+                    sessions: sessions.iter().filter(|x| x.machine_id == m.id).count(),
+                    up_to_date: release.as_ref().is_none_or(|v| !crate::version::is_newer(v, &m.version)),
+                    owner_name: m.owner.as_ref().and_then(|o| s.users.get(o)).map(|u| u.name.clone()),
+                    updating,
+                    update_error,
+                }
             })
             .collect();
         let mut users: Vec<UserView> = s
@@ -876,6 +1035,40 @@ async fn api_rename(State(r): State<Shared>, headers: HeaderMap, Path(id): Path<
     }
 }
 
+/// Small pictures of a computer's screens (admin, or the person it belongs to).
+async fn api_preview(State(r): State<Shared>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    let Some(who) = who(&r, &headers) else { return unauthorized() };
+    if !r.read_store(|s| s.can_access(&who, &id)) {
+        return (StatusCode::FORBIDDEN, "not your computer").into_response();
+    }
+    match r.preview(&id).await {
+        Ok(p) => Json(p).into_response(),
+        Err((code, msg)) => (code, msg).into_response(),
+    }
+}
+
+/// Make a computer's helper install the published version now (administrator).
+async fn api_update_machine(State(r): State<Shared>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    if !is_admin(&r, &headers) {
+        return unauthorized();
+    }
+    match r.force_update(&id) {
+        Ok(v) => Json(json!({"ok": true, "version": v})).into_response(),
+        Err(e) => bad(e),
+    }
+}
+
+/// Update every online helper that is older than the published version.
+async fn api_update_all(State(r): State<Shared>, headers: HeaderMap) -> Response {
+    if !is_admin(&r, &headers) {
+        return unauthorized();
+    }
+    if r.release_version().is_none() {
+        return bad("No version is published for computers yet");
+    }
+    Json(json!({"ok": true, "updating": r.force_update_all()})).into_response()
+}
+
 async fn api_remove_machine(State(r): State<Shared>, headers: HeaderMap, Path(id): Path<String>) -> Response {
     if !is_admin(&r, &headers) {
         return unauthorized();
@@ -1005,11 +1198,18 @@ async fn agent_loop(r: Shared, socket: WebSocket) {
     if let Some(old) = r.agents.lock().unwrap().insert(id.clone(), AgentConn { tx: tx.clone(), conn: conn.clone(), version: version.clone() }) {
         drop(old); // an older connection of the same machine; it will notice and stop
     }
-    log::info!("'{name}' online");
+    log::info!("'{name}' online ({version})");
+    {
+        // Back with the version it was asked to install: the update worked.
+        let mut forced = r.forced_updates.lock().unwrap();
+        if forced.get(&id).is_some_and(|f| f.version == version) {
+            forced.remove(&id);
+        }
+    }
     if let Some(v) = r.release_version()
         && crate::version::is_newer(&v, &version)
     {
-        let _ = tx.send(AgentMsg::UpdateAvailable { version: v });
+        let _ = tx.send(AgentMsg::UpdateAvailable { version: v, force: false });
     }
     loop {
         tokio::select! {
@@ -1021,8 +1221,10 @@ async fn agent_loop(r: Shared, socket: WebSocket) {
                 None => break,
             },
             msg = stream.next() => match msg {
-                Some(Ok(Message::Text(t))) => {
-                    if let Ok(AgentMsg::Heartbeat { monitors }) = serde_json::from_str::<AgentMsg>(t.as_str()) {
+                Some(Ok(Message::Text(t))) => match serde_json::from_str::<AgentMsg>(t.as_str()) {
+                    Ok(AgentMsg::Preview { req, shots }) => r.preview_arrived(&id, req, shots),
+                    Ok(AgentMsg::UpdateFailed { version, error }) => r.update_failed(&id, version, error),
+                    Ok(AgentMsg::Heartbeat { monitors }) => {
                         let changed = r.read_store(|s| s.machines.get(&id).is_some_and(|m| m.monitors != monitors));
                         if changed {
                             r.with_store(|s| if let Some(m) = s.machines.get_mut(&id) { m.monitors = monitors; m.last_seen = now_secs(); });
@@ -1030,7 +1232,8 @@ async fn agent_loop(r: Shared, socket: WebSocket) {
                             m.last_seen = now_secs();
                         }
                     }
-                }
+                    _ => {}
+                },
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                 _ => {}
             }
@@ -1159,6 +1362,28 @@ async fn viewer_loop(
     let mode = |v: bool| Message::Text(serde_json::to_string(&SessionMsg::ViewMode { view_only: v, locked }).unwrap().into());
     let _ = vs.send(mode(view_only)).await;
     let (mut hs, mut hr) = host.split();
+    // Pictures (host → viewer) flow in their own task: a big picture on its
+    // way to a slow viewer never holds up mouse, keys and acks going back.
+    let (to_viewer, mut to_viewer_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    let mut down = tokio::spawn(async move {
+        let reason = loop {
+            tokio::select! {
+                m = hr.next() => match m {
+                    Some(Ok(msg @ (Message::Text(_) | Message::Binary(_)))) => {
+                        if vs.send(msg).await.is_err() { break String::new(); }
+                    }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break "The remote computer ended the session".to_string(),
+                    _ => {}
+                },
+                m = to_viewer_rx.recv() => match m {
+                    Some(m) => if vs.send(m).await.is_err() { break String::new(); },
+                    None => break String::new(),
+                },
+            }
+        };
+        (vs, reason)
+    });
+    let mut finished = None;
     let reason = loop {
         tokio::select! {
             m = vr.next() => match m {
@@ -1175,7 +1400,7 @@ async fn viewer_loop(
                                 break "The remote computer disconnected".to_string();
                             }
                         }
-                        let _ = vs.send(mode(view_only)).await;
+                        let _ = to_viewer.send(mode(view_only));
                         continue;
                     }
                     if viewer_message_allowed(t.as_str(), view_only) && hs.send(Message::Text(t)).await.is_err() {
@@ -1191,12 +1416,10 @@ async fn viewer_loop(
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break String::new(),
                 _ => {}
             },
-            m = hr.next() => match m {
-                Some(Ok(msg @ (Message::Text(_) | Message::Binary(_)))) => {
-                    if vs.send(msg).await.is_err() { break String::new(); }
-                }
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break "The remote computer ended the session".to_string(),
-                _ => {}
+            done = &mut down => {
+                let Ok((vs, reason)) = done else { break String::new() };
+                finished = Some(vs);
+                break reason;
             },
             _ = kill.changed() => {
                 break kill.borrow().clone().unwrap_or_else(|| "Session ended".into());
@@ -1207,7 +1430,20 @@ async fn viewer_loop(
     let bye = SessionMsg::Closed { reason: "viewer left".into() };
     let _ = hs.send(Message::Text(serde_json::to_string(&bye).unwrap().into())).await;
     let _ = hs.close().await;
-    if !reason.is_empty() {
+    drop(to_viewer);
+    let vs = match finished {
+        Some(vs) => Some(vs),
+        None => match tokio::time::timeout(Duration::from_secs(5), &mut down).await {
+            Ok(Ok((vs, _))) => Some(vs),
+            _ => {
+                down.abort();
+                None
+            }
+        },
+    };
+    if let Some(mut vs) = vs
+        && !reason.is_empty()
+    {
         send_closed(&mut vs, &reason).await;
     }
 }
@@ -1239,6 +1475,10 @@ mod tests {
         assert!(ps.contains("Tls12"), "Server 2016 needs TLS 1.2 switched on");
         assert!(ps.contains("RunAs"));
         assert!(ps.contains("farlink-host.exe"));
+        assert!(ps.contains("Add-MpPreference"), "allows the Farlink folders in Defender");
+        assert!(ps.contains("Test-Path $tmp"), "notices when antivirus removes the download");
+        assert!(ps.contains("$LASTEXITCODE"), "does not claim success when the installer failed");
+        assert!(ps.find("Done.").unwrap() > ps.find("Get-Service FarlinkHost").unwrap());
         assert!(windows_cmd("https://x.y", "t").contains("https://x.y/install/t/windows.ps1"));
     }
 

@@ -193,10 +193,46 @@ pub enum AgentMsg {
     Rejected { reason: String },
     /// relay -> host: someone wants to see this machine; open a session socket.
     OpenSession { session_id: String, view_only: bool },
-    /// relay -> host: a newer version is published, update now.
-    UpdateAvailable { version: String },
+    /// relay -> host: a newer version is published, update now. `force`
+    /// (the administrator pressed "Update"): install the published version
+    /// even if it is not newer, and report a failure with
+    /// [`AgentMsg::UpdateFailed`].
+    UpdateAvailable {
+        version: String,
+        #[serde(default)]
+        force: bool,
+    },
+    /// host -> relay: installing an update did not work (a successful update
+    /// restarts the helper, which then registers with its new version).
+    UpdateFailed { version: String, error: String },
     /// host -> relay: monitors changed / still alive.
     Heartbeat { monitors: Vec<MonitorInfo> },
+    /// relay -> host: send small pictures of every screen (the preview of a
+    /// computer selected in the list).
+    PreviewRequest { req: u32 },
+    /// host -> relay: the answer to [`AgentMsg::PreviewRequest`].
+    Preview { req: u32, shots: Vec<PreviewShot> },
+}
+
+/// Longest side of a preview picture.
+pub const PREVIEW_MAX: u32 = 480;
+
+/// A small JPEG of one monitor, for the preview of a selected computer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewShot {
+    pub index: u8,
+    pub width: u32,
+    pub height: u32,
+    /// Base64 JPEG.
+    pub jpeg: String,
+}
+
+/// `GET /api/machines/{id}/preview` answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Preview {
+    /// Seconds since 1970 when the pictures were taken.
+    pub taken: u64,
+    pub shots: Vec<PreviewShot>,
 }
 
 /// Picture compression of one tile.
@@ -364,6 +400,19 @@ mod tests {
         assert!(SessionMsg::Input { event: InputEvent::Text { text: "x".into() } }.is_control());
         assert!(!SessionMsg::Refresh.is_control());
         assert!(!SessionMsg::Quality { quality: Quality::default() }.is_control());
+    }
+
+    #[test]
+    fn preview_messages_round_trip() {
+        let shot = PreviewShot { index: 1, width: 480, height: 270, jpeg: "/9j/".into() };
+        let msgs = [AgentMsg::PreviewRequest { req: 5 }, AgentMsg::Preview { req: 5, shots: vec![shot.clone()] }];
+        for m in msgs {
+            let s = serde_json::to_string(&m).unwrap();
+            assert_eq!(serde_json::from_str::<AgentMsg>(&s).unwrap(), m);
+        }
+        assert_eq!(serde_json::to_string(&AgentMsg::PreviewRequest { req: 5 }).unwrap(), r#"{"t":"preview_request","req":5}"#);
+        let p = Preview { taken: 1, shots: vec![shot] };
+        assert_eq!(serde_json::from_str::<Preview>(&serde_json::to_string(&p).unwrap()).unwrap(), p);
     }
 
     #[test]

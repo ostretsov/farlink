@@ -72,6 +72,10 @@ pub fn host_windows_plan(server: &str, token: &str, program_files: &Path, progra
     let bin_path = format!("\"{exe_s}\" service");
     vec![
         Step::try_run("sc.exe", &["stop", WIN_SERVICE]),
+        // Windows Defender often flags new, unsigned remote-control programs;
+        // allow our folders before the program is copied there (and so
+        // self-updates are not removed). May fail with another antivirus.
+        defender_exclusion("Add-MpPreference", &dir, &data),
         Step::Mkdir(dir.clone()),
         Step::CopySelf(exe.clone()),
         Step::Mkdir(data.clone()),
@@ -119,11 +123,19 @@ pub fn host_windows_plan(server: &str, token: &str, program_files: &Path, progra
     ]
 }
 
+/// `Add-MpPreference` / `Remove-MpPreference` for the program and data folders.
+fn defender_exclusion(cmdlet: &str, dir: &Path, data: &Path) -> Step {
+    let q = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "''"));
+    let cmd = format!("{cmdlet} -ExclusionPath {},{}", q(dir), q(data));
+    Step::try_run("powershell.exe", &["-NoProfile", "-NonInteractive", "-Command", &cmd])
+}
+
 pub fn host_windows_uninstall_plan(program_files: &Path, program_data: &Path) -> Vec<Step> {
     vec![
         Step::try_run("sc.exe", &["stop", WIN_SERVICE]),
         Step::try_run("sc.exe", &["delete", WIN_SERVICE]),
         Step::try_run("netsh.exe", &["advfirewall", "firewall", "delete", "rule", &format!("name={FIREWALL_RULE}")]),
+        defender_exclusion("Remove-MpPreference", &program_files.join("Farlink"), &program_data.join("Farlink")),
         Step::Note(format!(
             "Remove the folders {} and {} to finish.",
             program_files.join("Farlink").display(),
@@ -423,6 +435,12 @@ mod tests {
         assert!(cmds.iter().any(|c| c.starts_with("sc.exe create FarlinkHost") && c.contains("service")));
         assert!(cmds.iter().any(|c| c.contains("failure FarlinkHost") && c.contains("restart/3000")));
         assert!(cmds.iter().any(|c| c.contains("SoftwareSASGeneration")));
+        let mp = cmds.iter().position(|c| {
+            c.starts_with("powershell.exe") && c.contains("Add-MpPreference -ExclusionPath 'C:\\Program Files") && c.contains("ProgramData")
+        });
+        let copy = steps.iter().position(|s| matches!(s, Step::CopySelf(_))).unwrap();
+        assert!(mp.is_some(), "Defender exclusion for the install folders: {cmds:?}");
+        assert!(steps.iter().position(|s| s.describe().contains("Add-MpPreference")).unwrap() < copy, "before copying");
         assert_eq!(cmds.last().unwrap(), "sc.exe start FarlinkHost");
         let cfg = steps
             .iter()
@@ -440,6 +458,7 @@ mod tests {
     fn windows_uninstall_removes_service_and_rule() {
         let cmds = runs(&host_windows_uninstall_plan(Path::new("C:/PF"), Path::new("C:/PD")));
         assert!(cmds.iter().any(|c| c == "sc.exe delete FarlinkHost"));
+        assert!(cmds.iter().any(|c| c.contains("Remove-MpPreference")));
         assert!(cmds.iter().any(|c| c.contains("delete rule")));
     }
 

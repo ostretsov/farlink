@@ -2,13 +2,20 @@
 //! mouse and keyboard. The thread follows the *input desktop*, so when the
 //! helper runs as SYSTEM in the console session it also sees and controls the
 //! lock screen, the sign-in screen and UAC prompts.
+//!
+//! Pictures come from DXGI Desktop Duplication (`dxgi.rs`: cheap, knows what
+//! changed). Where that is not available (older systems, turned screens,
+//! briefly after a desktop switch) GDI `BitBlt` is used instead.
 
 use super::{Desktop, to_absolute};
 use crate::codec::Frame;
 use crate::keys;
 use crate::proto::{InputEvent, MonitorInfo, MouseButton};
+use super::dxgi::Duplicator;
 use anyhow::{Result, bail};
+use std::collections::HashMap;
 use std::mem::{size_of, zeroed};
+use std::time::{Duration, Instant};
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
@@ -29,6 +36,17 @@ pub fn wide(s: &str) -> Vec<u16> {
 
 pub struct WinDesktop {
     desk: HDESK,
+    /// Name of the desktop we are on ("Default", "Winlogon", ...).
+    desk_name: String,
+    dxgi: Option<Duplicator>,
+    /// When to try DXGI again after it failed.
+    dxgi_retry: Instant,
+    /// Reused GDI capture surfaces per monitor size.
+    gdi: HashMap<(i32, i32), GdiSurface>,
+    /// Monitors as last reported (to know which ones DXGI covers).
+    monitors: Vec<MonitorInfo>,
+    /// Pointer position + shape last time we looked.
+    pointer: (i32, i32, usize, bool),
 }
 
 impl WinDesktop {
@@ -39,28 +57,103 @@ impl WinDesktop {
                 let _ = SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
             }
         }
-        let mut d = WinDesktop { desk: null_mut() };
+        let mut d = WinDesktop {
+            desk: null_mut(),
+            desk_name: String::new(),
+            dxgi: None,
+            dxgi_retry: Instant::now(),
+            gdi: HashMap::new(),
+            monitors: Vec::new(),
+            pointer: (0, 0, 0, false),
+        };
         d.follow_input_desktop();
         Ok(d)
     }
 
     /// Switch this thread to whatever desktop currently receives input
     /// (normal desktop, Winlogon/lock screen, or the UAC secure desktop).
+    /// Screen duplication belongs to one desktop, so it starts over on a switch.
     fn follow_input_desktop(&mut self) {
         unsafe {
             let desk = OpenInputDesktop(0, 0, GENERIC_ALL);
             if desk.is_null() {
                 return;
             }
+            let name = desktop_name(desk);
             if SetThreadDesktop(desk) != 0 {
                 if !self.desk.is_null() {
                     CloseDesktop(self.desk);
                 }
                 self.desk = desk;
+                if name != self.desk_name {
+                    log::info!("desktop switched to {name:?}");
+                    self.desk_name = name;
+                    self.dxgi = None;
+                    self.gdi.clear();
+                    self.dxgi_retry = Instant::now();
+                }
             } else {
                 CloseDesktop(desk);
             }
         }
+    }
+
+    /// Start DXGI duplication when it is missing and a retry is due.
+    fn ensure_dxgi(&mut self) {
+        if self.dxgi.is_some() || Instant::now() < self.dxgi_retry {
+            return;
+        }
+        match Duplicator::new() {
+            Ok(d) => {
+                log::info!("screen capture: DXGI desktop duplication ({} screens)", d.outputs.len());
+                self.dxgi = Some(d);
+            }
+            Err(e) => {
+                log::info!("screen capture: GDI (DXGI not available: {e:#})");
+                self.dxgi_retry = Instant::now() + Duration::from_secs(5);
+            }
+        }
+    }
+
+    /// The DXGI output showing monitor `m`, if any.
+    fn output_index(&self, m: &MonitorInfo) -> Option<usize> {
+        self.dxgi.as_ref()?.outputs.iter().position(|o| o.x == m.x && o.y == m.y && o.width == m.width && o.height == m.height)
+    }
+
+    fn pointer_state() -> (i32, i32, usize, bool) {
+        unsafe {
+            let mut ci: CURSORINFO = zeroed();
+            ci.cbSize = size_of::<CURSORINFO>() as u32;
+            if GetCursorInfo(&mut ci) == 0 {
+                return (0, 0, 0, false);
+            }
+            (ci.ptScreenPos.x, ci.ptScreenPos.y, ci.hCursor as usize, ci.flags & CURSOR_SHOWING != 0)
+        }
+    }
+
+    /// Classic GDI capture (slower; used when DXGI is not available).
+    fn capture_gdi(&mut self, m: &MonitorInfo) -> Result<Frame> {
+        self.follow_input_desktop();
+        let (w, h) = (m.width as i32, m.height as i32);
+        if !self.gdi.contains_key(&(w, h)) {
+            self.gdi.insert((w, h), GdiSurface::new(w, h)?);
+        }
+        let surf = self.gdi.get_mut(&(w, h)).unwrap();
+        unsafe {
+            let screen = GetDC(null_mut());
+            if screen.is_null() {
+                bail!("cannot read the screen");
+            }
+            let ok = BitBlt(surf.dc, 0, 0, w, h, screen, m.x, m.y, SRCCOPY | CAPTUREBLT);
+            ReleaseDC(null_mut(), screen);
+            if ok == 0 {
+                // Typically the desktop just switched; start over next time.
+                self.gdi.clear();
+                bail!("screen capture failed");
+            }
+            draw_pointer_on(surf.dc, m.x, m.y);
+        }
+        Ok(Frame::from_bgra(m.width, m.height, surf.pixels(), w as usize * 4))
     }
 
     fn send(&self, inputs: &[INPUT]) {
@@ -136,6 +229,173 @@ pub fn send_sas() {
     }
 }
 
+/// Name of a desktop ("Default", "Winlogon", "Screen-saver").
+unsafe fn desktop_name(desk: HDESK) -> String {
+    let mut buf = [0u16; 128];
+    let mut need = 0u32;
+    let ok = unsafe { GetUserObjectInformationW(desk as HANDLE, UOI_NAME, buf.as_mut_ptr() as *mut _, (buf.len() * 2) as u32, &mut need) };
+    if ok == 0 {
+        return String::new();
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..len])
+}
+
+/// A memory picture GDI can draw into, with its pixels directly readable
+/// (no `GetDIBits` copy). Kept between pictures.
+struct GdiSurface {
+    dc: HDC,
+    bmp: HBITMAP,
+    old: HGDIOBJ,
+    bits: *mut u8,
+    w: i32,
+    h: i32,
+}
+
+impl GdiSurface {
+    fn new(w: i32, h: i32) -> Result<GdiSurface> {
+        unsafe {
+            let dc = CreateCompatibleDC(null_mut());
+            if dc.is_null() {
+                bail!("cannot create a drawing surface");
+            }
+            let mut bmi: BITMAPINFO = zeroed();
+            bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+            bmi.bmiHeader.biWidth = w;
+            bmi.bmiHeader.biHeight = -h; // top-down rows
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+            let mut bits: *mut core::ffi::c_void = null_mut();
+            let bmp = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+            if bmp.is_null() || bits.is_null() {
+                DeleteDC(dc);
+                bail!("cannot create a {w}x{h} picture");
+            }
+            let old = SelectObject(dc, bmp as HGDIOBJ);
+            Ok(GdiSurface { dc, bmp, old, bits: bits as *mut u8, w, h })
+        }
+    }
+
+    /// BGRX pixels, `w * 4` bytes per row.
+    fn pixels(&mut self) -> &mut [u8] {
+        unsafe {
+            GdiFlush();
+            std::slice::from_raw_parts_mut(self.bits, (self.w * self.h * 4) as usize)
+        }
+    }
+}
+
+impl Drop for GdiSurface {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.dc, self.old);
+            DeleteObject(self.bmp as HGDIOBJ);
+            DeleteDC(self.dc);
+        }
+    }
+}
+
+/// Draw the current mouse pointer onto `dc`, whose (0,0) is screen point
+/// (`ox`, `oy`). Windows handles every pointer kind (colour, black/white,
+/// inverting) itself.
+unsafe fn draw_pointer_on(dc: HDC, ox: i32, oy: i32) {
+    unsafe {
+        let mut ci: CURSORINFO = zeroed();
+        ci.cbSize = size_of::<CURSORINFO>() as u32;
+        if GetCursorInfo(&mut ci) == 0 || ci.flags & CURSOR_SHOWING == 0 {
+            return;
+        }
+        let mut ii: ICONINFO = zeroed();
+        if GetIconInfo(ci.hCursor, &mut ii) == 0 {
+            return;
+        }
+        let x = ci.ptScreenPos.x - ii.xHotspot as i32 - ox;
+        let y = ci.ptScreenPos.y - ii.yHotspot as i32 - oy;
+        DrawIconEx(dc, x, y, ci.hCursor, 0, 0, 0, null_mut(), DI_NORMAL);
+        free_icon_info(&ii);
+    }
+}
+
+unsafe fn free_icon_info(ii: &ICONINFO) {
+    unsafe {
+        if !ii.hbmMask.is_null() {
+            DeleteObject(ii.hbmMask as HGDIOBJ);
+        }
+        if !ii.hbmColor.is_null() {
+            DeleteObject(ii.hbmColor as HGDIOBJ);
+        }
+    }
+}
+
+/// Pointer box on monitor `m`: (left, top, width, height) in monitor pixels.
+unsafe fn pointer_box(m: &MonitorInfo) -> Option<(i32, i32, i32, i32)> {
+    unsafe {
+        let mut ci: CURSORINFO = zeroed();
+        ci.cbSize = size_of::<CURSORINFO>() as u32;
+        if GetCursorInfo(&mut ci) == 0 || ci.flags & CURSOR_SHOWING == 0 {
+            return None;
+        }
+        let mut ii: ICONINFO = zeroed();
+        if GetIconInfo(ci.hCursor, &mut ii) == 0 {
+            return None;
+        }
+        let mut bm: BITMAP = zeroed();
+        let (w, h) = if !ii.hbmColor.is_null() && GetObjectW(ii.hbmColor as HGDIOBJ, size_of::<BITMAP>() as i32, &mut bm as *mut _ as *mut _) != 0 {
+            (bm.bmWidth, bm.bmHeight)
+        } else if !ii.hbmMask.is_null() && GetObjectW(ii.hbmMask as HGDIOBJ, size_of::<BITMAP>() as i32, &mut bm as *mut _ as *mut _) != 0 {
+            (bm.bmWidth, bm.bmHeight / 2) // AND mask on top of XOR mask
+        } else {
+            (32, 32)
+        };
+        free_icon_info(&ii);
+        let left = ci.ptScreenPos.x - ii.xHotspot as i32 - m.x;
+        let top = ci.ptScreenPos.y - ii.yHotspot as i32 - m.y;
+        Some((left, top, w.clamp(1, 256), h.clamp(1, 256)))
+    }
+}
+
+/// Draw the pointer into a captured RGBA picture of monitor `m` (DXGI
+/// pictures don't contain it).
+fn draw_pointer(frame: &mut Frame, m: &MonitorInfo) {
+    let Some((left, top, w, h)) = (unsafe { pointer_box(m) }) else { return };
+    let x0 = left.max(0);
+    let y0 = top.max(0);
+    let x1 = (left + w).min(frame.width as i32);
+    let y1 = (top + h).min(frame.height as i32);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let (rw, rh) = (x1 - x0, y1 - y0);
+    let Ok(mut surf) = GdiSurface::new(rw, rh) else { return };
+    let fw = frame.width as usize;
+    {
+        let px = surf.pixels();
+        for row in 0..rh as usize {
+            let src = &frame.rgba[((y0 as usize + row) * fw + x0 as usize) * 4..][..rw as usize * 4];
+            let dst = &mut px[row * rw as usize * 4..][..rw as usize * 4];
+            for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                d[0] = s[2];
+                d[1] = s[1];
+                d[2] = s[0];
+                d[3] = 0;
+            }
+        }
+    }
+    unsafe { draw_pointer_on(surf.dc, m.x + x0, m.y + y0) };
+    let px = surf.pixels();
+    for row in 0..rh as usize {
+        let src = &px[row * rw as usize * 4..][..rw as usize * 4];
+        let dst = &mut frame.rgba[((y0 as usize + row) * fw + x0 as usize) * 4..][..rw as usize * 4];
+        for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+            d[0] = s[2];
+            d[1] = s[1];
+            d[2] = s[0];
+            d[3] = 255;
+        }
+    }
+}
+
 unsafe extern "system" fn enum_monitor(hmon: HMONITOR, _hdc: HDC, _rc: *mut RECT, data: LPARAM) -> BOOL {
     unsafe {
         let list = &mut *(data as *mut Vec<MonitorInfo>);
@@ -172,58 +432,49 @@ impl Desktop for WinDesktop {
         for (i, m) in list.iter_mut().enumerate() {
             m.index = i as u8;
         }
+        if list != self.monitors {
+            // Screens were added, removed or changed size: duplicate them anew.
+            self.dxgi = None;
+            self.dxgi_retry = Instant::now();
+            self.gdi.clear();
+            self.monitors = list.clone();
+        }
         Ok(list)
     }
 
-    fn capture(&mut self, m: &MonitorInfo) -> Result<Frame> {
+    fn changed(&mut self) -> bool {
         self.follow_input_desktop();
-        let (w, h) = (m.width as i32, m.height as i32);
-        unsafe {
-            let screen = GetDC(null_mut());
-            if screen.is_null() {
-                bail!("cannot read the screen");
-            }
-            let mem = CreateCompatibleDC(screen);
-            let bmp = CreateCompatibleBitmap(screen, w, h);
-            let old = SelectObject(mem, bmp as HGDIOBJ);
-            BitBlt(mem, 0, 0, w, h, screen, m.x, m.y, SRCCOPY | CAPTUREBLT);
-
-            // Mouse pointer.
-            let mut ci: CURSORINFO = zeroed();
-            ci.cbSize = size_of::<CURSORINFO>() as u32;
-            if GetCursorInfo(&mut ci) != 0 && ci.flags & CURSOR_SHOWING != 0 {
-                let mut ii: ICONINFO = zeroed();
-                if GetIconInfo(ci.hCursor, &mut ii) != 0 {
-                    let x = ci.ptScreenPos.x - ii.xHotspot as i32 - m.x;
-                    let y = ci.ptScreenPos.y - ii.yHotspot as i32 - m.y;
-                    DrawIconEx(mem, x, y, ci.hCursor, 0, 0, 0, null_mut(), DI_NORMAL);
-                    if !ii.hbmMask.is_null() {
-                        DeleteObject(ii.hbmMask as HGDIOBJ);
-                    }
-                    if !ii.hbmColor.is_null() {
-                        DeleteObject(ii.hbmColor as HGDIOBJ);
-                    }
+        self.ensure_dxgi();
+        let pointer = Self::pointer_state();
+        let mut changed = pointer != self.pointer;
+        self.pointer = pointer;
+        let Some(d) = self.dxgi.as_mut() else { return true }; // GDI can't tell
+        for o in &mut d.outputs {
+            match o.poll() {
+                Ok(c) => changed |= c,
+                Err(e) => {
+                    log::info!("screen duplication stopped ({e}); using GDI for now");
+                    self.dxgi = None;
+                    self.dxgi_retry = Instant::now() + Duration::from_millis(500);
+                    return true;
                 }
             }
-
-            let mut bmi: BITMAPINFO = zeroed();
-            bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
-            bmi.bmiHeader.biWidth = w;
-            bmi.bmiHeader.biHeight = -h; // top-down rows
-            bmi.bmiHeader.biPlanes = 1;
-            bmi.bmiHeader.biBitCount = 32;
-            bmi.bmiHeader.biCompression = BI_RGB;
-            let mut buf = vec![0u8; (w * h * 4) as usize];
-            let lines = GetDIBits(mem, bmp, 0, h as u32, buf.as_mut_ptr() as *mut _, &mut bmi, DIB_RGB_COLORS);
-            SelectObject(mem, old);
-            DeleteObject(bmp as HGDIOBJ);
-            DeleteDC(mem);
-            ReleaseDC(null_mut(), screen);
-            if lines == 0 {
-                bail!("screen capture failed");
-            }
-            Ok(Frame::from_bgra(m.width, m.height, &buf, w as usize * 4))
         }
+        // Monitors DXGI doesn't cover are read with GDI every time.
+        changed || self.monitors.iter().any(|m| self.output_index(m).is_none())
+    }
+
+    fn capture(&mut self, m: &MonitorInfo) -> Result<Frame> {
+        if let Some(i) = self.output_index(m)
+            && let Some(f) = &self.dxgi.as_ref().unwrap().outputs[i].frame
+            && f.width == m.width
+            && f.height == m.height
+        {
+            let mut frame = f.clone();
+            draw_pointer(&mut frame, m);
+            return Ok(frame);
+        }
+        self.capture_gdi(m)
     }
 
     fn input(&mut self, monitors: &[MonitorInfo], ev: &InputEvent) -> Result<()> {

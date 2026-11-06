@@ -182,9 +182,10 @@ async fn real_helper_streams_both_monitors_to_admin_viewer() {
             seen.insert(h.monitor);
         }
     }
-    // Pictures are scaled by the quality setting (60 % for Fast).
+    // Pictures are scaled by the quality setting (Fast is smaller than the screen).
     let f0 = canvases[&0].frame.as_ref().unwrap();
-    assert_eq!((f0.width, f0.height), (960, 540));
+    assert!(q.scale_pct < 100);
+    assert_eq!((f0.width, f0.height), q.scaled_size(1600, 900));
 
     // The admin overview lists the live session.
     let o = s.overview().await;
@@ -352,9 +353,107 @@ async fn published_updates_are_offered_and_verified() {
     // Connected hosts with an older version are told to update.
     let (mut agent, _, _) = fake_host(&s).await;
     match next_json::<AgentMsg>(&mut agent).await {
-        AgentMsg::UpdateAvailable { version } => assert_eq!(version, "9.1.0"),
+        AgentMsg::UpdateAvailable { version, force } => {
+            assert_eq!(version, "9.1.0");
+            assert!(!force, "a normal offer");
+        }
         other => panic!("{other:?}"),
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admin_forces_helper_updates_and_sees_how_they_went() {
+    let s = start_server().await;
+    let (mut agent, id, secret) = fake_host(&s).await;
+    let overview = |s: &TestServer| {
+        let api = farlink::net::Api { server: s.url.clone(), token: s.admin.clone() };
+        blocking(move || api.overview().unwrap())
+    };
+    let machine = |o: &farlink::server::Overview| o.machines.iter().find(|m| m.machine.id == id).unwrap().clone();
+    let post = |s: &TestServer, path: &str, token: &str| {
+        let (url, token) = (format!("{}{path}", s.url), token.to_string());
+        blocking(move || match ureq::post(&url).header("Authorization", format!("Bearer {token}")).send_empty() {
+            Ok(mut r) => (200, r.body_mut().read_json::<serde_json::Value>().unwrap()),
+            Err(ureq::Error::StatusCode(c)) => (c, serde_json::Value::Null),
+            Err(e) => panic!("{e}"),
+        })
+    };
+    let update_path = format!("/api/machines/{id}/update");
+    let admin = farlink::net::Api { server: s.url.clone(), token: s.admin.clone() };
+
+    // Nothing published yet: the server explains why.
+    let a = admin.clone();
+    let id2 = id.clone();
+    let err = blocking(move || a.update_machine(&id2).unwrap_err().to_string()).await;
+    assert!(err.contains("No version is published"), "{err}");
+
+    // The helper reports its version; a newer one gets published.
+    for _ in 0..50 {
+        if s.relay.is_online(&id) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let m = machine(&overview(&s).await);
+    assert!(m.online);
+    assert_eq!(m.machine.version, farlink::VERSION);
+    assert!(m.up_to_date && !m.updating && m.update_error.is_none());
+    std::fs::create_dir_all(&s.relay.cfg.releases_dir).unwrap();
+    std::fs::write(s.relay.cfg.releases_dir.join("version.txt"), "99.0.0\n").unwrap();
+    let m = machine(&overview(&s).await);
+    assert!(!m.up_to_date, "older than the published version");
+
+    // Only the administrator may force updates.
+    assert_eq!(post(&s, &update_path, "not-a-session").await.0, 401);
+    assert_eq!(post(&s, "/api/machines/update-all", "not-a-session").await.0, 401);
+
+    // "Update": the helper is told to install it even if it would not on its own.
+    let (code, v) = post(&s, &update_path, &s.admin).await;
+    assert_eq!(code, 200);
+    assert_eq!(v["version"], "99.0.0");
+    match next_json::<AgentMsg>(&mut agent).await {
+        AgentMsg::UpdateAvailable { version, force } => assert!(force && version == "99.0.0"),
+        other => panic!("{other:?}"),
+    }
+    assert!(machine(&overview(&s).await).updating, "shown as updating");
+    // Already being updated: "Update all" leaves it out.
+    assert_eq!(post(&s, "/api/machines/update-all", &s.admin).await.1["updating"], 0);
+
+    // The helper could not install it: the administrator sees why.
+    send(&mut agent, &AgentMsg::UpdateFailed { version: "99.0.0".into(), error: "checksum mismatch".into() }).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let m = machine(&overview(&s).await);
+    assert!(!m.updating);
+    assert_eq!(m.update_error.as_deref(), Some("checksum mismatch"));
+    // "Update all" tries it again.
+    assert_eq!(post(&s, "/api/machines/update-all", &s.admin).await.1["updating"], 1);
+    assert!(matches!(next_json::<AgentMsg>(&mut agent).await, AgentMsg::UpdateAvailable { force: true, .. }));
+
+    // Next try works: the helper comes back with the new version, the error is gone.
+    drop(agent);
+    let (mut ws, _) = connect_async(s.ws("/ws/agent")).await.unwrap();
+    send(
+        &mut ws,
+        &AgentMsg::Register {
+            enroll_token: None,
+            machine_id: Some(id.clone()),
+            secret: Some(secret),
+            hostname: "SRV2016".into(),
+            os: "Windows Server 2016".into(),
+            version: "99.0.0".into(),
+            target: "x86_64-pc-windows-gnu".into(),
+            monitors: vec![],
+        },
+    )
+    .await;
+    assert!(matches!(next_json::<AgentMsg>(&mut ws).await, AgentMsg::Registered { .. }));
+    let m = machine(&overview(&s).await);
+    assert_eq!(m.machine.version, "99.0.0");
+    assert!(m.up_to_date && !m.updating && m.update_error.is_none());
+
+    // Up to date: nothing to do.
+    assert_eq!(post(&s, &update_path, &s.admin).await.0, 400);
+    assert_eq!(post(&s, "/api/machines/update-all", &s.admin).await.1["updating"], 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -833,4 +932,112 @@ async fn overview_shows_relay_version_and_update_check_is_admin_only() {
     .await;
     assert_eq!(checking, Some(true));
     tokio::time::timeout(Duration::from_secs(1), ts.relay.update_now.notified()).await.expect("update loop woken");
+}
+
+/// Status code of a preview request with this sign-in token ("" = none).
+async fn preview_status(s: &TestServer, machine: &str, token: &str) -> u16 {
+    let url = format!("{}/api/machines/{machine}/preview", s.url);
+    let token = token.to_string();
+    blocking(move || {
+        let mut req = ureq::get(&url);
+        if !token.is_empty() {
+            req = req.header("Authorization", &format!("Bearer {token}"));
+        }
+        match req.call() {
+            Ok(r) => r.status().as_u16(),
+            Err(ureq::Error::StatusCode(c)) => c,
+            Err(e) => panic!("{e}"),
+        }
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_helper_sends_previews_of_every_screen() {
+    let s = start_server().await;
+    let cfg_dir = farlink::util::unique_temp_dir("farlink-e2e-host");
+    let cfg = HostConfig { server_url: s.url.clone(), enroll_token: Some(s.relay.enroll_token()), machine_id: None, secret: None };
+    tokio::spawn(run_agent(cfg_dir.join("host.json"), cfg, HostOptions { demo: true, no_update: true }));
+    let mut id = None;
+    for _ in 0..50 {
+        if let Some(m) = s.overview().await.machines.iter().find(|m| m.online) {
+            id = Some(m.machine.id.clone());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let id = id.expect("helper never came online");
+
+    let api = s.api();
+    let p = blocking(move || api.preview(&id).unwrap()).await;
+    assert!(p.taken > 0);
+    let frames = farlink::net::decode_preview(&p);
+    let sizes: Vec<_> = frames.iter().map(|(i, f)| (*i, f.width, f.height)).collect();
+    assert_eq!(sizes, vec![(0, 480, 270), (1, 480, 384)], "both demo screens, scaled down");
+    // No viewing session was opened for it.
+    assert!(s.overview().await.sessions.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn previews_follow_access_rules_and_are_shared_briefly() {
+    let s = start_server().await;
+    let (base, admin) = (s.url.clone(), s.admin.clone());
+    let created: serde_json::Value = blocking(move || {
+        ureq::post(&format!("{base}/api/users"))
+            .header("Authorization", &format!("Bearer {admin}"))
+            .send_json(serde_json::json!({"name": "Anna", "login": "anna", "password": "anna-pass-1"}))
+            .unwrap()
+            .body_mut()
+            .read_json()
+            .unwrap()
+    })
+    .await;
+    let anna_token = created["install_url"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
+    let (mut anna_agent, anna_pc, _) = fake_host_with(&s, &anna_token, "ANNA-PC").await;
+    let (mut office_agent, office_pc, _) = fake_host_with(&s, &s.relay.enroll_token(), "OFFICE").await;
+    let url = s.url.clone();
+    let anna = blocking(move || farlink::net::Api::login(&url, "anna", "anna-pass-1").unwrap()).await;
+
+    // Nobody signed in, and Anna for someone else's computer: refused before the host is asked.
+    assert_eq!(preview_status(&s, &office_pc, "").await, 401);
+    assert_eq!(preview_status(&s, &office_pc, &anna).await, 403);
+    assert_eq!(preview_status(&s, "no-such-pc", &s.admin).await, 403);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), office_agent.next()).await.is_err(),
+        "the office computer was not asked for pictures"
+    );
+
+    // Anna's own computer: the relay asks it and passes the answer on.
+    let api = farlink::net::Api { server: s.url.clone(), token: anna.clone() };
+    let pc = anna_pc.clone();
+    let request = tokio::spawn(async move { blocking(move || api.preview(&pc)).await });
+    let AgentMsg::PreviewRequest { req } = next_json::<AgentMsg>(&mut anna_agent).await else { panic!("expected preview_request") };
+    // Another computer can't answer in its place.
+    let fake = farlink::proto::PreviewShot { index: 0, width: 1, height: 1, jpeg: "AAAA".into() };
+    send(&mut office_agent, &AgentMsg::Preview { req, shots: vec![fake.clone(), fake] }).await;
+    let shot = farlink::proto::PreviewShot { index: 0, width: 2, height: 2, jpeg: "/9j/".into() };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    send(&mut anna_agent, &AgentMsg::Preview { req, shots: vec![shot.clone()] }).await;
+    let p = request.await.unwrap().unwrap();
+    assert_eq!(p.shots, vec![shot.clone()], "the real computer's answer, not the impostor's");
+
+    // Asked again right away (the admin looking too): served from the relay, the computer isn't bothered.
+    let api = s.api();
+    let pc = anna_pc.clone();
+    let again = blocking(move || api.preview(&pc).unwrap()).await;
+    assert_eq!(again.shots, vec![shot]);
+    assert!(tokio::time::timeout(Duration::from_millis(300), anna_agent.next()).await.is_err(), "no second request");
+
+    // Offline computers have no preview.
+    drop(office_agent);
+    for _ in 0..50 {
+        if !s.relay.is_online(&office_pc) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(preview_status(&s, &office_pc, &s.admin).await, 503);
+    let api = s.api();
+    let err = blocking(move || api.preview(&office_pc).unwrap_err()).await;
+    assert!(err.to_string().contains("offline"), "{err}");
 }

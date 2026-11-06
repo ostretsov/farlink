@@ -92,7 +92,7 @@ pub struct ViewerConfig {
     /// Sign-in name (empty = administrator).
     #[serde(default)]
     pub user_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "upgrade_quality")]
     pub quality: Quality,
     /// Machines open in view-only mode by default.
     #[serde(default)]
@@ -107,6 +107,11 @@ pub struct ViewerConfig {
 
 fn yes() -> bool {
     true
+}
+
+/// Saved 0.1 presets become the new (sharper, faster) presets.
+fn upgrade_quality<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Quality, D::Error> {
+    Ok(Quality::deserialize(d)?.upgraded())
 }
 
 impl Default for ViewerConfig {

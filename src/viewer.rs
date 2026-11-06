@@ -3,7 +3,8 @@
 
 use crate::config::{ViewerConfig, load_json, save_json, viewer_dir};
 use crate::layout::{LayoutStore, WindowPlace, default_place};
-use crate::net::{Api, ConnState, SessionHandle, Target, TransferState, parse_link};
+use crate::codec::Frame;
+use crate::net::{Api, ConnState, SessionHandle, Target, TransferState, decode_preview, demo_preview, parse_link};
 use crate::proto::{InputEvent, MonitorInfo, MouseButton, SessionMsg, monitor_fingerprint};
 use crate::quality::{Codec, ColorDepth, Preset, Quality};
 use crate::server::{MachineSummary, MachineView, Overview};
@@ -338,20 +339,34 @@ impl OpenSession {
 
 impl OpenSession {
     fn update_textures(&mut self, ctx: &egui::Context) {
-        let shared = self.handle.shared.lock().unwrap();
-        for (mon, canvas) in &shared.canvases {
-            let Some(frame) = &canvas.frame else { continue };
+        let mut shared = self.handle.shared.lock().unwrap();
+        for (mon, canvas) in shared.canvases.iter_mut() {
             let current = self.textures.get(mon).map(|t| t.1);
-            if current == Some(canvas.generation) {
+            if canvas.frame.is_none() || current == Some(canvas.generation) {
                 continue;
             }
-            let img = egui::ColorImage::from_rgba_unmultiplied([frame.width as usize, frame.height as usize], &frame.rgba);
+            let dirty = canvas.take_dirty();
+            let Some(frame) = &canvas.frame else { continue };
+            let size = [frame.width as usize, frame.height as usize];
             match self.textures.get_mut(mon) {
+                // Same size: upload only the parts that changed.
+                Some((tex, generation)) if tex.size() == size => {
+                    for r in dirty {
+                        if r.w == 0 || r.h == 0 {
+                            continue;
+                        }
+                        let part = frame.crop(r);
+                        let img = egui::ColorImage::from_rgba_unmultiplied([r.w as usize, r.h as usize], &part.rgba);
+                        tex.set_partial([r.x as usize, r.y as usize], img, egui::TextureOptions::LINEAR);
+                    }
+                    *generation = canvas.generation;
+                }
                 Some((tex, generation)) => {
-                    tex.set(img, egui::TextureOptions::LINEAR);
+                    tex.set(egui::ColorImage::from_rgba_unmultiplied(size, &frame.rgba), egui::TextureOptions::LINEAR);
                     *generation = canvas.generation;
                 }
                 None => {
+                    let img = egui::ColorImage::from_rgba_unmultiplied(size, &frame.rgba);
                     let tex = ctx.load_texture(format!("s{}m{}", self.id, mon), img, egui::TextureOptions::LINEAR);
                     self.textures.insert(*mon, (tex, canvas.generation));
                 }
@@ -480,6 +495,22 @@ pub fn fit_rect(avail: Rect, w: f32, h: f32) -> Rect {
 // ------------------------------------------------------------------ app
 
 /// An open "Rename computer" dialog.
+/// How often the selected computer's screen pictures are refreshed.
+const PREVIEW_EVERY: Duration = Duration::from_secs(5);
+
+/// Small pictures of the selected computer's screens.
+struct PreviewState {
+    machine_id: String,
+    /// When the last answer (or error) came; the next request is due after [`PREVIEW_EVERY`].
+    fetched: Option<Instant>,
+    /// Seconds since 1970 when the pictures were taken.
+    taken: u64,
+    textures: HashMap<u8, egui::TextureHandle>,
+    error: Option<String>,
+}
+
+type PreviewResult = (String, u64, Vec<(u8, Frame)>);
+
 struct Renaming {
     machine_id: String,
     text: String,
@@ -517,9 +548,13 @@ pub struct ViewerApp {
     job_grant: Option<Job<String>>,
     job_revoke: Option<Job<()>>,
     job_rename: Option<Job<()>>,
+    /// "Update" / "Update all" of helpers: what to tell the administrator.
+    job_update: Option<Job<String>>,
     renaming: Option<Renaming>,
     last_refresh: Option<Instant>,
     selected: Option<String>,
+    preview: Option<PreviewState>,
+    job_preview: Option<Job<PreviewResult>>,
     search: String,
     sessions: Vec<OpenSession>,
     next_session: u64,
@@ -559,14 +594,20 @@ pub fn sample_overview() -> Overview {
         sessions: 0,
         up_to_date: true,
         owner_name: None,
+        updating: false,
+        update_error: None,
     };
     let mut anna = m("demo-anna", "Anna's laptop", "ANNA-NB", "Windows 11 Home", vec![mon(0, 0, 1920, 1080)], true, 0);
     anna.machine.owner = Some("demo-user-anna".into());
     anna.owner_name = Some("Anna".into());
+    // One helper behind the published version, to show the "Update" button.
+    let mut srv = m("demo-srv", "Accounting server", "ACC-SRV16", "Windows Server 2016", vec![mon(0, 0, 1920, 1080)], true, 0);
+    srv.machine.version = "0.0.9".into();
+    srv.up_to_date = false;
     Overview {
         machines: vec![
             m("demo-office", "Office PC", "OFFICE-PC", "Windows 11 Pro", vec![mon(0, 0, 1600, 900), mon(1, 1600, 1280, 1024)], true, 0),
-            m("demo-srv", "Accounting server", "ACC-SRV16", "Windows Server 2016", vec![mon(0, 0, 1920, 1080)], true, 0),
+            srv,
             m(
                 "demo-ubuntu",
                 "Design workstation",
@@ -633,9 +674,12 @@ impl ViewerApp {
             job_grant: None,
             job_revoke: None,
             job_rename: None,
+            job_update: None,
             renaming: None,
             last_refresh: None,
             selected: None,
+            preview: None,
+            job_preview: None,
             search: String::new(),
             sessions: Vec::new(),
             next_session: 1,
@@ -651,7 +695,8 @@ impl ViewerApp {
         if demo {
             app.overview = Some(sample_overview());
             app.selected = Some("demo-office".into());
-            if screenshot {
+            // Hidden switch for checking the preview of a selected computer (no session open).
+            if screenshot && std::env::var_os("FARLINK_SHOT_PREVIEW").is_none() {
                 app.open_session(ctx, Target::Demo, Some("demo-office".into()), "Office PC".into(), false);
                 if std::env::var_os("FARLINK_SHOT_FILES").is_some() {
                     app.sessions[0].open_files();
@@ -831,12 +876,83 @@ impl ViewerApp {
             }
             self.refresh(ctx);
         }
+        if let Some(r) = take_job(&mut self.job_update) {
+            match r {
+                Ok(text) => self.toast(text),
+                Err(e) => self.toast(format!("Update failed: {e}")),
+            }
+            self.refresh(ctx);
+        }
         if let Some(r) = take_job(&mut self.job_revoke) {
             match r {
                 Ok(()) => self.toast("Access withdrawn, open sessions were ended"),
                 Err(e) => self.toast(e),
             }
             self.refresh(ctx);
+        }
+    }
+
+    /// Keep the pictures of the selected computer fresh: one request every
+    /// [`PREVIEW_EVERY`] while it is online and not already open (an open
+    /// session shows live pictures instead).
+    fn preview_step(&mut self, ctx: &egui::Context) {
+        if let Some(r) = take_job(&mut self.job_preview)
+            && let Some(p) = self.preview.as_mut()
+        {
+            p.fetched = Some(Instant::now());
+            match r {
+                Ok((id, taken, frames)) if id == p.machine_id => {
+                    p.error = None;
+                    p.taken = taken;
+                    p.textures.retain(|i, _| frames.iter().any(|(j, _)| j == i));
+                    for (i, f) in frames {
+                        let img = egui::ColorImage::from_rgba_unmultiplied([f.width as usize, f.height as usize], &f.rgba);
+                        match p.textures.get_mut(&i) {
+                            Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                            None => {
+                                let t = ctx.load_texture(format!("preview{i}"), img, egui::TextureOptions::LINEAR);
+                                p.textures.insert(i, t);
+                            }
+                        }
+                    }
+                }
+                Ok(_) => p.fetched = None, // answer for a computer no longer selected
+                Err(e) => p.error = Some(e),
+            }
+        }
+        let wanted = self
+            .overview
+            .as_ref()
+            .and_then(|o| o.machines.iter().find(|m| Some(&m.machine.id) == self.selected.as_ref()))
+            .filter(|m| m.online && (self.signed_in() || self.demo))
+            .filter(|m| !self.sessions.iter().any(|s| s.machine_id.as_ref() == Some(&m.machine.id)))
+            .map(|m| (m.machine.id.clone(), m.machine.monitors.clone()));
+        let Some((id, monitors)) = wanted else {
+            self.preview = None;
+            return;
+        };
+        if self.preview.as_ref().is_none_or(|p| p.machine_id != id) {
+            self.preview = Some(PreviewState { machine_id: id.clone(), fetched: None, taken: 0, textures: HashMap::new(), error: None });
+        }
+        let p = self.preview.as_ref().unwrap();
+        let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
+        let due = p.fetched.is_none_or(|t| t.elapsed() >= PREVIEW_EVERY);
+        if self.job_preview.is_none() && due && !minimized {
+            if self.demo {
+                let tick = (now_secs() / 5) as u32;
+                self.job_preview = Some(spawn_job(ctx, move || {
+                    let p = demo_preview(&monitors, tick);
+                    Ok((id, p.taken, decode_preview(&p)))
+                }));
+            } else if let Some(api) = self.api() {
+                self.job_preview = Some(spawn_job(ctx, move || {
+                    let p = api.preview(&id)?;
+                    Ok((id, p.taken, decode_preview(&p)))
+                }));
+            }
+        }
+        if let Some(t) = p.fetched {
+            ctx.request_repaint_after(PREVIEW_EVERY.saturating_sub(t.elapsed()).max(Duration::from_millis(100)));
         }
     }
 
@@ -1005,6 +1121,16 @@ impl ViewerApp {
                 let online = ov.machines.iter().filter(|m| m.online).count();
                 let title = if ov.role == "admin" { "COMPUTERS" } else { "MY COMPUTERS" };
                 ui.label(RichText::new(format!("{title} · {online} ONLINE OF {}", ov.machines.len())).size(11.0).color(MUTED));
+                // Helpers behind the published version that can be updated right now.
+                let outdated = ov.machines.iter().filter(|m| m.online && !m.up_to_date && !m.updating).count();
+                let mut update_all = false;
+                if ov.role == "admin" && outdated > 0 {
+                    let text = format!("{outdated} helper{} out of date · Update all", if outdated == 1 { " is" } else { "s are" });
+                    update_all = ui
+                        .add_enabled(self.job_update.is_none(), egui::Link::new(RichText::new(text).size(12.0).color(AMBER)))
+                        .on_hover_text(format!("Install {} on every connected computer with an older helper", ov.release_version.as_deref().unwrap_or("?")))
+                        .clicked();
+                }
                 ui.add_space(2.0);
                 let mut clicked = None;
                 let mut rename_start: Option<(String, String)> = None;
@@ -1015,7 +1141,11 @@ impl ViewerApp {
                     }) {
                         let selected = self.selected.as_deref() == Some(m.machine.id.as_str());
                         let in_session = self.sessions.iter().any(|s| s.machine_id.as_deref() == Some(m.machine.id.as_str()));
-                        let resp = machine_row(ui, m, selected, in_session, ov.now);
+                        let mut resp = machine_row(ui, m, selected, in_session, ov.now);
+                        if !m.up_to_date {
+                            let state = if m.updating { "updating" } else if m.update_error.is_some() { "update failed" } else { "out of date" };
+                            resp = resp.on_hover_text(format!("Helper {}: {state}", m.machine.version));
+                        }
                         if resp.clicked() {
                             clicked = Some(m.machine.id.clone());
                         }
@@ -1048,7 +1178,59 @@ impl ViewerApp {
                 if let Some((id, name)) = rename_start {
                     self.renaming = Some(Renaming { machine_id: id, text: name, focus: true });
                 }
+                if update_all {
+                    self.start_update(ui.ctx(), None);
+                }
             });
+    }
+
+    /// Helper version vs. the published one, with "Update now" for the administrator.
+    fn helper_update_row(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, mv: &MachineView) {
+        let Some(ov) = &self.overview else { return };
+        let Some(release) = ov.release_version.clone() else { return };
+        let is_admin = ov.role == "admin";
+        let m = &mv.machine;
+        if m.version == release {
+            return;
+        }
+        ui.horizontal(|ui| {
+            if mv.updating {
+                ui.add(egui::Spinner::new().size(12.0));
+                ui.label(RichText::new(format!("Updating the helper to {release}...")).color(ACCENT));
+            } else if let Some(e) = &mv.update_error {
+                ui.label(RichText::new(format!("Update to {release} failed: {e}")).color(DANGER));
+            } else if !mv.up_to_date {
+                ui.label(RichText::new(format!("Helper {} is older than the published {release}", m.version)).color(AMBER));
+            } else {
+                ui.label(RichText::new(format!("Helper {} is newer than the published {release}", m.version)).color(MUTED));
+            }
+            if is_admin && mv.online && !mv.updating {
+                let text = if mv.update_error.is_some() { "Try again" } else { "Update now" };
+                let button = ui
+                    .add_enabled(self.job_update.is_none(), egui::Button::new(text).small())
+                    .on_hover_text(format!("Install {release} on this computer now; the helper restarts (open sessions reconnect)"));
+                if button.clicked() {
+                    self.start_update(ctx, Some(m.id.clone()));
+                }
+            }
+        });
+    }
+
+    /// Ask the server to update one helper (`Some(id)`) or every outdated one.
+    fn start_update(&mut self, ctx: &egui::Context, machine_id: Option<String>) {
+        if self.demo {
+            self.toast("Sample computers can't be updated");
+            return;
+        }
+        let Some(api) = self.api() else { return };
+        self.job_update = Some(spawn_job(ctx, move || match machine_id {
+            Some(id) => api.update_machine(&id).map(|v| format!("Updating to {v}; the helper restarts in a moment")),
+            None => api.update_all().map(|n| match n {
+                0 => "Every connected helper is up to date".to_string(),
+                1 => "Updating 1 computer".to_string(),
+                n => format!("Updating {n} computers"),
+            }),
+        }));
     }
 
     /// The "Rename computer" dialog.
@@ -1203,6 +1385,7 @@ impl ViewerApp {
                 if let Some(owner) = &mv.owner_name {
                     ui.label(RichText::new(format!("Belongs to {owner}: only {owner} and the administrator can reach it")).color(AMBER));
                 }
+                self.helper_update_row(ctx, ui, mv);
             });
         });
         ui.add_space(12.0);
@@ -1317,6 +1500,21 @@ impl ViewerApp {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Screens").size(16.0).strong());
                 ui.label(RichText::new(format!("{} on this computer · each opens in its own window", monitors.len())).color(MUTED));
+                if let Some(p) = self.preview.as_ref().filter(|p| p.machine_id == m.id) {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let text = match (&p.error, p.textures.is_empty()) {
+                            (Some(e), _) => RichText::new(format!("Preview: {e}")).color(AMBER),
+                            (None, true) => RichText::new("Loading preview...").color(MUTED),
+                            (None, false) => RichText::new(format!(
+                                "Preview, every {} s · taken {} ago",
+                                PREVIEW_EVERY.as_secs(),
+                                human_duration(now_secs().saturating_sub(p.taken))
+                            ))
+                            .color(MUTED),
+                        };
+                        ui.label(text.size(12.5));
+                    });
+                }
             });
             ui.add_space(6.0);
             if monitors.is_empty() {
@@ -1326,7 +1524,7 @@ impl ViewerApp {
             // Arrangement diagram with live pictures when connected.
             let (vx, vy, vw, vh) = crate::desktop::virtual_bounds(&monitors);
             let avail_w = ui.available_width().min(760.0);
-            let scale = (avail_w / vw as f32).min(200.0 / vh as f32);
+            let scale = (avail_w / vw as f32).min(260.0 / vh as f32);
             let (area, _) = ui.allocate_exact_size(Vec2::new(avail_w, vh as f32 * scale + 8.0), Sense::hover());
             let painter = ui.painter_at(area);
             let off = Vec2::new((avail_w - vw as f32 * scale) / 2.0, 4.0);
@@ -1337,7 +1535,10 @@ impl ViewerApp {
                 )
                 .shrink(3.0);
                 painter.rect_filled(r, CornerRadius::same(4), PANEL2);
-                let tex = session_idx.and_then(|i| self.sessions[i].textures.get(&mon.index).map(|t| t.0.id()));
+                let tex = session_idx.and_then(|i| self.sessions[i].textures.get(&mon.index).map(|t| t.0.id())).or_else(|| {
+                    let p = self.preview.as_ref().filter(|p| p.machine_id == m.id)?;
+                    p.textures.get(&mon.index).map(|t| t.id())
+                });
                 if let Some(tex) = tex {
                     painter.image(tex, r.shrink(2.0), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
                 } else {
@@ -1409,13 +1610,13 @@ impl ViewerApp {
                 ui.end_row();
                 ui.label("Compression");
                 ui.horizontal(|ui| {
-                    for c in [Codec::Jpeg, Codec::Png] {
+                    for c in Codec::ALL {
                         ui.radio_value(&mut q.codec, c, c.label());
                     }
                 });
                 ui.end_row();
-                if q.codec == Codec::Jpeg {
-                    ui.label("JPEG quality");
+                if q.codec != Codec::Png {
+                    ui.label(if q.codec == Codec::Auto { "Photo quality" } else { "JPEG quality" });
                     ui.add(egui::Slider::new(&mut q.jpeg_quality, 10..=95));
                     ui.end_row();
                 }
@@ -1428,7 +1629,10 @@ impl ViewerApp {
                 ui.end_row();
             });
             ui.label(
-                RichText::new("Fewer colours and a smaller picture use less internet. Colour depth matters most with Sharp text (PNG).")
+                RichText::new(
+                    "Auto sends text and windows lossless and photos/video as JPEG, then sharpens them once they stop moving. \
+                     Fewer colours and a smaller picture use less internet.",
+                )
                     .color(MUTED)
                     .size(12.0),
             );
@@ -1689,6 +1893,7 @@ impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_jobs(&ctx);
+        self.preview_step(&ctx);
         if self.signed_in() && !self.demo && self.last_refresh.is_none_or(|t| t.elapsed() > Duration::from_secs(5)) {
             self.refresh(&ctx);
         }
@@ -1863,6 +2068,14 @@ fn machine_row(ui: &mut egui::Ui, m: &MachineView, selected: bool, in_session: b
         Color32::from_rgb(89, 97, 109)
     };
     p.circle_filled(Pos2::new(rect.max.x - 14.0, rect.center().y), 4.5, dot);
+    if !m.up_to_date {
+        // Small "arrow up": this helper is older than the published version.
+        let c = Pos2::new(rect.max.x - 30.0, rect.center().y);
+        let color = if m.update_error.is_some() { DANGER } else { AMBER };
+        let tri = vec![c + Vec2::new(0.0, -5.0), c + Vec2::new(5.0, 2.0), c + Vec2::new(-5.0, 2.0)];
+        p.add(egui::Shape::convex_polygon(tri, color, Stroke::NONE));
+        p.rect_filled(Rect::from_center_size(c + Vec2::new(0.0, 4.0), Vec2::new(3.0, 4.0)), CornerRadius::ZERO, color);
+    }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 

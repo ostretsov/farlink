@@ -7,6 +7,8 @@ use anyhow::Result;
 #[cfg(target_os = "linux")]
 pub mod x11;
 #[cfg(windows)]
+pub mod dxgi;
+#[cfg(windows)]
 pub mod windows;
 
 /// One machine's screens, mouse and keyboard.

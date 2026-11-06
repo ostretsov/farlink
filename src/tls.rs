@@ -181,7 +181,14 @@ pub async fn run(relay: crate::server::Shared, cfg: ServerConfig) -> Result<()> 
         );
     }
     match &cfg.tls {
-        Tls::Off => crate::server::serve(relay, listener).await,
+        Tls::Off => {
+            use axum::serve::ListenerExt;
+            // Small messages (mouse, keys, acks) must not wait for Nagle's algorithm.
+            let listener = listener.tap_io(|tcp| {
+                let _ = tcp.set_nodelay(true);
+            });
+            crate::server::serve(relay, listener).await
+        }
         tls => crate::server::serve(relay, listen(listener, tls, &cfg.data_dir)?).await,
     }
 }

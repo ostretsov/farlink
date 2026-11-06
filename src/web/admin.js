@@ -79,6 +79,10 @@ function render() {
   $('installUrl').textContent = data.install_url;
   const q = $('filter').value.toLowerCase();
   const ms = data.machines.filter((m) => !q || (m.name + m.hostname + m.os + (m.owner_name || '')).toLowerCase().includes(q));
+  const outdated = data.machines.filter((m) => m.online && !m.up_to_date && !m.updating).length;
+  $('updAll').classList.toggle('hidden', !admin || !outdated);
+  $('updAll').textContent = 'Update ' + outdated + ' out of date';
+  $('updAll').title = 'Install ' + (data.release_version || '') + ' on every connected computer with an older helper';
   $('mcount').textContent = data.machines.filter((m) => m.online).length + ' online of ' + data.machines.length;
   $('machines').innerHTML = ms.map((m) => `<tr ${admin ? `oncontextmenu="rowMenu(event, '${m.id}')" title="Right-click to rename"` : ''}>
     <td><span class="dot ${m.online ? 'on' : ''}"></span><b>${esc(m.name)}</b>
@@ -86,7 +90,7 @@ function render() {
       <div class="muted">${m.online ? 'online' : 'seen ' + ago(data.now - m.last_seen)} · ${esc(m.hostname)}</div></td>
     <td>${esc(m.os)}</td><td>${screens(m.monitors)}</td>
     ${admin ? `<td>${ownerSelect(m)}</td>` : ''}
-    <td>${esc(m.version)} ${m.up_to_date ? '' : '<span class="tag view">updating</span>'}</td>
+    <td>${versionCell(m, admin)}</td>
     <td style="text-align:right;white-space:nowrap">
       <a class="btn small primary" href="/view/${m.id}" target="_blank" ${m.online ? '' : 'style="opacity:.5"'}>Control</a>
       <a class="btn small" href="/view/${m.id}?view_only=1" target="_blank">View</a>
@@ -123,6 +127,34 @@ function render() {
     <td>${s.view_only ? '<span class="tag view">view</span>' : '<span class="tag ctrl">control</span>'}</td>
     <td style="text-align:right"><button class="small danger" onclick="endSession('${s.id}')">End</button></td></tr>`).join('')
     || '<tr><td colspan="4" class="muted">Nobody is connected.</td></tr>';
+}
+
+// Helper version on a computer, how its update goes, and "Update" (administrator).
+function versionCell(m, admin) {
+  const rel = data.release_version;
+  let html = esc(m.version);
+  if (m.updating) html += ' <span class="tag ctrl">updating…</span>';
+  else if (m.update_error) html += ` <span class="tag bad" title="${esc(m.update_error)}">update failed</span>`;
+  else if (!m.up_to_date) html += ' <span class="tag view">out of date</span>';
+  if (admin && m.online && rel && m.version !== rel && !m.updating) {
+    html += ` <button class="small" onclick="updateMachine('${m.id}')" title="Install ${esc(rel)} now; the helper restarts">${m.update_error ? 'Try again' : 'Update'}</button>`;
+  }
+  if (m.update_error && !m.updating) html += `<div class="muted">${esc(m.update_error)}</div>`;
+  return html;
+}
+async function updateMachine(id) {
+  try {
+    const r = await api('POST', '/api/machines/' + id + '/update');
+    toast('Updating to ' + r.version + '…');
+  } catch (e) { toast(e.message); }
+  refresh();
+}
+async function updateAll() {
+  try {
+    const r = await api('POST', '/api/machines/update-all');
+    toast(r.updating ? 'Updating ' + r.updating + (r.updating === 1 ? ' computer…' : ' computers…') : 'Everything is up to date');
+  } catch (e) { toast(e.message); }
+  refresh();
 }
 
 // Relay version and its own updates: short form in the header, details and

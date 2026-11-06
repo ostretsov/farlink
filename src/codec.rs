@@ -4,7 +4,9 @@
 //! 1. scale to the chosen size,
 //! 2. reduce colours to the chosen depth,
 //! 3. compare with the previous picture in 64×64 tiles,
-//! 4. send only changed tiles (neighbours merged into strips) as JPEG/PNG.
+//! 4. send only changed tiles (neighbours merged into strips) as JPEG/PNG
+//!    (Auto: lossless palette PNG for text/windows, JPEG for photos, and
+//!    rough JPEG parts sharpened once they stop changing).
 
 use crate::proto::{FLAG_LAST, TileFormat, TileHeader};
 use crate::quality::{Codec, ColorDepth, Quality};
@@ -249,49 +251,180 @@ pub fn changed_rects(prev: Option<&Frame>, cur: &Frame) -> Vec<Rect> {
     out
 }
 
+/// JPEG quality used to sharpen parts that Auto first sent as rough JPEG.
+pub const REFINE_JPEG: u8 = 92;
+
+/// One compressed part of a picture.
+struct Encoded {
+    format: TileFormat,
+    data: Vec<u8>,
+    /// Rough JPEG that Auto should sharpen once it stops changing.
+    rough: bool,
+}
+
 /// Compress one part of a prepared picture.
 pub fn encode_rect(f: &Frame, r: Rect, q: &Quality) -> Result<(TileFormat, Vec<u8>)> {
+    let e = encode_part(f, r, q)?;
+    Ok((e.format, e.data))
+}
+
+fn encode_part(f: &Frame, r: Rect, q: &Quality) -> Result<Encoded> {
+    let q = q.clamped();
     let tile = f.crop(r);
-    let mut buf = Vec::new();
     match q.codec {
-        Codec::Jpeg => {
-            use image::ImageEncoder;
-            let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, q.clamped().jpeg_quality);
-            if q.color == ColorDepth::Gray {
-                let gray: Vec<u8> = tile.rgba.chunks_exact(4).map(|p| p[0]).collect();
-                enc.write_image(&gray, r.w, r.h, image::ExtendedColorType::L8)?;
-            } else {
-                let rgb: Vec<u8> = tile.rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
-                enc.write_image(&rgb, r.w, r.h, image::ExtendedColorType::Rgb8)?;
+        Codec::Jpeg => Ok(Encoded { format: TileFormat::Jpeg, data: jpeg(&tile, q.jpeg_quality, q.color)?, rough: false }),
+        Codec::Png => Ok(Encoded { format: TileFormat::Png, data: png_lossless(&tile, q.color)?, rough: false }),
+        Codec::Auto => {
+            // Text, windows and icons rarely use more than 256 colours in one
+            // strip: send them lossless (palette PNG is small and fast).
+            if let Some((palette, indexed)) = palette_of(&tile) {
+                return Ok(Encoded { format: TileFormat::Png, data: png_indexed(&tile, &palette, &indexed)?, rough: false });
             }
-            Ok((TileFormat::Jpeg, buf))
-        }
-        Codec::Png => {
-            let mut enc = png::Encoder::new(&mut buf, r.w, r.h);
-            enc.set_depth(png::BitDepth::Eight);
-            enc.set_compression(png::Compression::Fast);
-            let data: Vec<u8> = match q.color {
-                ColorDepth::Gray => {
-                    enc.set_color(png::ColorType::Grayscale);
-                    tile.rgba.chunks_exact(4).map(|p| p[0]).collect()
-                }
-                ColorDepth::Low => {
-                    enc.set_color(png::ColorType::Indexed);
-                    let palette: Vec<u8> = (0..=255u8).flat_map(color_332).collect();
-                    enc.set_palette(palette);
-                    tile.rgba.chunks_exact(4).map(|p| index_332(p[0], p[1], p[2])).collect()
-                }
-                ColorDepth::Full | ColorDepth::High => {
-                    enc.set_color(png::ColorType::Rgb);
-                    tile.rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect()
-                }
-            };
-            let mut w = enc.write_header()?;
-            w.write_image_data(&data)?;
-            w.finish()?;
-            Ok((TileFormat::Png, buf))
+            let rough = q.jpeg_quality < REFINE_JPEG;
+            Ok(Encoded { format: TileFormat::Jpeg, data: jpeg(&tile, q.jpeg_quality, q.color)?, rough })
         }
     }
+}
+
+/// A small JPEG of a whole monitor: longest side at most `max` pixels.
+pub fn thumbnail_jpeg(f: &Frame, max: u32, quality: u8) -> Result<(u32, u32, Vec<u8>)> {
+    let k = (max as f32 / f.width.max(f.height).max(1) as f32).min(1.0);
+    let (w, h) = (((f.width as f32 * k).round() as u32).max(1), ((f.height as f32 * k).round() as u32).max(1));
+    let small = if (w, h) == (f.width, f.height) { f.clone() } else { scale(f, w, h) };
+    Ok((w, h, jpeg(&small, quality, ColorDepth::Full)?))
+}
+
+fn jpeg(tile: &Frame, quality: u8, color: ColorDepth) -> Result<Vec<u8>> {
+    use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
+    let mut buf = Vec::with_capacity(tile.rgba.len() / 8);
+    let mut enc = Encoder::new(&mut buf, quality);
+    // Full colour resolution for high qualities keeps coloured text crisp.
+    enc.set_sampling_factor(if quality >= 90 { SamplingFactor::R_4_4_4 } else { SamplingFactor::R_4_2_0 });
+    let (w, h) = (tile.width as u16, tile.height as u16);
+    if color == ColorDepth::Gray {
+        let gray: Vec<u8> = tile.rgba.chunks_exact(4).map(|p| p[0]).collect();
+        enc.encode(&gray, w, h, ColorType::Luma)?;
+    } else {
+        enc.encode(&tile.rgba, w, h, ColorType::Rgba)?;
+    }
+    Ok(buf)
+}
+
+fn png_lossless(tile: &Frame, color: ColorDepth) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut enc = png::Encoder::new(&mut buf, tile.width, tile.height);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.set_compression(png::Compression::Fast);
+    let data: Vec<u8> = match color {
+        ColorDepth::Gray => {
+            enc.set_color(png::ColorType::Grayscale);
+            tile.rgba.chunks_exact(4).map(|p| p[0]).collect()
+        }
+        ColorDepth::Low => {
+            enc.set_color(png::ColorType::Indexed);
+            let palette: Vec<u8> = (0..=255u8).flat_map(color_332).collect();
+            enc.set_palette(palette);
+            tile.rgba.chunks_exact(4).map(|p| index_332(p[0], p[1], p[2])).collect()
+        }
+        ColorDepth::Full | ColorDepth::High => {
+            // Few colours: a palette PNG is much smaller and quicker.
+            if let Some((palette, indexed)) = palette_of(tile) {
+                return png_indexed(tile, &palette, &indexed);
+            }
+            enc.set_color(png::ColorType::Rgb);
+            tile.rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect()
+        }
+    };
+    let mut w = enc.write_header()?;
+    w.write_image_data(&data)?;
+    w.finish()?;
+    Ok(buf)
+}
+
+fn png_indexed(tile: &Frame, palette: &[u8], indexed: &[u8]) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut enc = png::Encoder::new(&mut buf, tile.width, tile.height);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.set_compression(png::Compression::Fast);
+    enc.set_color(png::ColorType::Indexed);
+    enc.set_palette(palette.to_vec());
+    let mut w = enc.write_header()?;
+    w.write_image_data(indexed)?;
+    w.finish()?;
+    Ok(buf)
+}
+
+/// The palette (RGB triples) and one index per pixel, if the picture has at
+/// most 256 colours. Gives up as soon as the 257th colour appears.
+pub fn palette_of(tile: &Frame) -> Option<(Vec<u8>, Vec<u8>)> {
+    const SLOTS: usize = 1024; // open addressing, at most 1/4 full
+    const EMPTY: u32 = u32::MAX; // alpha is always 255, so RGB keys never hit this
+    let mut keys = [EMPTY; SLOTS];
+    let mut vals = [0u8; SLOTS];
+    let mut palette = Vec::with_capacity(64 * 3);
+    let mut indexed = Vec::with_capacity(tile.rgba.len() / 4);
+    let mut last_key = EMPTY;
+    let mut last_val = 0u8;
+    for p in tile.rgba.chunks_exact(4) {
+        let key = u32::from_le_bytes([p[0], p[1], p[2], 0]);
+        if key != last_key {
+            let mut slot = (key.wrapping_mul(0x9E37_79B1) >> 22) as usize; // top 10 bits
+            loop {
+                if keys[slot] == key {
+                    last_val = vals[slot];
+                    break;
+                }
+                if keys[slot] == EMPTY {
+                    let n = palette.len() / 3;
+                    if n == 256 {
+                        return None;
+                    }
+                    keys[slot] = key;
+                    vals[slot] = n as u8;
+                    palette.extend_from_slice(&p[..3]);
+                    last_val = n as u8;
+                    break;
+                }
+                slot = (slot + 1) % SLOTS;
+            }
+            last_key = key;
+        }
+        indexed.push(last_val);
+    }
+    Some((palette, indexed))
+}
+
+/// Threads used to compress one picture: half the processors (at most 4),
+/// so the remote computer stays responsive for the person using it.
+fn encode_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::thread::available_parallelism().map(|n| n.get() / 2).unwrap_or(1).clamp(1, 4))
+}
+
+/// Compress many parts, in parallel when there is enough work.
+fn encode_parts(f: &Frame, rects: &[Rect], q: &Quality) -> Vec<Result<Encoded>> {
+    let pixels: u64 = rects.iter().map(|r| r.w as u64 * r.h as u64).sum();
+    let threads = encode_threads().min(rects.len());
+    if threads <= 1 || pixels < 200_000 {
+        return rects.iter().map(|r| encode_part(f, *r, q)).collect();
+    }
+    let mut out: Vec<Option<Result<Encoded>>> = (0..rects.len()).map(|_| None).collect();
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                s.spawn(move || {
+                    rects.iter().enumerate().skip(t).step_by(threads).map(|(i, r)| (i, encode_part(f, *r, q))).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for h in handles {
+            match h.join() {
+                Ok(done) => done.into_iter().for_each(|(i, e)| out[i] = Some(e)),
+                Err(_) => {} // left as None → reported below
+            }
+        }
+    });
+    out.into_iter().map(|e| e.unwrap_or_else(|| Err(anyhow::anyhow!("encoder thread failed")))).collect()
 }
 
 /// Decode a tile back to RGBA (desktop viewer side).
@@ -309,25 +442,82 @@ pub fn decode_tile(format: TileFormat, data: &[u8]) -> Result<Frame> {
 #[derive(Default)]
 pub struct MonitorEncoder {
     prev: Option<Frame>,
+    /// Per 64×64 tile (row by row): sent as rough JPEG, worth sharpening.
+    rough: Vec<bool>,
 }
 
 impl MonitorEncoder {
     /// Forget the last picture so the next one is sent completely.
     pub fn reset(&mut self) {
         self.prev = None;
+        self.rough.clear();
     }
 
     /// Messages for this picture (empty if nothing changed). The last message
     /// carries [`FLAG_LAST`].
     pub fn encode(&mut self, frame: Frame, q: &Quality, monitor: u8, seq: u32) -> Result<Vec<Vec<u8>>> {
         let rects = changed_rects(self.prev.as_ref(), &frame);
-        let mut out = Vec::with_capacity(rects.len());
+        let cols = frame.width.div_ceil(TILE) as usize;
+        let tiles = cols * frame.height.div_ceil(TILE) as usize;
+        if self.rough.len() != tiles || self.prev.as_ref().is_none_or(|p| p.width != frame.width || p.height != frame.height) {
+            self.rough = vec![false; tiles];
+        }
+        let out = self.messages(&frame, &rects, q, monitor, seq)?;
+        self.prev = Some(frame);
+        Ok(out)
+    }
+
+    /// Parts still showing a rough JPEG (Auto only).
+    pub fn needs_refine(&self) -> bool {
+        self.rough.iter().any(|&r| r)
+    }
+
+    /// Send the rough JPEG parts again in high quality. Call when the screen
+    /// has been still for a moment.
+    pub fn refine(&mut self, q: &Quality, monitor: u8, seq: u32) -> Result<Vec<Vec<u8>>> {
+        let Some(frame) = self.prev.take() else { return Ok(Vec::new()) };
+        let cols = frame.width.div_ceil(TILE) as usize;
+        let mut rects = Vec::new();
+        for (ty, row) in self.rough.chunks(cols).enumerate() {
+            let y = ty as u32 * TILE;
+            let h = TILE.min(frame.height - y);
+            let mut run: Option<Rect> = None;
+            for (tx, &rough) in row.iter().enumerate() {
+                let x = tx as u32 * TILE;
+                let w = TILE.min(frame.width - x);
+                match (&mut run, rough) {
+                    (Some(r), true) if r.w + w <= MAX_STRIP => r.w += w,
+                    (_, true) => {
+                        rects.extend(run.take());
+                        run = Some(Rect { x, y, w, h });
+                    }
+                    (_, false) => rects.extend(run.take()),
+                }
+            }
+            rects.extend(run);
+        }
+        let sharp = Quality { codec: Codec::Jpeg, jpeg_quality: REFINE_JPEG, ..q.clamped() };
+        let out = self.messages(&frame, &rects, &sharp, monitor, seq);
+        self.prev = Some(frame);
+        out
+    }
+
+    fn messages(&mut self, frame: &Frame, rects: &[Rect], q: &Quality, monitor: u8, seq: u32) -> Result<Vec<Vec<u8>>> {
+        let cols = frame.width.div_ceil(TILE) as usize;
         let n = rects.len();
-        for (i, r) in rects.into_iter().enumerate() {
-            let (format, data) = encode_rect(&frame, r, q)?;
+        let mut out = Vec::with_capacity(n);
+        for (i, (r, e)) in rects.iter().zip(encode_parts(frame, rects, q)).enumerate() {
+            let e = e?;
+            for ty in r.y / TILE..(r.y + r.h).div_ceil(TILE) {
+                for tx in r.x / TILE..(r.x + r.w).div_ceil(TILE) {
+                    if let Some(t) = self.rough.get_mut(ty as usize * cols + tx as usize) {
+                        *t = e.rough;
+                    }
+                }
+            }
             let header = TileHeader {
                 monitor,
-                format,
+                format: e.format,
                 flags: if i + 1 == n { FLAG_LAST } else { 0 },
                 frame_w: frame.width as u16,
                 frame_h: frame.height as u16,
@@ -337,9 +527,8 @@ impl MonitorEncoder {
                 h: r.h as u16,
                 seq,
             };
-            out.push(header.encode(&data));
+            out.push(header.encode(&e.data));
         }
-        self.prev = Some(frame);
         Ok(out)
     }
 }
@@ -350,19 +539,45 @@ pub struct Canvas {
     pub frame: Option<Frame>,
     /// Bumped whenever pixels change, so the UI knows to re-upload the texture.
     pub generation: u64,
+    /// Parts changed since the UI last took them (only those are re-uploaded).
+    pub dirty: Vec<Rect>,
 }
 
 impl Canvas {
     pub fn apply(&mut self, h: &TileHeader, data: &[u8]) -> Result<()> {
         let tile = decode_tile(h.format, data)?;
+        self.apply_tile(h, &tile);
+        Ok(())
+    }
+
+    /// Put an already decoded tile in place.
+    pub fn apply_tile(&mut self, h: &TileHeader, tile: &Frame) {
         let (fw, fh) = (h.frame_w as u32, h.frame_h as u32);
         if self.frame.as_ref().is_none_or(|f| f.width != fw || f.height != fh) {
             self.frame = Some(Frame::filled(fw, fh, [16, 18, 24, 255]));
+            self.dirty.clear();
+            self.dirty.push(Rect { x: 0, y: 0, w: fw, h: fh });
         }
         let f = self.frame.as_mut().unwrap();
-        f.blit(&tile, h.x as u32, h.y as u32);
+        f.blit(tile, h.x as u32, h.y as u32);
+        let (x, y) = (h.x as u32, h.y as u32);
+        if x < fw && y < fh {
+            self.dirty.push(Rect { x, y, w: tile.width.min(fw - x), h: tile.height.min(fh - y) });
+        }
         self.generation += 1;
-        Ok(())
+    }
+
+    /// Changed parts since the last call (a single bounding box when there are many).
+    pub fn take_dirty(&mut self) -> Vec<Rect> {
+        let mut d = std::mem::take(&mut self.dirty);
+        if d.len() > 48 {
+            let x0 = d.iter().map(|r| r.x).min().unwrap_or(0);
+            let y0 = d.iter().map(|r| r.y).min().unwrap_or(0);
+            let x1 = d.iter().map(|r| r.x + r.w).max().unwrap_or(0);
+            let y1 = d.iter().map(|r| r.y + r.h).max().unwrap_or(0);
+            d = vec![Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }];
+        }
+        d
     }
 }
 
@@ -513,6 +728,102 @@ mod tests {
         }
     }
 
+    /// Screen-like picture: white window with dark "text", plus a noisy photo.
+    fn desktop_like(w: u32, h: u32) -> Frame {
+        let mut f = Frame::filled(w, h, [250, 250, 250, 255]);
+        for y in 0..h {
+            for x in 0..w {
+                if x >= w / 2 {
+                    let n = (x.wrapping_mul(7919) ^ y.wrapping_mul(104_729)).wrapping_mul(2_654_435_761) >> 24;
+                    f.set_pixel(x, y, [n as u8, (x * 3) as u8, (y * 5) as u8, 255]);
+                } else if (y / 16) % 2 == 0 && (x / 3 + y) % 4 == 0 {
+                    f.set_pixel(x, y, [20, 20, 30, 255]);
+                }
+            }
+        }
+        f
+    }
+
+    #[test]
+    fn palette_detection() {
+        let f = Frame::filled(64, 64, [1, 2, 3, 255]);
+        let (pal, idx) = palette_of(&f).unwrap();
+        assert_eq!(pal, vec![1, 2, 3]);
+        assert!(idx.iter().all(|&i| i == 0));
+        let mut g = Frame::new(32, 32);
+        for i in 0..1024u32 {
+            g.set_pixel(i % 32, i / 32, [i as u8, (i >> 8) as u8, 0, 255]);
+        }
+        assert!(palette_of(&g).is_none(), "1024 colours");
+        assert!(palette_of(&g.crop(Rect { x: 0, y: 0, w: 32, h: 8 })).is_some(), "exactly 256 colours");
+    }
+
+    #[test]
+    fn auto_sends_text_lossless_and_photos_as_jpeg_then_sharpens_them() {
+        let q = Quality::preset(Preset::Balanced);
+        assert_eq!(q.codec, Codec::Auto);
+        let f = desktop_like(1024, 128);
+        let mut enc = MonitorEncoder::default();
+        let mut canvas = Canvas::default();
+        let mut formats = Vec::new();
+        for m in enc.encode(f.clone(), &q, 0, 1).unwrap() {
+            let (h, data) = TileHeader::decode(&m).unwrap();
+            formats.push((h.x, h.format));
+            canvas.apply(&h, data).unwrap();
+        }
+        assert!(formats.contains(&(0, TileFormat::Png)), "{formats:?}");
+        assert!(formats.contains(&(512, TileFormat::Jpeg)), "{formats:?}");
+        let text = Rect { x: 0, y: 0, w: 512, h: 128 };
+        assert_eq!(canvas.frame.as_ref().unwrap().crop(text), f.crop(text), "text is exact");
+
+        assert!(enc.needs_refine());
+        let msgs = enc.refine(&q, 0, 2).unwrap();
+        assert!(!msgs.is_empty());
+        for m in &msgs {
+            let (h, data) = TileHeader::decode(m).unwrap();
+            assert!(h.x >= 512, "only the photo is sent again");
+            assert_eq!(h.format, TileFormat::Jpeg);
+            canvas.apply(&h, data).unwrap();
+        }
+        assert!(TileHeader::decode(msgs.last().unwrap()).unwrap().0.is_last());
+        assert!(!enc.needs_refine());
+        assert!(enc.refine(&q, 0, 3).unwrap().is_empty());
+        assert!(enc.encode(f, &q, 0, 4).unwrap().is_empty(), "still nothing new");
+    }
+
+    #[test]
+    fn parallel_encoding_keeps_order_and_last_flag() {
+        let q = Quality::preset(Preset::Balanced);
+        let f = desktop_like(1920, 1080);
+        let mut enc = MonitorEncoder::default();
+        let msgs = enc.encode(f.clone(), &q, 0, 1).unwrap();
+        let mut canvas = Canvas::default();
+        let mut last = (0u16, 0u16);
+        for (i, m) in msgs.iter().enumerate() {
+            let (h, data) = TileHeader::decode(m).unwrap();
+            assert!((h.y, h.x) > last || i == 0, "row by row order");
+            last = (h.y, h.x);
+            assert_eq!(h.is_last(), i + 1 == msgs.len());
+            canvas.apply(&h, data).unwrap();
+        }
+        let left = Rect { x: 0, y: 0, w: 512, h: 1080 }; // strips are 512 wide: 512..1024 holds photo too
+        assert_eq!(canvas.frame.as_ref().unwrap().crop(left), f.crop(left));
+    }
+
+    #[test]
+    fn canvas_reports_changed_parts() {
+        let mut c = Canvas::default();
+        let tile = Frame::filled(10, 10, [1, 1, 1, 255]);
+        let h = TileHeader { monitor: 0, format: TileFormat::Png, flags: 0, frame_w: 100, frame_h: 50, x: 95, y: 5, w: 10, h: 10, seq: 1 };
+        c.apply_tile(&h, &tile);
+        let d = c.take_dirty();
+        assert_eq!(d[0], Rect { x: 0, y: 0, w: 100, h: 50 }, "new picture: everything");
+        assert_eq!(d[1], Rect { x: 95, y: 5, w: 5, h: 10 }, "clipped to the picture");
+        c.apply_tile(&h, &tile);
+        assert_eq!(c.take_dirty(), vec![Rect { x: 95, y: 5, w: 5, h: 10 }]);
+        assert!(c.take_dirty().is_empty());
+    }
+
     #[test]
     fn encoder_and_canvas_reproduce_the_screen() {
         let q = Quality { codec: Codec::Png, color: ColorDepth::Full, scale_pct: 100, ..Quality::preset(Preset::Sharp) };
@@ -537,5 +848,21 @@ mod tests {
         assert!(enc.encode(f2, &q, 1, 3).unwrap().is_empty(), "no change, nothing sent");
         enc.reset();
         assert!(!enc.encode(f1, &q, 1, 4).unwrap().is_empty());
+    }
+
+    #[test]
+    fn thumbnails_keep_aspect_and_never_grow() {
+        let f = Frame::filled(1600, 900, [10, 120, 200, 255]);
+        let (w, h, jpeg) = thumbnail_jpeg(&f, 480, 70).unwrap();
+        assert_eq!((w, h), (480, 270));
+        let back = decode_tile(TileFormat::Jpeg, &jpeg).unwrap();
+        assert_eq!((back.width, back.height), (480, 270));
+        let p = back.pixel(240, 135);
+        assert!(p[0].abs_diff(10) < 8 && p[1].abs_diff(120) < 8 && p[2].abs_diff(200) < 8, "{p:?}");
+
+        let (w, h, _) = thumbnail_jpeg(&Frame::filled(1280, 1024, [0, 0, 0, 255]), 480, 70).unwrap();
+        assert_eq!((w, h), (480, 384), "portrait-ish screens fit by the longer side");
+        let (w, h, _) = thumbnail_jpeg(&Frame::filled(300, 200, [0, 0, 0, 255]), 480, 70).unwrap();
+        assert_eq!((w, h), (300, 200), "small screens are not enlarged");
     }
 }

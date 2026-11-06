@@ -6,9 +6,9 @@
   let viewOnly = cfg.mode === 'guest' ? !!cfg.view_only : params.get('view_only') === '1';
   const token = localStorage.getItem('farlink_token') || '';
   const PRESETS = {
-    fast: { scale_pct: 60, max_fps: 12, codec: 'jpeg', jpeg_quality: 35 },
-    balanced: { scale_pct: 85, max_fps: 20, codec: 'jpeg', jpeg_quality: 65 },
-    sharp: { scale_pct: 100, max_fps: 25, codec: 'png', jpeg_quality: 85 },
+    fast: { scale_pct: 75, max_fps: 20, codec: 'jpeg', jpeg_quality: 50 },
+    balanced: { scale_pct: 100, max_fps: 30, codec: 'auto', jpeg_quality: 75 },
+    sharp: { scale_pct: 100, max_fps: 30, codec: 'png', jpeg_quality: 90 },
   };
   const KEYS = {
     Enter: 'Enter', NumpadEnter: 'Enter', Escape: 'Escape', Backspace: 'Backspace', Tab: 'Tab', Space: 'Space',

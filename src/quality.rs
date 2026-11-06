@@ -33,18 +33,24 @@ impl ColorDepth {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Codec {
-    /// Lossy, small. Good for photos/video and slow links.
+    /// Per part of the screen: text and windows (at most 256 colours) are sent
+    /// lossless, photos and video as JPEG. JPEG parts are sent again in high
+    /// quality once they stop changing.
     #[default]
+    Auto,
+    /// Lossy, small. Good for photos/video and slow links.
     Jpeg,
     /// Lossless with the chosen colour depth. Crisp text.
     Png,
 }
 
 impl Codec {
+    pub const ALL: [Codec; 3] = [Codec::Auto, Codec::Jpeg, Codec::Png];
     pub fn label(self) -> &'static str {
         match self {
+            Codec::Auto => "Auto",
             Codec::Jpeg => "Smooth (JPEG)",
-            Codec::Png => "Sharp text (PNG)",
+            Codec::Png => "Lossless (PNG)",
         }
     }
 }
@@ -71,9 +77,9 @@ impl Preset {
     }
     pub fn hint(self) -> &'static str {
         match self {
-            Preset::Fast => "Slow links: smaller picture, 256 colours",
-            Preset::Balanced => "Good default for office work",
-            Preset::Sharp => "Fast networks: full size, crisp text",
+            Preset::Fast => "Slow links: smaller picture, JPEG only",
+            Preset::Balanced => "Full size: crisp text, smooth video",
+            Preset::Sharp => "Fast networks: everything lossless",
             Preset::Custom => "Your own mix",
         }
     }
@@ -86,7 +92,7 @@ pub struct Quality {
     /// Highest pictures per second, 1..=30.
     pub max_fps: u8,
     pub codec: Codec,
-    /// JPEG quality 10..=95 (ignored for PNG).
+    /// JPEG quality 10..=95 (ignored for PNG; used by Auto for photos).
     pub jpeg_quality: u8,
     pub color: ColorDepth,
 }
@@ -100,12 +106,23 @@ impl Default for Quality {
 impl Quality {
     pub fn preset(p: Preset) -> Quality {
         match p {
-            Preset::Fast => Quality { scale_pct: 60, max_fps: 12, codec: Codec::Jpeg, jpeg_quality: 35, color: ColorDepth::Low },
+            Preset::Fast => Quality { scale_pct: 75, max_fps: 20, codec: Codec::Jpeg, jpeg_quality: 50, color: ColorDepth::Full },
             Preset::Balanced | Preset::Custom => {
-                Quality { scale_pct: 85, max_fps: 20, codec: Codec::Jpeg, jpeg_quality: 65, color: ColorDepth::High }
+                Quality { scale_pct: 100, max_fps: 30, codec: Codec::Auto, jpeg_quality: 75, color: ColorDepth::Full }
             }
-            Preset::Sharp => Quality { scale_pct: 100, max_fps: 25, codec: Codec::Png, jpeg_quality: 85, color: ColorDepth::High },
+            Preset::Sharp => Quality { scale_pct: 100, max_fps: 30, codec: Codec::Png, jpeg_quality: 90, color: ColorDepth::Full },
         }
+    }
+
+    /// Presets of version 0.1 (blurry: smaller picture, 16-bit colour). Saved
+    /// settings equal to one of them are moved to the new preset of that name.
+    pub fn upgraded(self) -> Quality {
+        let old = [
+            (Quality { scale_pct: 60, max_fps: 12, codec: Codec::Jpeg, jpeg_quality: 35, color: ColorDepth::Low }, Preset::Fast),
+            (Quality { scale_pct: 85, max_fps: 20, codec: Codec::Jpeg, jpeg_quality: 65, color: ColorDepth::High }, Preset::Balanced),
+            (Quality { scale_pct: 100, max_fps: 25, codec: Codec::Png, jpeg_quality: 85, color: ColorDepth::High }, Preset::Sharp),
+        ];
+        old.into_iter().find(|(q, _)| *q == self).map(|(_, p)| Quality::preset(p)).unwrap_or(self)
     }
 
     /// Which preset these settings match exactly, or `Custom`.
@@ -137,6 +154,7 @@ impl Quality {
     pub fn summary(&self) -> String {
         let q = self.clamped();
         let codec = match q.codec {
+            Codec::Auto => "Auto".to_string(),
             Codec::Jpeg => format!("JPEG {}", q.jpeg_quality),
             Codec::Png => "PNG".to_string(),
         };
@@ -190,6 +208,15 @@ mod tests {
 
     #[test]
     fn summary_text() {
-        assert_eq!(Quality::preset(Preset::Fast).summary(), "60% · 12 fps · JPEG 35 · 8-bit");
+        assert_eq!(Quality::preset(Preset::Fast).summary(), "75% · 20 fps · JPEG 50 · 24-bit");
+        assert_eq!(Quality::preset(Preset::Balanced).summary(), "100% · 30 fps · Auto · 24-bit");
+    }
+
+    #[test]
+    fn old_presets_are_upgraded() {
+        let old_balanced = Quality { scale_pct: 85, max_fps: 20, codec: Codec::Jpeg, jpeg_quality: 65, color: ColorDepth::High };
+        assert_eq!(old_balanced.upgraded(), Quality::preset(Preset::Balanced));
+        let mine = Quality { scale_pct: 50, ..Quality::default() };
+        assert_eq!(mine.upgraded(), mine, "own settings are kept");
     }
 }
