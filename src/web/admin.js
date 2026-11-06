@@ -60,7 +60,7 @@ function left(secs) {
 }
 function screens(mons) {
   if (!mons || !mons.length) return '<span class="muted">–</span>';
-  return '<span class="screens">' + mons.map((m) => `<i title="${esc(m.width + '×' + m.height)}" style="width:${Math.round(14 * m.width / m.height)}px"></i>`).join('') + '</span> ' + mons.length;
+  return '<span class="screens">' + mons.map((m) => `<i title="${esc(m.width + '×' + m.height)}" style="width:${Math.round(17.5 * m.width / m.height)}px"></i>`).join('') + '</span> ' + mons.length;
 }
 
 function ownerSelect(m) {
@@ -84,7 +84,7 @@ function render() {
   $('updAll').textContent = 'Update ' + outdated + ' out of date';
   $('updAll').title = 'Install ' + (data.release_version || '') + ' on every connected computer with an older helper';
   $('mcount').textContent = data.machines.filter((m) => m.online).length + ' online of ' + data.machines.length;
-  $('machines').innerHTML = ms.map((m) => `<tr ${admin ? `oncontextmenu="rowMenu(event, '${m.id}')" title="Right-click to rename"` : ''}>
+  $('machines').innerHTML = ms.map((m) => `<tr ${admin ? `oncontextmenu="rowMenu(event, '${m.id}')" title="Right-click for more"` : ''}>
     <td><span class="dot ${m.online ? 'on' : ''}"></span><b>${esc(m.name)}</b>
       ${m.sessions ? '<span class="tag ctrl">in use</span>' : ''}
       <div class="muted">${m.online ? 'online' : 'seen ' + ago(data.now - m.last_seen)} · ${esc(m.hostname)}</div></td>
@@ -94,9 +94,7 @@ function render() {
     <td style="text-align:right;white-space:nowrap">
       <a class="btn small primary" href="/view/${m.id}" target="_blank" ${m.online ? '' : 'style="opacity:.5"'}>Control</a>
       <a class="btn small" href="/view/${m.id}?view_only=1" target="_blank">View</a>
-      ${admin ? `<button class="small" onclick="openGrant('${m.id}')">Temporary link</button>
-      <button class="small" onclick="rename('${m.id}')">Rename</button>
-      <button class="small danger" onclick="removeMachine('${m.id}')">Remove</button>` : ''}</td></tr>`).join('')
+      ${admin ? `<button class="small more" title="More" onclick="rowMenu(event, '${m.id}')">⋯</button>` : ''}</td></tr>`).join('')
     || `<tr><td colspan="6" class="muted">${admin ? 'No computers yet. Open the install link above on a computer to add it.' : 'No computers yet. Ask the administrator for your personal install link.'}</td></tr>`;
 
   if (!admin) return;
@@ -186,7 +184,7 @@ function renderServer(admin) {
       : '<span class="muted">not updated since it was installed</span>'],
     ['Published for computers', data.release_version ? esc(data.release_version) : '<span class="muted">nothing yet</span>'],
   ];
-  $('srvInfo').innerHTML = rows.map(([k, v]) => `<tr><td class="muted" style="width:220px">${k}</td><td>${v}</td></tr>`).join('');
+  $('srvInfo').innerHTML = rows.map(([k, v]) => `<tr><td class="muted" style="width:275px">${k}</td><td>${v}</td></tr>`).join('');
 }
 let pendingCheck = false;
 async function checkServerUpdate() {
@@ -258,22 +256,40 @@ async function rename(id) {
     try { await api('POST', '/api/machines/' + id + '/rename', { name: n.trim() }); toast('Renamed'); refresh(); } catch (e) { toast(e.message); }
   }
 }
-// Right-click menu on a computer row (administrator only).
+// "⋯" / right-click menu on a computer row (administrator only).
 function closeMenu() { document.querySelectorAll('.ctxmenu').forEach((el) => el.remove()); }
 function rowMenu(ev, id) {
   ev.preventDefault();
+  ev.stopPropagation();
   closeMenu();
   const menu = document.createElement('div');
   menu.className = 'ctxmenu';
-  menu.style.left = ev.clientX + 'px';
-  menu.style.top = ev.clientY + 'px';
-  const item = document.createElement('button');
-  item.textContent = 'Rename…';
-  item.onclick = () => rename(id);
-  menu.append(item);
+  const items = [
+    ['Temporary link…', () => openGrant(id)],
+    ['Rename…', () => rename(id)],
+    ['Remove…', () => removeMachine(id), 'danger'],
+  ];
+  for (const [label, fn, cls] of items) {
+    const item = document.createElement('button');
+    item.textContent = label;
+    if (cls) item.className = cls;
+    item.onclick = () => { closeMenu(); fn(); };
+    menu.append(item);
+  }
   document.body.append(menu);
+  // From the "⋯" button: open below it, right edges aligned; from right-click: at the pointer.
+  const btn = ev.currentTarget && ev.currentTarget.tagName === 'BUTTON' ? ev.currentTarget : null;
+  if (btn) {
+    const r = btn.getBoundingClientRect();
+    menu.style.top = (r.bottom + 4) + 'px';
+    menu.style.left = Math.max(4, r.right - menu.offsetWidth) + 'px';
+  } else {
+    menu.style.left = Math.min(ev.clientX, innerWidth - menu.offsetWidth - 4) + 'px';
+    menu.style.top = Math.min(ev.clientY, innerHeight - menu.offsetHeight - 4) + 'px';
+  }
 }
 document.addEventListener('click', (e) => { if (!e.target.closest('.ctxmenu')) closeMenu(); });
+window.addEventListener('scroll', closeMenu, true);
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeMenu(); });
 async function removeMachine(id) {
   const m = data.machines.find((x) => x.id === id);

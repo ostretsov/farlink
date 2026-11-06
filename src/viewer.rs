@@ -128,6 +128,8 @@ struct OpenSession {
     scale: ScaleMode,
     /// The user picked another scale mode: remember it as the default.
     scale_changed: bool,
+    /// Quality picked in one of this connection's windows: becomes the saved default.
+    quality_changed: bool,
     /// Scale mode each screen window was last drawn with (to resize on a switch).
     applied_scale: HashMap<u8, ScaleMode>,
     /// Last "watching these screens" sent to the helper.
@@ -584,7 +586,7 @@ pub struct ViewerApp {
     next_session: u64,
     grant: GrantForm,
     toast: Option<(String, Instant)>,
-    update_status: Arc<Mutex<String>>,
+    updater: Updater,
     frames: u64,
     shot_requested: bool,
     shot_done: Arc<AtomicBool>,
@@ -709,7 +711,7 @@ impl ViewerApp {
             next_session: 1,
             grant: GrantForm::default(),
             toast: None,
-            update_status: Arc::new(Mutex::new(String::new())),
+            updater: Updater::default(),
             frames: 0,
             shot_requested: false,
             shot_done: Arc::new(AtomicBool::new(false)),
@@ -734,22 +736,11 @@ impl ViewerApp {
         if let Some(link) = app.opts.open_link.clone() {
             app.open_link(ctx, &link);
         }
-        if !screenshot && app.cfg.auto_update && !app.cfg.server_url.is_empty() {
-            let server = app.cfg.server_url.clone();
-            let status = app.update_status.clone();
-            let ctx = ctx.clone();
-            std::thread::spawn(move || {
-                if let Ok(exe) = std::env::current_exe() {
-                    crate::update::cleanup_old(&exe);
-                }
-                let text = match crate::update::update_self(&server, "farlink") {
-                    Ok(Some(v)) => format!("Updated to {v}, restart Farlink to use it"),
-                    Ok(None) => "Up to date".into(),
-                    Err(_) => String::new(),
-                };
-                *status.lock().unwrap() = text;
-                ctx.request_repaint();
-            });
+        if !screenshot && !app.demo {
+            if let Ok(exe) = std::env::current_exe() {
+                crate::update::cleanup_old(&exe);
+            }
+            app.updater.start(ctx, &app.cfg.server_url, app.cfg.auto_update);
         }
         app
     }
@@ -763,6 +754,7 @@ impl ViewerApp {
     }
 
     fn save_cfg(&self) {
+        self.updater.set_server(&self.cfg.server_url);
         if let Some(p) = &self.cfg_path
             && let Err(e) = save_json(p, &self.cfg)
         {
@@ -807,6 +799,7 @@ impl ViewerApp {
             minimized: HashSet::new(),
             scale: self.cfg.scale_mode,
             scale_changed: false,
+            quality_changed: false,
             applied_scale: HashMap::new(),
             last_watch: None,
             files: None,
@@ -1041,6 +1034,34 @@ impl ViewerApp {
             });
     }
 
+    /// "Farlink x.y.z · up to date · Check for updates" in the bottom bar.
+    fn update_status(&mut self, ui: &mut egui::Ui) {
+        if !self.updater.started() {
+            return;
+        }
+        let st = self.updater.status();
+        let small = |t: String, c: Color32| RichText::new(t).color(c).size(12.0);
+        if st.checking {
+            ui.label(small("· checking for updates...".into(), MUTED));
+        } else if let Some(v) = &st.installed {
+            ui.label(small(format!("· updated to {v}"), ACCENT));
+            if ui.add(egui::Link::new(small("Restart".into(), ACCENT))).on_hover_text("Close Farlink and start the new version").clicked() {
+                restart_app(ui.ctx());
+            }
+        } else {
+            if !st.text.is_empty() {
+                ui.label(small(format!("· {}", st.text), if st.error { AMBER } else { MUTED }));
+            }
+            let tip = match st.last_check {
+                Some(t) => format!("Last checked {} ago; checks every hour by itself", human_duration(t.elapsed().as_secs())),
+                None => "Checks every hour by itself".into(),
+            };
+            if ui.add(egui::Link::new(small("Check for updates".into(), ACCENT))).on_hover_text(tip).clicked() {
+                self.updater.check_now();
+            }
+        }
+    }
+
     // -------------------------------------------------------------- bottom
 
     fn bottom_bar(&mut self, ui: &mut egui::Ui) {
@@ -1051,10 +1072,7 @@ impl ViewerApp {
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.label(RichText::new(format!("Farlink {}", crate::VERSION)).color(MUTED).size(12.0));
-                    let upd = self.update_status.lock().unwrap().clone();
-                    if !upd.is_empty() {
-                        ui.label(RichText::new(format!("· {upd}")).color(MUTED).size(12.0));
-                    }
+                    self.update_status(ui);
                     if let Some(o) = &self.overview {
                         relay_status(ui, o);
                     }
@@ -1624,7 +1642,7 @@ impl ViewerApp {
                 for p in Preset::BUTTONS {
                     let b = egui::Button::new(RichText::new(p.label()).size(14.0)).selected(current == p).min_size(Vec2::new(96.0, 30.0));
                     if ui.add(b).on_hover_text(p.hint()).clicked() {
-                        self.cfg.quality = Quality::preset(p);
+                        self.cfg.quality = self.cfg.quality.with_preset(p);
                     }
                 }
                 ui.label(RichText::new(current.hint()).color(MUTED));
@@ -1684,9 +1702,13 @@ impl ViewerApp {
         let mut dirty = false;
         let mut to_close = Vec::new();
         let mut new_scale = None;
+        let mut new_quality = None;
         for s in &mut self.sessions {
             if std::mem::take(&mut s.scale_changed) {
                 new_scale = Some(s.scale);
+            }
+            if std::mem::take(&mut s.quality_changed) {
+                new_quality = Some(s.quality);
             }
             let (monitors, live) = {
                 let mut sh = s.handle.shared.lock().unwrap();
@@ -1763,6 +1785,12 @@ impl ViewerApp {
         if !to_close.is_empty() {
             self.sessions.retain(|s| !to_close.contains(&s.id));
         }
+        if let Some(q) = new_quality
+            && q != self.cfg.quality
+        {
+            self.cfg.quality = q;
+            self.save_cfg();
+        }
         if let Some(m) = new_scale
             && m != self.cfg.scale_mode
         {
@@ -1815,6 +1843,127 @@ impl ViewerApp {
             self.sessions.clear();
             ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Close);
         }
+    }
+}
+
+/// Keeps this app up to date from the server: checks at start-up, every
+/// [`UPDATE_EVERY`] and when asked, and installs a newer version (it is used
+/// after a restart).
+#[derive(Default)]
+struct Updater {
+    shared: Arc<(Mutex<UpdaterState>, std::sync::Condvar)>,
+}
+
+const UPDATE_EVERY: Duration = Duration::from_secs(3600);
+
+#[derive(Default, Clone)]
+struct UpdaterState {
+    server: String,
+    started: bool,
+    /// Wake the thread for a check now.
+    wanted: bool,
+    checking: bool,
+    /// Short result of the last check ("up to date", an error...).
+    text: String,
+    error: bool,
+    last_check: Option<Instant>,
+    /// Version installed next to the running one, waiting for a restart.
+    installed: Option<String>,
+}
+
+impl Updater {
+    fn start(&self, ctx: &egui::Context, server: &str, auto: bool) {
+        {
+            let mut st = self.shared.0.lock().unwrap();
+            st.server = server.to_string();
+            st.started = true;
+            st.wanted = auto; // first check right away (unless switched off)
+        }
+        let shared = self.shared.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let (lock, cv) = &*shared;
+            loop {
+                let server = {
+                    let mut st = lock.lock().unwrap();
+                    loop {
+                        let due = auto && st.last_check.is_none_or(|t| t.elapsed() >= UPDATE_EVERY);
+                        if st.wanted || due {
+                            break;
+                        }
+                        let wait = st.last_check.map_or(UPDATE_EVERY, |t| UPDATE_EVERY.saturating_sub(t.elapsed()));
+                        st = cv.wait_timeout(st, wait.max(Duration::from_secs(1))).unwrap().0;
+                    }
+                    st.wanted = false;
+                    st.checking = true;
+                    st.server.clone()
+                };
+                ctx.request_repaint();
+                let (text, error, installed) = if server.is_empty() {
+                    ("sign in to check for updates".to_string(), false, None)
+                } else {
+                    match check_and_install(&server, lock.lock().unwrap().installed.as_deref()) {
+                        Ok(Some(v)) => (String::new(), false, Some(v)),
+                        Ok(None) => ("up to date".to_string(), false, None),
+                        Err(e) => {
+                            log::warn!("update check: {e:#}");
+                            ("could not check for updates".to_string(), true, None)
+                        }
+                    }
+                };
+                {
+                    let mut st = lock.lock().unwrap();
+                    st.checking = false;
+                    st.text = text;
+                    st.error = error;
+                    st.last_check = Some(Instant::now());
+                    if installed.is_some() {
+                        st.installed = installed;
+                    }
+                }
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn started(&self) -> bool {
+        self.shared.0.lock().unwrap().started
+    }
+
+    fn status(&self) -> UpdaterState {
+        self.shared.0.lock().unwrap().clone()
+    }
+
+    fn set_server(&self, server: &str) {
+        self.shared.0.lock().unwrap().server = server.to_string();
+    }
+
+    fn check_now(&self) {
+        let mut st = self.shared.0.lock().unwrap();
+        st.wanted = true;
+        st.checking = true; // shown at once, before the thread wakes
+        self.shared.1.notify_all();
+    }
+}
+
+/// Install the server's version if it is newer than the running one and not
+/// installed already. Returns the version installed now.
+fn check_and_install(server: &str, already: Option<&str>) -> anyhow::Result<Option<String>> {
+    let target = crate::util::current_target();
+    let Some(info) = crate::update::check(server, "farlink", target, already.unwrap_or(crate::VERSION))? else {
+        return Ok(None);
+    };
+    let bytes = crate::update::download(server, &info)?; // checks size and SHA-256
+    crate::update::replace_exe(&std::env::current_exe()?, &bytes)?;
+    log::info!("updated farlink {} -> {}", crate::VERSION, info.version);
+    Ok(Some(info.version))
+}
+
+/// Start the (updated) program again and close this one.
+fn restart_app(ctx: &egui::Context) {
+    match std::env::current_exe().and_then(|exe| std::process::Command::new(exe).args(std::env::args_os().skip(1)).spawn()) {
+        Ok(_) => ctx.send_viewport_cmd(ViewportCommand::Close),
+        Err(e) => log::warn!("restart: {e}"),
     }
 }
 
@@ -1892,15 +2041,26 @@ fn monitor_window(ui: &mut egui::Ui, s: &mut OpenSession, mon: &MonitorInfo, key
                     if !view_only && ui.button("Ctrl+Alt+Del").clicked() {
                         s.handle.send(SessionMsg::Input { event: InputEvent::CtrlAltDel });
                     }
-                    let current = s.quality.matching_preset();
-                    egui::ComboBox::from_id_salt("q").selected_text(current.label()).width(96.0).show_ui(ui, |ui| {
-                        for p in Preset::BUTTONS {
-                            if ui.add(egui::Button::new(p.label()).selected(current == p).frame(false)).clicked() {
-                                s.quality = Quality::preset(p);
-                                s.handle.send(SessionMsg::Quality { quality: s.quality });
+                    let before = s.quality;
+                    egui::ComboBox::from_id_salt("colors").selected_text(s.quality.color.short_label()).width(110.0).show_ui(ui, |ui| {
+                        for c in ColorDepth::ALL {
+                            if ui.add(egui::Button::new(c.label()).selected(s.quality.color == c).frame(false)).clicked() {
+                                s.quality.color = c;
                             }
                         }
                     });
+                    let current = s.quality.matching_preset();
+                    egui::ComboBox::from_id_salt("q").selected_text(current.label()).width(96.0).show_ui(ui, |ui| {
+                        for p in Preset::BUTTONS {
+                            if ui.add(egui::Button::new(p.label()).selected(current == p).frame(false)).on_hover_text(p.hint()).clicked() {
+                                s.quality = s.quality.with_preset(p);
+                            }
+                        }
+                    });
+                    if s.quality != before {
+                        s.handle.send(SessionMsg::Quality { quality: s.quality });
+                        s.quality_changed = true;
+                    }
                     egui::ComboBox::from_id_salt("scale").selected_text(s.scale.label()).width(110.0).show_ui(ui, |ui| {
                         for m in [ScaleMode::Original, ScaleMode::Fit] {
                             if ui.add(egui::Button::new(m.label()).selected(s.scale == m).frame(false)).clicked() && s.scale != m {

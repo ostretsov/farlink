@@ -27,6 +27,14 @@ impl ColorDepth {
             ColorDepth::Gray => "Greyscale",
         }
     }
+    pub fn short_label(self) -> &'static str {
+        match self {
+            ColorDepth::Full => "Full colour",
+            ColorDepth::High => "High colour",
+            ColorDepth::Low => "256 colours",
+            ColorDepth::Gray => "Greyscale",
+        }
+    }
 }
 
 /// How the picture is compressed.
@@ -125,10 +133,16 @@ impl Quality {
         old.into_iter().find(|(q, _)| *q == self).map(|(_, p)| Quality::preset(p)).unwrap_or(self)
     }
 
-    /// Which preset these settings match exactly, or `Custom`.
+    /// Which preset these settings match (colours aside: they are chosen
+    /// separately), or `Custom`.
     pub fn matching_preset(&self) -> Preset {
         let me = self.clamped();
-        Preset::BUTTONS.into_iter().find(|p| Quality::preset(*p) == me).unwrap_or(Preset::Custom)
+        Preset::BUTTONS.into_iter().find(|p| self.with_preset(*p) == me).unwrap_or(Preset::Custom)
+    }
+
+    /// Preset `p`, keeping the colours chosen here.
+    pub fn with_preset(&self, p: Preset) -> Quality {
+        Quality { color: self.color, ..Quality::preset(p) }
     }
 
     /// Keep every value in its allowed range (values come from the network).
@@ -180,6 +194,9 @@ mod tests {
         let mut q = Quality::preset(Preset::Fast);
         q.max_fps = 7;
         assert_eq!(q.matching_preset(), Preset::Custom);
+        let grey = Quality { color: ColorDepth::Gray, ..Quality::preset(Preset::Sharp) };
+        assert_eq!(grey.matching_preset(), Preset::Sharp, "colours are chosen apart from presets");
+        assert_eq!(grey.with_preset(Preset::Fast).color, ColorDepth::Gray);
     }
 
     #[test]

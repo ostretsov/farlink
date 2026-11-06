@@ -159,8 +159,19 @@
     const q = Object.assign({}, PRESETS[$('quality').value], { color: $('color').value });
     send({ t: 'quality', quality: q });
   }
-  $('quality').onchange = sendQuality;
-  $('color').onchange = sendQuality;
+  // Remember the picture choice in this browser (Balanced / full colour by default).
+  const remembered = (key, sel) => {
+    try {
+      const v = localStorage.getItem(key);
+      if (v && [...$(sel).options].some((o) => o.value === v)) $(sel).value = v;
+    } catch (_) { /* storage blocked: keep the default */ }
+    $(sel).onchange = () => {
+      try { localStorage.setItem(key, $(sel).value); } catch (_) { /* not remembered */ }
+      sendQuality();
+    };
+  };
+  remembered('farlink_quality', 'quality');
+  remembered('farlink_color', 'color');
   $('cad').onclick = () => input({ k: 'ctrl_alt_del' });
   $('fs').onclick = () => (document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen());
 

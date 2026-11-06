@@ -564,8 +564,8 @@ pub fn run_screen(
                     continue;
                 }
             };
-            let prepared = if quality.scale_pct >= 100 && quality.color == crate::quality::ColorDepth::Full {
-                frame // nothing to prepare; the encoder skips unchanged parts itself
+            let prepared = if quality.scale_pct >= 100 {
+                frame // nothing to prepare (colours are reduced per part); the encoder skips unchanged parts itself
             } else {
                 if prev_raw[i].as_ref() == Some(&frame) {
                     continue; // identical picture: skip scaling and compression

@@ -70,8 +70,8 @@
     <select id="gMode"><option value="view">Only watch the screen</option><option value="control">Watch and control</option></select>
     <label>Link works for</label>
     <select id="gMinutes"><option value="30">30 minutes</option><option value="120" selected>2 hours</option><option value="480">8 hours</option><option value="1440">1 day</option><option value="10080">1 week</option></select>
-    <div class="row" style="margin-top:16px"><button class="primary">Create link</button><button type="button" onclick="grantDlg.close()">Cancel</button></div>
-    <div id="gResult" class="hidden" style="margin-top:14px">
+    <div class="row" style="margin-top:20px"><button class="primary">Create link</button><button type="button" onclick="grantDlg.close()">Cancel</button></div>
+    <div id="gResult" class="hidden" style="margin-top:17.5px">
       <p class="muted">Send this link. It opens in a browser or in the Farlink app, and you can withdraw it any time.</p>
       <div class="copybox"><code class="mono" id="gUrl"></code><button type="button" class="small" onclick="copyText(gUrl.textContent)">Copy</button></div>
     </div>
@@ -84,8 +84,8 @@
     <label>Name</label><input id="uName" placeholder="Anna" required>
     <label>Sign-in name</label><input id="uLogin" placeholder="anna" required>
     <label>Password (at least 8 characters)</label><input id="uPw" type="text" required minlength="8">
-    <div class="row" style="margin-top:16px"><button class="primary">Add</button><button type="button" onclick="userDlg.close()">Close</button></div>
-    <div id="uResult" class="hidden" style="margin-top:14px">
+    <div class="row" style="margin-top:20px"><button class="primary">Add</button><button type="button" onclick="userDlg.close()">Close</button></div>
+    <div id="uResult" class="hidden" style="margin-top:17.5px">
       <p class="muted">Open this personal install link on the person's computer. When it is installed it appears in their row
         and only they (and you) can see and control it.</p>
       <div class="copybox"><code class="mono" id="uUrl"></code><button type="button" class="small" onclick="copyText(uUrl.textContent)">Copy</button></div>

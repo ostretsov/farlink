@@ -201,12 +201,12 @@ pub fn color_332(i: u8) -> [u8; 3] {
     [(r as u32 * 255 / 7) as u8, (g as u32 * 255 / 7) as u8, (b as u32 * 255 / 3) as u8]
 }
 
-/// Scale + reduce colours according to the quality settings.
+/// Scale according to the quality settings. Colours are reduced later, per
+/// part, while compressing (see [`encode_part`]): which parts are photos is
+/// decided from the real colours.
 pub fn prepare(raw: &Frame, q: &Quality) -> Frame {
     let (w, h) = q.scaled_size(raw.width, raw.height);
-    let mut f = scale(raw, w, h);
-    quantize(&mut f, q.color);
-    f
+    scale(raw, w, h)
 }
 
 /// Tiles of `cur` that differ from `prev` (all tiles if `prev` is `None` or a
@@ -270,18 +270,44 @@ pub fn encode_rect(f: &Frame, r: Rect, q: &Quality) -> Result<(TileFormat, Vec<u
 
 fn encode_part(f: &Frame, r: Rect, q: &Quality) -> Result<Encoded> {
     let q = q.clamped();
-    let tile = f.crop(r);
+    let mut tile = f.crop(r);
+    let jpeg_part = |tile: &Frame, rough: bool| -> Result<Encoded> {
+        // 16-bit colour only adds banding to a JPEG (bigger, not smaller): JPEG
+        // parts use the real colours, or one grey channel for greyscale.
+        Ok(Encoded { format: TileFormat::Jpeg, data: jpeg(tile, q.jpeg_quality, q.color)?, rough })
+    };
+    let lossless = |mut tile: Frame| -> Result<Encoded> {
+        quantize(&mut tile, q.color);
+        // A palette of the colours really used compresses better than a fixed one.
+        let data = match palette_of(&tile) {
+            Some((palette, indexed)) => png_indexed(&tile, &palette, &indexed)?,
+            None => png_lossless(&tile, q.color)?,
+        };
+        Ok(Encoded { format: TileFormat::Png, data, rough: false })
+    };
     match q.codec {
-        Codec::Jpeg => Ok(Encoded { format: TileFormat::Jpeg, data: jpeg(&tile, q.jpeg_quality, q.color)?, rough: false }),
-        Codec::Png => Ok(Encoded { format: TileFormat::Png, data: png_lossless(&tile, q.color)?, rough: false }),
+        Codec::Jpeg if q.color == ColorDepth::Low => {
+            quantize(&mut tile, ColorDepth::Low);
+            jpeg_part(&tile, false)
+        }
+        Codec::Jpeg => jpeg_part(&tile, false),
+        Codec::Png => lossless(tile),
         Codec::Auto => {
             // Text, windows and icons rarely use more than 256 colours in one
-            // strip: send them lossless (palette PNG is small and fast).
+            // strip: send them lossless (palette PNG is small and fast). Decided
+            // on the real colours: after greyscale everything would qualify,
+            // photos too, and lossless photos are several times bigger.
             if let Some((palette, indexed)) = palette_of(&tile) {
-                return Ok(Encoded { format: TileFormat::Png, data: png_indexed(&tile, &palette, &indexed)?, rough: false });
+                if q.color == ColorDepth::Full {
+                    return Ok(Encoded { format: TileFormat::Png, data: png_indexed(&tile, &palette, &indexed)?, rough: false });
+                }
+                return lossless(tile);
             }
-            let rough = q.jpeg_quality < REFINE_JPEG;
-            Ok(Encoded { format: TileFormat::Jpeg, data: jpeg(&tile, q.jpeg_quality, q.color)?, rough })
+            match q.color {
+                // 256 fixed colours: a lossless 8-bit picture is about as small as JPEG.
+                ColorDepth::Low => lossless(tile),
+                _ => jpeg_part(&tile, q.jpeg_quality < REFINE_JPEG),
+            }
         }
     }
 }
@@ -302,7 +328,7 @@ fn jpeg(tile: &Frame, quality: u8, color: ColorDepth) -> Result<Vec<u8>> {
     enc.set_sampling_factor(if quality >= 90 { SamplingFactor::R_4_4_4 } else { SamplingFactor::R_4_2_0 });
     let (w, h) = (tile.width as u16, tile.height as u16);
     if color == ColorDepth::Gray {
-        let gray: Vec<u8> = tile.rgba.chunks_exact(4).map(|p| p[0]).collect();
+        let gray: Vec<u8> = tile.rgba.chunks_exact(4).map(|p| luma(p[0], p[1], p[2])).collect();
         enc.encode(&gray, w, h, ColorType::Luma)?;
     } else {
         enc.encode(&tile.rgba, w, h, ColorType::Rgba)?;
@@ -684,8 +710,30 @@ mod tests {
             let (fmt, data) = encode_rect(&f, r, &q).unwrap();
             assert_eq!(fmt, TileFormat::Png);
             let back = decode_tile(fmt, &data).unwrap();
-            assert_eq!(back, f, "depth {depth:?}");
+            let mut want = f.clone();
+            quantize(&mut want, depth);
+            assert_eq!(back, want, "depth {depth:?}");
         }
+    }
+
+    #[test]
+    fn auto_sends_photos_as_jpeg_whatever_the_colours() {
+        // More than 256 real colours = photo, also in greyscale (where every
+        // picture has at most 256 shades) and 16-bit colour.
+        let photo = gradient(200, 120);
+        let r = Rect { x: 0, y: 0, w: 200, h: 120 };
+        for depth in [ColorDepth::Full, ColorDepth::High, ColorDepth::Gray] {
+            let q = Quality { codec: Codec::Auto, color: depth, ..Quality::default() };
+            assert_eq!(encode_rect(&photo, r, &q).unwrap().0, TileFormat::Jpeg, "{depth:?}");
+        }
+        // Text-like part in greyscale: lossless and really grey.
+        let mut text = Frame::filled(64, 64, [250, 250, 250, 255]);
+        text.fill_rect(Rect { x: 10, y: 10, w: 20, h: 4 }, [200, 30, 30, 255]);
+        let q = Quality { codec: Codec::Auto, color: ColorDepth::Gray, ..Quality::default() };
+        let (fmt, data) = encode_rect(&text, Rect { x: 0, y: 0, w: 64, h: 64 }, &q).unwrap();
+        assert_eq!(fmt, TileFormat::Png);
+        let p = decode_tile(fmt, &data).unwrap().pixel(15, 11);
+        assert!(p[0] == p[1] && p[1] == p[2], "grey: {p:?}");
     }
 
     #[test]
@@ -864,5 +912,31 @@ mod tests {
         assert_eq!((w, h), (480, 384), "portrait-ish screens fit by the longer side");
         let (w, h, _) = thumbnail_jpeg(&Frame::filled(300, 200, [0, 0, 0, 255]), 480, 70).unwrap();
         assert_eq!((w, h), (300, 200), "small screens are not enlarged");
+    }
+}
+
+#[cfg(test)]
+mod bench_colors {
+    use super::*;
+    use crate::quality::{ColorDepth, Quality};
+    #[test]
+    #[ignore]
+    fn bench_color_depths() {
+        let paths = std::env::var("BENCH_PNGS").unwrap();
+        for p in paths.split(',') {
+            let img = image::open(p).unwrap().to_rgba8();
+            let raw = Frame { width: img.width(), height: img.height(), rgba: img.into_raw() };
+            for depth in ColorDepth::ALL {
+                let q = Quality { color: depth, ..Quality::default() };
+                let t = std::time::Instant::now();
+                let mut bytes = 0;
+                for _ in 0..5 {
+                    let f = raw.clone();
+                    let mut enc = MonitorEncoder::default();
+                    bytes = enc.encode(f, &q, 0, 1).unwrap().iter().map(|m| m.len()).sum::<usize>();
+                }
+                eprintln!("{p} {}x{} {depth:?}: {:.1} ms, {} KB", raw.width, raw.height, t.elapsed().as_secs_f64() * 200.0, bytes / 1024);
+            }
+        }
     }
 }
