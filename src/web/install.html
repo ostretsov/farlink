@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Install Farlink</title>
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<header class="top"><div class="logo"><i></i>Farlink</div><span class="muted">Install on this computer · version {{VERSION}}</span></header>
+<main>
+  <div class="card">
+    <h2>Let your administrator see and control this computer</h2>
+    <p class="muted">Everything is already set up for <b>{{SERVER}}</b>. The helper starts with the computer, updates itself
+      in the background and only connects to this server. It cannot be used to control other computers.</p>
+    <p>{{FOR}}</p>
+  </div>
+  <div class="grid2">
+    <div class="card">
+      <h2>Windows 10 / 11 / Server 2016+</h2>
+      <ol class="steps">
+        <li><a class="btn primary" href="/install/{{TOKEN}}/install-windows.cmd">Download installer</a></li>
+        <li>Open the downloaded file and allow it to make changes.</li>
+        <li>Wait for “Done”. The firewall is configured automatically.</li>
+      </ol>
+      <p class="muted">Or paste this into PowerShell:</p>
+      <div class="copybox"><code class="mono" id="win">iex (irm '{{SERVER}}/install/{{TOKEN}}/windows.ps1')</code><button class="small" onclick="copy('win')">Copy</button></div>
+    </div>
+    <div class="card">
+      <h2>Ubuntu (X11 desktop)</h2>
+      <ol class="steps">
+        <li>Open a Terminal on the computer.</li>
+        <li>Paste the line below, press Enter, type your password.</li>
+      </ol>
+      <div class="copybox"><code class="mono" id="lin">curl -fsSL {{SERVER}}/install/{{TOKEN}}/linux.sh | sh</code><button class="small" onclick="copy('lin')">Copy</button></div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Administrator app <small>to view and control computers</small></h2>
+    <div class="row">
+      <a class="btn" href="/download/x86_64-pc-windows-gnu/farlink.exe">Farlink for Windows</a>
+      <a class="btn" href="/download/x86_64-unknown-linux-gnu/farlink">Farlink for Linux</a>
+      <span class="muted">Or use the web version: <a href="/">{{SERVER}}</a></span>
+    </div>
+  </div>
+</main>
+<script>
+function copy(id){ navigator.clipboard.writeText(document.getElementById(id).textContent); }
+</script>
+</body>
+</html>

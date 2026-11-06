@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Farlink</title>
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<header class="top">
+  <div class="logo"><i></i>Farlink</div>
+  <span class="muted" id="ver"></span>
+  <div class="spacer"></div>
+  <span class="muted" id="me"></span>
+  <button id="logout" class="hidden" onclick="logout()">Sign out</button>
+</header>
+
+<div id="login" class="card login hidden">
+  <h2>Sign in</h2>
+  <form onsubmit="login(event)">
+    <label class="muted">Your sign-in name <small>(leave empty for the administrator)</small></label>
+    <input id="user" autocomplete="username" placeholder="e.g. anna">
+    <label class="muted">Password</label>
+    <input type="password" id="pw" autocomplete="current-password" placeholder="Password">
+    <button class="primary" style="width:100%">Sign in</button>
+    <p id="loginErr" class="muted"></p>
+  </form>
+</div>
+
+<main id="dash" class="hidden">
+  <div class="card admin-only">
+    <h2>Add a computer <small>general link: the computer is visible to the administrator only</small></h2>
+    <div class="copybox"><code class="mono" id="installUrl"></code>
+      <button class="small" onclick="copyText(document.getElementById('installUrl').textContent)">Copy</button>
+      <button class="small" onclick="rotate()" title="Old install links stop working">New link</button></div>
+  </div>
+
+  <div class="card">
+    <h2><span id="mtitle">Computers</span> <small id="mcount"></small><span class="spacer"></span><input id="filter" placeholder="Search" oninput="render()"></h2>
+    <table><thead><tr><th>Name</th><th>System</th><th>Screens</th><th class="admin-only">Belongs to</th><th>Version</th><th></th></tr></thead><tbody id="machines"></tbody></table>
+  </div>
+
+  <div class="card admin-only">
+    <h2>People <small>each person signs in and sees only their own computers</small><span class="spacer"></span><button class="small primary" onclick="openUser()">Add person</button></h2>
+    <table><thead><tr><th>Name</th><th>Sign-in</th><th>Their computers</th><th>Personal install link</th><th></th></tr></thead><tbody id="users"></tbody></table>
+  </div>
+
+  <div class="grid2 admin-only">
+    <div class="card">
+      <h2>Temporary links</h2>
+      <table><thead><tr><th>For</th><th>Computer</th><th>Mode</th><th>Ends</th><th></th></tr></thead><tbody id="grants"></tbody></table>
+    </div>
+    <div class="card">
+      <h2>Connected now</h2>
+      <table><thead><tr><th>Who</th><th>Computer</th><th>Mode</th><th></th></tr></thead><tbody id="sessions"></tbody></table>
+    </div>
+  </div>
+</main>
+
+<dialog id="grantDlg">
+  <form method="dialog" onsubmit="createGrant(event)">
+    <h2 style="margin-top:0">Temporary access to <span id="gName"></span></h2>
+    <label>Who is it for (optional)</label><input id="gLabel" placeholder="e.g. Support for Ana">
+    <label>Allowed to</label>
+    <select id="gMode"><option value="view">Only watch the screen</option><option value="control">Watch and control</option></select>
+    <label>Link works for</label>
+    <select id="gMinutes"><option value="30">30 minutes</option><option value="120" selected>2 hours</option><option value="480">8 hours</option><option value="1440">1 day</option><option value="10080">1 week</option></select>
+    <div class="row" style="margin-top:16px"><button class="primary">Create link</button><button type="button" onclick="grantDlg.close()">Cancel</button></div>
+    <div id="gResult" class="hidden" style="margin-top:14px">
+      <p class="muted">Send this link. It opens in a browser or in the Farlink app, and you can withdraw it any time.</p>
+      <div class="copybox"><code class="mono" id="gUrl"></code><button type="button" class="small" onclick="copyText(gUrl.textContent)">Copy</button></div>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="userDlg">
+  <form method="dialog" onsubmit="createUser(event)">
+    <h2 style="margin-top:0">Add a person</h2>
+    <label>Name</label><input id="uName" placeholder="Anna" required>
+    <label>Sign-in name</label><input id="uLogin" placeholder="anna" required>
+    <label>Password (at least 8 characters)</label><input id="uPw" type="text" required minlength="8">
+    <div class="row" style="margin-top:16px"><button class="primary">Add</button><button type="button" onclick="userDlg.close()">Close</button></div>
+    <div id="uResult" class="hidden" style="margin-top:14px">
+      <p class="muted">Open this personal install link on the person's computer. When it is installed it appears in their row
+        and only they (and you) can see and control it.</p>
+      <div class="copybox"><code class="mono" id="uUrl"></code><button type="button" class="small" onclick="copyText(uUrl.textContent)">Copy</button></div>
+    </div>
+  </form>
+</dialog>
+
+<script src="/assets/admin.js"></script>
+</body>
+</html>

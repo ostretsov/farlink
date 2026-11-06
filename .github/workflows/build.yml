@@ -1,0 +1,190 @@
+# Farlink CI/CD
+#
+# * Every push and pull request: tests on Linux, a Windows test run, and builds
+#   for every platform (downloadable from the run's "Artifacts").
+# * Pushing a version tag (e.g. `git tag v0.2.0 && git push origin v0.2.0`):
+#   the same, then a GitHub Release with the programs, the ready `dist/`
+#   archive and checksums. The tag must match `version` in Cargo.toml.
+
+name: build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test-linux:
+    name: Test (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64 libxkbcommon-dev libwayland-dev
+      - name: Version tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          have="$(make -s version)"
+          if [ "$want" != "$have" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $have"
+            exit 1
+          fi
+      - name: Compile check (Linux + Windows)
+        run: make check
+      - name: Tests
+        run: make test
+
+  test-windows:
+    name: Test (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests
+        run: cargo test --locked
+
+  build-linux:
+    name: Build Linux x86_64
+    needs: test-linux
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-linux
+      - run: make linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x86_64-unknown-linux-gnu
+          path: |
+            target/x86_64-unknown-linux-gnu/release/farlink
+            target/x86_64-unknown-linux-gnu/release/farlink-host
+            target/x86_64-unknown-linux-gnu/release/farlink-server
+          if-no-files-found: error
+
+  build-linux-arm64:
+    name: Build Linux ARM64
+    needs: test-linux
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-linux-arm64
+      - run: make linux-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aarch64-unknown-linux-gnu
+          path: |
+            target/aarch64-unknown-linux-gnu/release/farlink
+            target/aarch64-unknown-linux-gnu/release/farlink-host
+            target/aarch64-unknown-linux-gnu/release/farlink-server
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows x86_64
+    needs: test-linux
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-windows
+      - name: Install mingw-w64
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+      - run: make windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x86_64-pc-windows-gnu
+          path: |
+            target/x86_64-pc-windows-gnu/release/farlink.exe
+            target/x86_64-pc-windows-gnu/release/farlink-host.exe
+          if-no-files-found: error
+
+  dist:
+    name: Package
+    needs: [build-linux, build-linux-arm64, build-windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+      - name: Put builds where the Makefile expects them
+        run: |
+          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-gnu; do
+            mkdir -p "target/$t/release"
+            cp artifacts/$t/* "target/$t/release/"
+          done
+          chmod +x target/*-linux-gnu/release/*
+      - name: Build dist/ and archive
+        run: make package
+      - name: Single files and checksums
+        run: |
+          v="$(make -s version)"
+          mkdir -p upload
+          cp "farlink-$v.tar.gz" upload/
+          cp dist/farlink-server                                   "upload/farlink-server-linux-x86_64"
+          cp dist/releases/x86_64-unknown-linux-gnu/farlink        "upload/farlink-linux-x86_64"
+          cp dist/releases/x86_64-unknown-linux-gnu/farlink-host   "upload/farlink-host-linux-x86_64"
+          cp dist/releases/aarch64-unknown-linux-gnu/farlink       "upload/farlink-linux-arm64"
+          cp dist/releases/aarch64-unknown-linux-gnu/farlink-host  "upload/farlink-host-linux-arm64"
+          cp target/aarch64-unknown-linux-gnu/release/farlink-server "upload/farlink-server-linux-arm64"
+          cp dist/releases/x86_64-pc-windows-gnu/farlink.exe       "upload/farlink-windows-x86_64.exe"
+          cp dist/releases/x86_64-pc-windows-gnu/farlink-host.exe  "upload/farlink-host-windows-x86_64.exe"
+          (cd upload && sha256sum * > SHA256SUMS.txt)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: farlink-dist
+          path: upload/*
+
+  release:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [dist, test-windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: farlink-dist
+          path: upload
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: upload/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body: |
+            **Server (new install or update):** download the `farlink-<version>.tar.gz` archive below,
+            unpack it on the server and follow `INSTALL-SERVER.md` inside it.
+            **Update every computer:** `sudo /opt/farlink-server/farlink-server publish <version> ./releases --config /etc/farlink-server/config.json`
+            in the unpacked folder; computers update themselves in the background.

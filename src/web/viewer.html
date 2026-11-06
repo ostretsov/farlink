@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Farlink</title>
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body class="viewer">
+<div class="vbar">
+  <div class="logo"><i></i><span id="title">Farlink</span></div>
+  <span id="mode" class="tag"></span>
+  <span id="status" class="stat">Connecting…</span>
+  <div class="spacer"></div>
+  <select id="screens" title="Screens"><option value="all">All screens</option></select>
+  <select id="quality" title="Picture quality">
+    <option value="fast">Fast</option><option value="balanced" selected>Balanced</option><option value="sharp">Sharp</option>
+  </select>
+  <select id="color" title="Colours">
+    <option value="full">Full colour</option><option value="high" selected>High colour</option><option value="low">256 colours</option><option value="gray">Greyscale</option>
+  </select>
+  <button id="filesBtn" title="Copy files to and from this computer">Files</button>
+  <button id="cad" title="Send Ctrl+Alt+Del">Ctrl+Alt+Del</button>
+  <button id="fs">Full screen</button>
+</div>
+<div class="stage" id="stage"><div class="overlay" id="overlay">Connecting…</div></div>
+<aside id="files" class="files hidden">
+  <div class="row"><b>Remote files</b><span class="spacer"></span><button class="small" id="fsClose">Close</button></div>
+  <div class="row"><button class="small" id="fsUp">Up</button><code class="mono muted" id="fsPath"></code></div>
+  <div id="fsList" class="fslist"></div>
+  <div class="row"><label class="btn small primary">Upload a file here<input type="file" id="fsUpload" hidden></label>
+    <span class="muted">Double-click a folder to open, a file to download.</span></div>
+  <div id="fsTransfers" class="muted"></div>
+</aside>
+<script>window.FARLINK = {{CONFIG}};</script>
+<script src="/assets/viewer.js"></script>
+</body>
+</html>
