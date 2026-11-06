@@ -78,9 +78,14 @@ pub struct Relay {
     pending: Mutex<HashMap<String, Pending>>,
     sessions: Mutex<HashMap<String, SessionEntry>>,
     sha_cache: Mutex<HashMap<PathBuf, (SystemTime, u64, String)>>,
+    update_status: Mutex<crate::server_update::UpdateStatus>,
+    /// Wakes the update loop for a check right now.
+    pub update_now: tokio::sync::Notify,
 }
 
 pub type Shared = Arc<Relay>;
+
+const UPDATE_STATUS: &str = "update-status.json";
 
 /// Load the saved state or create it. Returns the new admin password when
 /// the server starts for the very first time.
@@ -102,6 +107,11 @@ impl Relay {
         std::fs::create_dir_all(&cfg.data_dir)?;
         let state_path = cfg.data_dir.join("state.json");
         let (store, first_password) = load_or_init_store(&state_path)?;
+        let source = cfg.update_from_github.clone().filter(|r| !r.trim().is_empty());
+        let update_status = crate::server_update::UpdateStatus::load(&cfg.data_dir.join(UPDATE_STATUS), source, now_secs());
+        if let Err(e) = save_json(&cfg.data_dir.join(UPDATE_STATUS), &update_status) {
+            log::warn!("saving update status: {e}");
+        }
         let relay = Relay {
             cfg,
             state_path,
@@ -110,6 +120,8 @@ impl Relay {
             pending: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             sha_cache: Mutex::new(HashMap::new()),
+            update_status: Mutex::new(update_status),
+            update_now: tokio::sync::Notify::new(),
         };
         Ok((Arc::new(relay), first_password))
     }
@@ -122,6 +134,19 @@ impl Relay {
             log::error!("saving state: {e}");
         }
         r
+    }
+
+    pub fn update_status(&self) -> crate::server_update::UpdateStatus {
+        self.update_status.lock().unwrap().clone()
+    }
+
+    /// Change the update status and save it.
+    pub fn set_update_status(&self, f: impl FnOnce(&mut crate::server_update::UpdateStatus)) {
+        let mut s = self.update_status.lock().unwrap();
+        f(&mut s);
+        if let Err(e) = save_json(&self.cfg.data_dir.join(UPDATE_STATUS), &*s) {
+            log::warn!("saving update status: {e}");
+        }
     }
 
     fn read_store<R>(&self, f: impl FnOnce(&Store) -> R) -> R {
@@ -290,6 +315,7 @@ pub fn router(relay: Shared) -> Router {
         .route("/api/grants/{token}", delete(api_revoke))
         .route("/api/sessions/{id}/end", post(api_end_session))
         .route("/api/enroll/rotate", post(api_rotate))
+        .route("/api/server/check-update", post(api_check_update))
         .route("/api/guest/{token}", get(api_guest_info))
         .route("/ws/agent", get(ws_agent))
         .route("/ws/host-session/{session}", get(ws_host_session))
@@ -670,6 +696,9 @@ pub struct Overview {
     /// People (admin only).
     #[serde(default)]
     pub users: Vec<UserView>,
+    /// The server's own updates (what went wrong: admin only).
+    #[serde(default)]
+    pub server_update: crate::server_update::UpdateStatus,
 }
 
 fn admin_role() -> String {
@@ -688,6 +717,9 @@ pub fn overview_for(r: &Relay, who: &Who) -> Overview {
         o.users.clear();
         o.install_url.clear();
         o.role = "user".into();
+        if !o.server_update.last_check_ok && o.server_update.last_check.is_some() {
+            o.server_update.last_check_result = "failed".into();
+        }
         o.user_name = r.read_store(|s| s.display_name(who));
     }
     o
@@ -747,6 +779,7 @@ pub fn overview(r: &Relay) -> Overview {
         role: "admin".into(),
         user_name: "Administrator".into(),
         users,
+        server_update: r.update_status(),
     }
 }
 
@@ -893,6 +926,19 @@ async fn api_end_session(State(r): State<Shared>, headers: HeaderMap, Path(id): 
     }
     let n = r.kill_sessions("The administrator ended this session", |s| s.id == id);
     Json(json!({"ok": n > 0})).into_response()
+}
+
+/// Ask the server to look for a new release now (and install it).
+async fn api_check_update(State(r): State<Shared>, headers: HeaderMap) -> Response {
+    if !is_admin(&r, &headers) {
+        return unauthorized();
+    }
+    if r.update_status().source.is_none() {
+        return bad("Automatic updates are off. Set \"update_from_github\" in the server settings.");
+    }
+    r.set_update_status(|s| s.checking = true);
+    r.update_now.notify_one();
+    Json(json!({"ok": true})).into_response()
 }
 
 async fn api_rotate(State(r): State<Shared>, headers: HeaderMap) -> Response {

@@ -75,7 +75,7 @@ function render() {
   document.querySelectorAll('.admin-only').forEach((el) => el.classList.toggle('hidden', !admin));
   $('me').textContent = admin ? 'Administrator' : data.user_name;
   $('mtitle').textContent = admin ? 'Computers' : 'My computers';
-  $('ver').textContent = 'server ' + data.server_version + (admin && data.release_version ? ' · published ' + data.release_version : '');
+  renderServer(admin);
   $('installUrl').textContent = data.install_url;
   const q = $('filter').value.toLowerCase();
   const ms = data.machines.filter((m) => !q || (m.name + m.hostname + m.os + (m.owner_name || '')).toLowerCase().includes(q));
@@ -123,6 +123,48 @@ function render() {
     <td>${s.view_only ? '<span class="tag view">view</span>' : '<span class="tag ctrl">control</span>'}</td>
     <td style="text-align:right"><button class="small danger" onclick="endSession('${s.id}')">End</button></td></tr>`).join('')
     || '<tr><td colspan="4" class="muted">Nobody is connected.</td></tr>';
+}
+
+// Relay version and its own updates: short form in the header, details and
+// the "Update now" button in the administrator's "Relay server" card.
+function renderServer(admin) {
+  const u = data.server_update || {};
+  const when = (t) => t ? ago(data.now - t) : 'never';
+  let line = 'relay ' + data.server_version;
+  if (u.checking) line += ' · checking for updates…';
+  else if (u.last_check) line += ' · checked ' + when(u.last_check) + (u.last_check_ok ? '' : ' (failed)');
+  if (u.last_update) line += ' · updated ' + when(u.last_update);
+  $('ver').textContent = line;
+  $('ver').title = u.last_check ? 'Last check: ' + u.last_check_result : '';
+  if (!admin) return;
+  $('srvSource').innerHTML = u.source
+    ? 'updates itself from <a href="https://github.com/' + esc(u.source) + '/releases" target="_blank">github.com/' + esc(u.source) + '</a>, hourly'
+    : 'automatic updates are off';
+  const btn = $('srvCheck');
+  btn.disabled = !u.source || !!u.checking || !!pendingCheck;
+  btn.textContent = u.checking || pendingCheck ? 'Checking…' : 'Update now';
+  btn.title = u.source ? 'Look for a new release now and install it' : 'Set "update_from_github" in /etc/farlink-server/config.json';
+  const rows = [
+    ['Version', esc(data.server_version)],
+    ['Last check', u.last_check
+      ? when(u.last_check) + ' — ' + (u.last_check_ok ? esc(u.last_check_result) : '<span class="tag bad">failed</span> ' + esc(u.last_check_result))
+      : '<span class="muted">' + (u.source ? 'not yet' : '—') + '</span>'],
+    ['Last update', u.last_update
+      ? when(u.last_update) + (u.last_update_from ? ' (' + esc(u.last_update_from) + ' → ' + esc(u.version) + ')' : '')
+      : '<span class="muted">not updated since it was installed</span>'],
+    ['Published for computers', data.release_version ? esc(data.release_version) : '<span class="muted">nothing yet</span>'],
+  ];
+  $('srvInfo').innerHTML = rows.map(([k, v]) => `<tr><td class="muted" style="width:220px">${k}</td><td>${v}</td></tr>`).join('');
+}
+let pendingCheck = false;
+async function checkServerUpdate() {
+  pendingCheck = true; render();
+  try {
+    await api('POST', '/api/server/check-update');
+    toast('Checking for a new release…');
+  } catch (e) { toast(e.message); }
+  // The server restarts if it updates itself; the page picks it up again.
+  setTimeout(() => { pendingCheck = false; refresh(); }, 3000);
 }
 
 async function refresh() {

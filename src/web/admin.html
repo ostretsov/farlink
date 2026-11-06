@@ -54,6 +54,12 @@
       <table><thead><tr><th>Who</th><th>Computer</th><th>Mode</th><th></th></tr></thead><tbody id="sessions"></tbody></table>
     </div>
   </div>
+
+  <div class="card admin-only">
+    <h2>Relay server <small id="srvSource"></small><span class="spacer"></span>
+      <button class="small" id="srvCheck" onclick="checkServerUpdate()">Update now</button></h2>
+    <table><tbody id="srvInfo"></tbody></table>
+  </div>
 </main>
 
 <dialog id="grantDlg">

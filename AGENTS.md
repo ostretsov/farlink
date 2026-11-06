@@ -35,7 +35,7 @@ Data flow: host keeps a control WebSocket `/ws/agent` to the relay → a viewer 
 | `layout.rs` | Remembered window positions per machine+monitor (`layouts.json`) | Window placement |
 | `config.rs` | Settings files (host/viewer/server), atomic JSON save | New settings |
 | `install.rs` | Install plans as data (`Step`s): Windows service + firewall, Linux user service, server (HTTPS itself: `--port`, auto cert on 443 or cert files; removes old Caddy site); `execute` | Installers |
-| `server_update.rs` | Server follows GitHub Releases (`update_from_github`): hourly check, verify assets against `SHA256SUMS.txt`, replace own exe, publish computer programs, re-exec in place (loop guard `FARLINK_UPDATED_TO`). Asset names must match `build.yml` | Server auto-update |
+| `server_update.rs` | Server follows GitHub Releases (`update_from_github`): hourly check, verify assets against `SHA256SUMS.txt`, replace own exe, publish computer programs, re-exec in place (loop guard `FARLINK_UPDATED_TO`). `UpdateStatus` (saved in `<data>/update-status.json`, sent in `Overview.server_update`: version, last check, last update), `POST /api/server/check-update` (admin) wakes the loop via `Relay.update_now`. Asset names must match `build.yml` | Server auto-update |
 | `update.rs` | Self-update: check, download, SHA-256 verify, swap exe | Updates |
 | `keys.rs` | Key names ⇄ X11 keysyms / Windows VK codes | Keyboard |
 | `util.rs`, `version.rs` | Small helpers, CLI `Args`, version compare | — |

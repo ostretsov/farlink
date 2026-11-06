@@ -594,6 +594,16 @@ pub fn sample_overview() -> Overview {
             install_url: "https://remote.example.com/install/sample-anna".into(),
             machines: vec!["demo-anna".into()],
         }],
+        server_update: crate::server_update::UpdateStatus {
+            version: crate::VERSION.into(),
+            source: Some("example/farlink".into()),
+            last_check: Some(now - 20 * 60),
+            last_check_ok: true,
+            last_check_result: format!("up to date (latest release {})", crate::VERSION),
+            last_update: Some(now - 3 * 86400),
+            last_update_from: Some("0.0.9".into()),
+            checking: false,
+        },
     }
 }
 
@@ -898,6 +908,9 @@ impl ViewerApp {
                     let upd = self.update_status.lock().unwrap().clone();
                     if !upd.is_empty() {
                         ui.label(RichText::new(format!("· {upd}")).color(MUTED).size(12.0));
+                    }
+                    if let Some(o) = &self.overview {
+                        relay_status(ui, o);
                     }
                     ui.label(RichText::new(format!("· picture: {}", self.cfg.quality.summary())).color(MUTED).size(12.0));
                     if let Some((t, at)) = &self.toast {
@@ -1855,6 +1868,41 @@ fn machine_row(ui: &mut egui::Ui, m: &MachineView, selected: bool, in_session: b
 
 fn short_os(os: &str) -> String {
     os.split_whitespace().take(3).collect::<Vec<_>>().join(" ")
+}
+
+/// Status bar: relay version, when it last looked for and installed an update
+/// (details on hover).
+fn relay_status(ui: &mut egui::Ui, o: &Overview) {
+    let u = &o.server_update;
+    let ago = |t: u64| format!("{} ago", crate::util::human_duration(o.now.saturating_sub(t)));
+    let mut text = format!("· relay {}", o.server_version);
+    let mut color = MUTED;
+    if u.checking {
+        text.push_str(" · checking for updates…");
+    } else if let Some(t) = u.last_check {
+        text.push_str(&format!(" · checked {}", ago(t)));
+        if !u.last_check_ok {
+            text.push_str(" (failed)");
+            color = AMBER;
+        }
+    }
+    if let Some(t) = u.last_update {
+        text.push_str(&format!(" · updated {}", ago(t)));
+    }
+    let mut tip = format!("Relay server version {}", o.server_version);
+    match &u.source {
+        Some(repo) => tip.push_str(&format!("\nUpdates itself from github.com/{repo} (hourly)")),
+        None => tip.push_str("\nAutomatic updates are off"),
+    }
+    if let Some(t) = u.last_check {
+        tip.push_str(&format!("\nLast check: {} — {}", ago(t), u.last_check_result));
+    }
+    match (u.last_update, &u.last_update_from) {
+        (Some(t), Some(from)) => tip.push_str(&format!("\nLast update: {} ({from} → {})", ago(t), u.version)),
+        (Some(t), None) => tip.push_str(&format!("\nLast update: {}", ago(t))),
+        _ => tip.push_str("\nNot updated since it was installed"),
+    }
+    ui.label(RichText::new(text).color(color).size(12.0)).on_hover_text(tip);
 }
 
 #[cfg(test)]

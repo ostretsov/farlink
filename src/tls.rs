@@ -1,6 +1,5 @@
 //! Built-in HTTPS for the relay: certificates from Let's Encrypt (automatic,
-//! TLS-ALPN-01 on port 443, nothing else needed) or from PEM files, plus an
-//! optional plain-HTTP listener that only redirects to the HTTPS address.
+//! TLS-ALPN-01 on port 443, nothing else needed) or from PEM files.
 //!
 //! Handshakes run in their own tasks, so a slow or silent client never holds up
 //! other connections; finished TLS streams are handed to axum through
@@ -171,33 +170,15 @@ where
     });
 }
 
-/// Plain-HTTP listener that sends every request to the same path on `public_url`.
-pub async fn serve_redirect(listener: TcpListener, public_url: String) -> Result<()> {
-    use axum::http::{StatusCode, Uri, header};
-    use axum::response::IntoResponse;
-    let base = public_url.trim_end_matches('/').to_string();
-    let app = axum::Router::new().fallback(move |uri: Uri| {
-        let base = base.clone();
-        async move {
-            let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-            (StatusCode::PERMANENT_REDIRECT, [(header::LOCATION, format!("{base}{path}"))]).into_response()
-        }
-    });
-    axum::serve(listener, app).await?;
-    Ok(())
-}
-
-/// Bind everything the settings ask for and run the server until it fails.
+/// Bind the address the settings ask for and run the server until it fails.
 pub async fn run(relay: crate::server::Shared, cfg: ServerConfig) -> Result<()> {
     let listener = TcpListener::bind(&cfg.bind).await.with_context(|| format!("listening on {}", cfg.bind))?;
-    if let Some(addr) = cfg.redirect_bind.as_deref().filter(|a| !a.trim().is_empty()) {
-        let redirect = TcpListener::bind(addr).await.with_context(|| format!("listening on {addr}"))?;
-        let url = cfg.public_url.clone();
-        tokio::spawn(async move {
-            if let Err(e) = serve_redirect(redirect, url).await {
-                log::error!("HTTP redirect stopped: {e:#}");
-            }
-        });
+    if matches!(cfg.tls, Tls::Auto { .. }) && listener.local_addr()?.port() != 443 {
+        log::warn!(
+            "automatic certificates need Let's Encrypt to reach this server on port 443, but it listens on {}; \
+             this only works if port 443 is forwarded here (otherwise use certificate files)",
+            cfg.bind
+        );
     }
     match &cfg.tls {
         Tls::Off => crate::server::serve(relay, listener).await,

@@ -784,3 +784,53 @@ async fn server_updates_itself_and_publishes_from_github() {
     assert_eq!(std::fs::read_to_string(releases.join("version.txt")).unwrap().trim(), "0.9.0");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn overview_shows_relay_version_and_update_check_is_admin_only() {
+    let ts = start_server().await;
+    let (url, admin) = (ts.url.clone(), ts.admin.clone());
+    blocking(move || {
+        let get = |token: &str| -> serde_json::Value {
+            ureq::get(format!("{url}/api/overview"))
+                .header("Authorization", format!("Bearer {token}"))
+                .call()
+                .unwrap()
+                .body_mut()
+                .read_json()
+                .unwrap()
+        };
+        let post = |token: &str| {
+            match ureq::post(format!("{url}/api/server/check-update")).header("Authorization", format!("Bearer {token}")).send_empty() {
+                Ok(r) => r.status().as_u16(),
+                Err(ureq::Error::StatusCode(c)) => c,
+                Err(e) => panic!("{e}"),
+            }
+        };
+        let o = get(&admin);
+        assert_eq!(o["server_version"], farlink::VERSION);
+        assert_eq!(o["server_update"]["version"], farlink::VERSION);
+        assert!(o["server_update"]["source"].is_null(), "no GitHub repository set");
+        assert!(o["server_update"]["last_update"].is_null(), "first start is not an update");
+        assert_eq!(post("not-a-session"), 401);
+        assert_eq!(post(&admin), 400, "automatic updates are off: nothing to check");
+    })
+    .await;
+    // Turned on: the request wakes the update loop and shows "checking".
+    ts.relay.set_update_status(|s| s.source = Some("o/farlink".into()));
+    let (url, admin) = (ts.url.clone(), ts.admin.clone());
+    let checking = blocking(move || {
+        let r = ureq::post(format!("{url}/api/server/check-update")).header("Authorization", format!("Bearer {admin}")).send_empty();
+        assert_eq!(r.unwrap().status().as_u16(), 200);
+        let o: serde_json::Value = ureq::get(format!("{url}/api/overview"))
+            .header("Authorization", format!("Bearer {admin}"))
+            .call()
+            .unwrap()
+            .body_mut()
+            .read_json()
+            .unwrap();
+        o["server_update"]["checking"].as_bool()
+    })
+    .await;
+    assert_eq!(checking, Some(true));
+    tokio::time::timeout(Duration::from_secs(1), ts.relay.update_now.notified()).await.expect("update loop woken");
+}

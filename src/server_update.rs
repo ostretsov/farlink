@@ -13,7 +13,7 @@
 use crate::util::sha256_hex;
 use crate::version::Version;
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -35,6 +35,50 @@ const ASSETS: &[(&str, &str, &str)] = &[
     ("farlink-windows-x86_64.exe", "x86_64-pc-windows-gnu", "farlink.exe"),
     ("farlink-host-windows-x86_64.exe", "x86_64-pc-windows-gnu", "farlink-host.exe"),
 ];
+
+/// What the server knows about its own updates; shown in the apps and saved
+/// in `<data>/update-status.json` so it survives the restart after an update.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct UpdateStatus {
+    /// Version of the running server program.
+    #[serde(default)]
+    pub version: String,
+    /// `owner/repo` it follows, `None`: automatic updates are off.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// When it last asked GitHub (seconds since 1970).
+    #[serde(default)]
+    pub last_check: Option<u64>,
+    #[serde(default)]
+    pub last_check_ok: bool,
+    /// "up to date", "updated to 0.3.0", or what went wrong.
+    #[serde(default)]
+    pub last_check_result: String,
+    /// When the server program last changed version (automatically or by hand).
+    #[serde(default)]
+    pub last_update: Option<u64>,
+    #[serde(default)]
+    pub last_update_from: Option<String>,
+    /// A check is running right now.
+    #[serde(default)]
+    pub checking: bool,
+}
+
+impl UpdateStatus {
+    /// Load the saved status at start-up. A different saved version means the
+    /// program was replaced since the last run: that is the last update.
+    pub fn load(path: &Path, source: Option<String>, now: u64) -> UpdateStatus {
+        let mut s: UpdateStatus = crate::config::load_json(path);
+        if !s.version.is_empty() && s.version != crate::VERSION {
+            s.last_update = Some(now);
+            s.last_update_from = Some(std::mem::take(&mut s.version));
+        }
+        s.version = crate::VERSION.into();
+        s.source = source;
+        s.checking = false;
+        s
+    }
+}
 
 /// The latest release: its version and asset name → download address.
 #[derive(Debug, Clone)]
@@ -241,7 +285,11 @@ pub fn spawn(relay: crate::server::Shared, repo: String) {
         log::info!("updates: following GitHub releases of {repo}");
         let mut tick = tokio::time::interval(CHECK_EVERY);
         loop {
-            tick.tick().await;
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = relay.update_now.notified() => log::info!("updates: check asked for by the administrator"),
+            }
+            relay.set_update_status(|s| s.checking = true);
             let (relay2, repo2, exe2, broken2) = (relay.clone(), repo.clone(), exe.clone(), broken.clone());
             let result = tokio::task::spawn_blocking(move || -> Result<(Applied, String)> {
                 // FARLINK_GITHUB_API: a stand-in GitHub for testing.
@@ -253,6 +301,28 @@ pub fn spawn(relay: crate::server::Shared, repo: String) {
                 Ok((apply(&latest, crate::VERSION, published.as_deref(), &relay2.cfg.releases_dir, server)?, latest.version))
             })
             .await;
+            let (ok, text) = match &result {
+                Ok(Ok((done, version))) => (
+                    true,
+                    if done.server_replaced {
+                        format!("updated to {version}, restarting")
+                    } else if done.published.is_some() {
+                        format!("published {version} for computers")
+                    } else if broken.as_deref() == Some(version.as_str()) {
+                        format!("release {version} is broken (its server is {})", crate::VERSION)
+                    } else {
+                        format!("up to date (latest release {version})")
+                    },
+                ),
+                Ok(Err(e)) => (false, format!("{e:#}")),
+                Err(e) => (false, e.to_string()),
+            };
+            relay.set_update_status(|s| {
+                s.checking = false;
+                s.last_check = Some(crate::util::now_secs());
+                s.last_check_ok = ok;
+                s.last_check_result = text.clone();
+            });
             match result {
                 Ok(Ok((done, version))) => {
                     if let Some(v) = &done.published {
@@ -265,8 +335,7 @@ pub fn spawn(relay: crate::server::Shared, repo: String) {
                         restart(exe, &version);
                     }
                 }
-                Ok(Err(e)) => log::warn!("updates: {e:#}"),
-                Err(e) => log::warn!("updates: {e}"),
+                _ => log::warn!("updates: {text}"),
             }
         }
     });
@@ -275,6 +344,25 @@ pub fn spawn(relay: crate::server::Shared, repo: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_records_a_changed_version_as_the_last_update() {
+        let dir = crate::util::unique_temp_dir("farlink-updstatus");
+        let p = dir.join("update-status.json");
+        let first = UpdateStatus::load(&p, None, 100);
+        assert_eq!(first.version, crate::VERSION);
+        assert_eq!(first.last_update, None, "a first start is not an update");
+        crate::config::save_json(&p, &UpdateStatus { version: "0.0.1".into(), last_check: Some(50), checking: true, ..first })
+            .unwrap();
+        let s = UpdateStatus::load(&p, Some("o/r".into()), 200);
+        assert_eq!((s.last_update, s.last_update_from.as_deref()), (Some(200), Some("0.0.1")));
+        assert_eq!(s.last_check, Some(50), "kept across the restart");
+        assert!(!s.checking);
+        assert_eq!(s.source.as_deref(), Some("o/r"));
+        crate::config::save_json(&p, &s).unwrap();
+        assert_eq!(UpdateStatus::load(&p, None, 300).last_update, Some(200), "same version: nothing new");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn repo_names() {
