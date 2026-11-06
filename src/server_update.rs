@@ -217,6 +217,8 @@ fn restart(exe: &Path, version: &str) -> ! {
         let err = std::process::Command::new(exe).args(std::env::args_os().skip(1)).env(UPDATED_TO, version).exec();
         log::error!("restarting {}: {err}; exiting so the service manager restarts it", exe.display());
     }
+    #[cfg(not(unix))]
+    let _ = (exe, version); // the server only runs on Linux
     std::process::exit(1)
 }
 
