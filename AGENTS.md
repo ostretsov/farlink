@@ -19,17 +19,18 @@ Data flow: host keeps a control WebSocket `/ws/agent` to the relay → a viewer 
 
 | File | What's in it | Typical reasons to edit |
 |---|---|---|
-| `proto.rs` | **Wire protocol**: `SessionMsg` (viewer⇄host JSON), `AgentMsg` (host⇄relay), `TileHeader` (binary pictures, magic `T`), `FileChunk` (binary file pieces, magic `F`), `MonitorInfo`, `InputEvent`, `Preview`/`PreviewShot` (small base64 JPEGs per screen, `AgentMsg::PreviewRequest`/`Preview`), `AgentMsg::UpdateAvailable { force }` / `UpdateFailed` (forced helper updates) | Any new feature that crosses the network. JSON uses `#[serde(tag = "t", rename_all = "snake_case")]` — the browser viewer (`web/viewer.js`) relies on these exact names |
+| `proto.rs` | **Wire protocol**: `SessionMsg` (viewer⇄host JSON), `AgentMsg` (host⇄relay), `TileHeader` (binary pictures, magic `T`), `FileChunk` (binary file pieces, magic `F`), `MonitorInfo`, `InputEvent`, `Preview`/`PreviewShot` (small base64 JPEGs per screen, `AgentMsg::PreviewRequest`/`Preview`), `AgentMsg::UpdateAvailable { force }` / `UpdateFailed` (forced helper updates), `SessionMsg::Clipboard` (copied text, both ways, control only), `PointerMode`/`PointerShape`/`Pointer` (viewer draws the mouse pointer itself) | Any new feature that crosses the network. JSON uses `#[serde(tag = "t", rename_all = "snake_case")]` — the browser viewer (`web/viewer.js`) relies on these exact names |
 | `server.rs` | axum routes (`router()`), REST API `/api/*`, pages, WebSocket handlers, `viewer_loop` (the relay pipe + view-only/mode enforcement), `overview_for` (what admin vs person sees), `Relay::preview` + `GET /api/machines/{id}/preview` (asks the host over `/ws/agent`, 3 s cache, only answers from the asked machine count), `Relay::force_update`/`force_update_all` + `POST /api/machines/{id}/update`, `/api/machines/update-all` (admin; `MachineView.updating`/`update_error`, kept in memory only) | API endpoints, permissions, relay behaviour |
 | `grants.rs` | **Server state** `Store` (saved as `state.json`): admin password + sessions, `Machine`, `User` (people), `Grant` (temporary links), `Who` (admin/user), `can_access`, enrolment tokens | Accounts, access rules, link rules. Pure logic, well unit-tested |
-| `host.rs` | Helper agent loop (`run_agent`), `run_session`, `screen_loop` (capture → prepare → diff → encode, flow control, idle pacing `IdleTracker`, watched monitors), `preview_worker`/`preview_shots` (screen previews on their own thread, desktop kept open 60 s), `FileLogger`, Windows `service` module (SYSTEM service, session spawn, SendSAS) | Streaming performance, host behaviour |
+| `host.rs` | Helper agent loop (`run_agent`), `run_session`, `screen_loop`/`run_screen` (waits on viewer messages, not sleep: input is injected the moment it arrives and the screen is looked at again `INPUT_FOLLOW_UP` later; capture → prepare → diff → encode, adaptive flow control `FlowControl` (2–8 pictures on the way, grows while the round trip stays low, shrinks when it rises; viewers ack on arrival via `net::ack_for`), idle pacing `IdleTracker`, watched monitors; `PointerSender` sends pointer shape/position apart from pictures), `preview_worker`/`preview_shots` (screen previews on their own thread, desktop kept open 60 s), `FileLogger`, Windows `service` module (SYSTEM service, session spawn, SendSAS) | Streaming performance, host behaviour |
 | `codec.rs` | `Frame` (RGBA), scaling, colour reduction, 64×64 tile diff → strips, encode (`Codec::Auto`: ≤256 colours → palette PNG, else JPEG via `jpeg-encoder`; strips encoded in parallel), `MonitorEncoder` (host side; `refine` re-sends rough JPEG parts sharp after `REFINE_AFTER` still time), `Canvas` (viewer side, `take_dirty` for partial texture uploads) | Picture quality / bandwidth |
 | `quality.rs` | `Quality` settings + presets (Fast/Balanced/Sharp), clamping | Quality options |
-| `desktop/mod.rs` | `Desktop` trait (monitors, capture, input, `changed`), `TestPattern` fake 2-monitor desktop (demo + tests), coordinate helpers, cursor drawing | New platform features |
+| `desktop/mod.rs` | `Desktop` trait (monitors, capture, input, `changed`, `pointer`/`pointer_image`/`set_pointer_in_picture`), `PointerImage`, `TestPattern` fake 2-monitor desktop (demo + tests), coordinate helpers, cursor drawing | New platform features |
 | `desktop/x11.rs` | Ubuntu/X11: RandR, GetImage, XFixes cursor, XTest input, XDamage change detection | Linux capture/input |
-| `desktop/windows.rs` | Windows: capture via DXGI (falls back to reused GDI DIB surfaces), pointer drawn with `DrawIconEx`, SendInput, follows the input desktop (lock screen/UAC; a switch restarts DXGI), Ctrl+Alt+Del | Windows capture/input (only cross-compiled here, never run) |
+| `desktop/windows.rs` | Windows: capture via DXGI (falls back to reused GDI DIB surfaces), pointer drawn with `DrawIconEx`, SendInput, follows the input desktop (lock screen/UAC; a switch restarts DXGI), Ctrl+Alt+Del, `cursor_picture` (pointer shape via black/white `DrawIconEx`) | Windows capture/input (only cross-compiled here, never run) |
 | `desktop/dxgi.rs` | DXGI Desktop Duplication (`windows` crate): per-monitor `Output::poll` copies only dirty/moved rects into an RGBA frame; `changed()` is real on Windows | Windows capture performance |
 | `tls.rs` | Built-in HTTPS for the relay: Let's Encrypt via `rustls-acme` (TLS-ALPN-01 on 443, cache in `<data>/acme`) or PEM files (any port), `TlsListener` for `axum::serve`, `run` (binds per `ServerConfig.tls`) | Certificates, ports |
+| `clipboard.rs` | Shared copied text: `ClipboardSync` (`last` stops echoes, `\r\n`-tolerant), process-wide arboard clipboard (`system_get/set`), demo clipboard for tests, host `poll_loop` (500 ms, nothing while view-only). Host applies incoming text before forwarding later input; relay drops it both ways for view-only (`host_message_allowed`); viewer sends on Ctrl+V / window focus, browser on `paste` | Clipboard |
 | `files.rs` | Host-side file service: list folders, upload/download in chunks, safe names, never overwrite | File transfer |
 | `net.rs` | Viewer networking: `Api` (blocking REST via ureq), `SessionHandle`/`SessionShared` (live session state, transfers, mode), demo session | Desktop app ⇄ server |
 | `viewer.rs` | **Desktop UI** (≈2000 lines). Sections, in order: colours/style · jobs · `OpenSession` · input mapping (`map_events`) · `ViewerApp` state + `sample_overview` · top bar · bottom bar (connections) · machine list (right-click rename) · rename dialog · `preview_step` (selected online computer without open session: pictures every 5 s, drawn in the screens card) · central/login/details/grant/screens/quality cards · monitor windows · screenshot · `monitor_window` · file browser (`FilesView`, `files_window`) · widgets · tests | Anything visible in the app |
@@ -43,7 +44,7 @@ Data flow: host keeps a control WebSocket `/ws/agent` to the relay → a viewer 
 | `web/` | Browser UI embedded with `include_str!`: `admin.html/js` (web admin + person view), `viewer.html/js` (in-browser viewer + files panel), `install.html`, `message.html`, `app.css` | Web UI (plain JS, no build step) |
 
 Tests: unit tests live at the bottom of each module; `tests/end_to_end.rs` starts a real relay on a
-random port with real/fake hosts and viewers (people access, links, files, view-only switching,
+random port with real/fake hosts and viewers (people access, links, files, view-only switching, clipboard,
 updates, rename, screen previews).
 
 ## Commands
@@ -88,7 +89,8 @@ cargo run --bin farlink-host -- run --demo --verbose --server http://127.0.0.1:8
 ## CI/CD
 
 `.github/workflows/build.yml` (this folder is meant to be the root of the GitHub repo): tests on every
-push/PR (Linux + Windows), release builds for Linux x86_64, Linux ARM64, Windows x86_64; pushing a tag
+push/PR (Linux + Windows); release builds for Linux x86_64, Linux ARM64, Windows x86_64 only on tags and
+manual "Run workflow" (so pushing main + tag together doesn't build twice); pushing a tag
 `vX.Y.Z` (must equal `version` in `Cargo.toml`) creates a GitHub Release with the programs, the ready
 `farlink-X.Y.Z.tar.gz` (dist layout) and `SHA256SUMS.txt`.
 

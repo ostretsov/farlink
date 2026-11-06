@@ -24,6 +24,76 @@ pub trait Desktop {
     fn changed(&mut self) -> bool {
         true
     }
+    /// Draw the mouse pointer into pictures (`true`, the default) or leave
+    /// it out because the viewer draws it itself. With `false`, pointer
+    /// moves alone no longer count as a change.
+    fn set_pointer_in_picture(&mut self, _on: bool) {}
+    /// Where the pointer is right now. `None` = this system can't tell; the
+    /// pointer then stays in the pictures.
+    fn pointer(&mut self) -> Option<PointerPos> {
+        None
+    }
+    /// The look of the pointer as of the last [`pointer`](Self::pointer) call.
+    fn pointer_image(&mut self) -> Option<PointerImage> {
+        None
+    }
+}
+
+/// The mouse pointer's hot spot (virtual-desktop pixels) and which shape it
+/// has: the same `shape` key always means the same picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PointerPos {
+    pub x: i32,
+    pub y: i32,
+    pub shape: u64,
+}
+
+/// A pointer shape: straight (not premultiplied) RGBA pixels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PointerImage {
+    pub width: u32,
+    pub height: u32,
+    pub hot_x: u32,
+    pub hot_y: u32,
+    pub rgba: Vec<u8>,
+}
+
+impl PointerImage {
+    /// From premultiplied ARGB words (as X11 gives them).
+    pub fn from_premultiplied_argb(width: u32, height: u32, hot_x: u32, hot_y: u32, argb: &[u32]) -> PointerImage {
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for i in 0..(width * height) as usize {
+            let p = argb.get(i).copied().unwrap_or(0);
+            let a = (p >> 24) & 0xff;
+            let un = |c: u32| (c * 255).checked_div(a).map_or(0, |v| v.min(255) as u8);
+            rgba.extend_from_slice(&[un((p >> 16) & 0xff), un((p >> 8) & 0xff), un(p & 0xff), a as u8]);
+        }
+        PointerImage { width, height, hot_x: hot_x.min(width.saturating_sub(1)), hot_y: hot_y.min(height.saturating_sub(1)), rgba }
+    }
+
+    /// The demo pointer: a white arrow with a dark edge.
+    pub fn arrow() -> PointerImage {
+        let (w, h) = (11u32, 17u32);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            // Rows 0..16 widen by one pixel every row (the arrow's slanted side).
+            let width = (y + 1).min(w);
+            for x in 0..width {
+                let edge = x == 0 || x + 1 == width || y + 1 == h;
+                let c = if edge { [20, 20, 20, 255] } else { [255, 255, 255, 255] };
+                rgba[((y * w + x) * 4) as usize..][..4].copy_from_slice(&c);
+            }
+        }
+        PointerImage { width: w, height: h, hot_x: 0, hot_y: 0, rgba }
+    }
+
+    /// A small number that is the same for the same picture.
+    pub fn key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (self.width, self.height, self.hot_x, self.hot_y, &self.rgba).hash(&mut h);
+        h.finish()
+    }
 }
 
 /// Open the real desktop of this computer.
@@ -96,6 +166,8 @@ pub struct TestPattern {
     pub tick: u32,
     pub pointer: (i32, i32),
     pub received: Vec<InputEvent>,
+    /// Draw the pointer into pictures (off when the viewer draws it).
+    pub pointer_in_picture: bool,
 }
 
 impl TestPattern {
@@ -110,7 +182,7 @@ impl TestPattern {
                 m
             })
             .collect();
-        TestPattern { monitors, tick: 0, pointer: (100, 100), received: Vec::new() }
+        TestPattern { monitors, tick: 0, pointer: (100, 100), received: Vec::new(), pointer_in_picture: true }
     }
 
     pub fn dual() -> TestPattern {
@@ -172,7 +244,19 @@ impl Desktop for TestPattern {
 
     fn capture(&mut self, mon: &MonitorInfo) -> Result<Frame> {
         self.tick = self.tick.wrapping_add(1);
-        Ok(TestPattern::render(mon, self.tick, Some(self.pointer)))
+        Ok(TestPattern::render(mon, self.tick, self.pointer_in_picture.then_some(self.pointer)))
+    }
+
+    fn set_pointer_in_picture(&mut self, on: bool) {
+        self.pointer_in_picture = on;
+    }
+
+    fn pointer(&mut self) -> Option<PointerPos> {
+        Some(PointerPos { x: self.pointer.0, y: self.pointer.1, shape: 1 })
+    }
+
+    fn pointer_image(&mut self) -> Option<PointerImage> {
+        Some(PointerImage::arrow())
     }
 
     fn input(&mut self, monitors: &[MonitorInfo], ev: &InputEvent) -> Result<()> {
@@ -225,6 +309,34 @@ mod tests {
         let p = g.pixel(0, 1);
         assert_eq!(p[0], 128);
         assert!((p[2] as i32 - 99).abs() <= 1);
+    }
+
+    #[test]
+    fn pointer_image_unpremultiplies_and_keys_by_content() {
+        // Opaque white, nothing, half-transparent red (premultiplied 0x80 red).
+        let img = PointerImage::from_premultiplied_argb(3, 1, 9, 9, &[0xffffffff, 0, 0x80800000]);
+        assert_eq!(&img.rgba[0..4], &[255, 255, 255, 255]);
+        assert_eq!(&img.rgba[4..8], &[0, 0, 0, 0]);
+        assert_eq!(&img.rgba[8..12], &[255, 0, 0, 128]);
+        assert_eq!((img.hot_x, img.hot_y), (2, 0), "hot spot kept inside");
+        assert_eq!(img.key(), img.clone().key());
+        assert_ne!(img.key(), PointerImage::arrow().key());
+        let a = PointerImage::arrow();
+        assert_eq!(a.rgba.len(), (a.width * a.height * 4) as usize);
+    }
+
+    #[test]
+    fn test_pattern_pointer_can_leave_the_picture() {
+        let mut t = TestPattern::dual();
+        let mons = t.monitors().unwrap();
+        let with = t.capture(&mons[0]).unwrap();
+        t.set_pointer_in_picture(false);
+        t.tick = 0; // same moment as `with`
+        let without = t.capture(&mons[0]).unwrap();
+        let reference = TestPattern::render(&mons[0], 1, None);
+        assert_eq!(without, reference);
+        assert_ne!(with, reference);
+        assert_eq!(t.pointer(), Some(PointerPos { x: 100, y: 100, shape: 1 }));
     }
 
     #[test]

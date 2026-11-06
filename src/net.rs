@@ -236,6 +236,17 @@ pub struct SessionShared {
     pub transfers: Vec<Transfer>,
     /// The remote folder changed (upload finished): list it again.
     pub remote_changed: bool,
+    /// Text copied on the remote computer, waiting to be put on this
+    /// computer's clipboard.
+    pub clipboard_in: Option<String>,
+    /// What the remote clipboard holds as far as we know (sent or received),
+    /// so the same text is not sent again.
+    pub remote_clipboard: Option<String>,
+    /// Pointer shapes from the host, by id. Empty = the host draws the
+    /// pointer into the pictures (older helper).
+    pub pointer_shapes: HashMap<u32, crate::desktop::PointerImage>,
+    /// Where the remote pointer is (virtual-desktop pixels) and its shape id.
+    pub pointer: Option<(i32, i32, u32)>,
     next_req: u32,
     /// Download request -> (local folder, open file once it started).
     downloads: HashMap<u32, (PathBuf, Option<std::fs::File>)>,
@@ -340,6 +351,10 @@ impl SessionShared {
             remote_dir: RemoteDir::default(),
             transfers: Vec::new(),
             remote_changed: false,
+            clipboard_in: None,
+            remote_clipboard: None,
+            pointer_shapes: HashMap::new(),
+            pointer: None,
             next_req: 0,
             downloads: HashMap::new(),
             state: ConnState::Connecting,
@@ -377,6 +392,8 @@ impl SessionShared {
                     self.view_only |= view_only;
                     self.state = ConnState::Live;
                     replies.push(SessionMsg::Quality { quality: *quality });
+                    // Draw the pointer here: it then moves without waiting for the network.
+                    replies.push(SessionMsg::PointerMode { local: true });
                 }
                 Ok(SessionMsg::Monitors { monitors }) => {
                     self.monitors = monitors;
@@ -389,6 +406,22 @@ impl SessionShared {
                     self.view_only = view_only;
                     self.view_locked = locked;
                 }
+                Ok(SessionMsg::Clipboard { text }) => {
+                    self.remote_clipboard = Some(text.clone());
+                    self.clipboard_in = Some(text);
+                }
+                Ok(SessionMsg::PointerShape { id, width, height, hot_x, hot_y, rgba }) => {
+                    if let Some(rgba) = crate::util::base64_decode(&rgba)
+                        && (1..=256).contains(&width)
+                        && (1..=256).contains(&height)
+                        && rgba.len() == (width * height * 4) as usize
+                        && id != 0
+                    {
+                        let img = crate::desktop::PointerImage { width, height, hot_x: hot_x.min(width - 1), hot_y: hot_y.min(height - 1), rgba };
+                        self.pointer_shapes.insert(id, img);
+                    }
+                }
+                Ok(SessionMsg::Pointer { x, y, shape }) => self.pointer = Some((x, y, shape)),
                 Ok(m @ (SessionMsg::FsListing { .. } | SessionMsg::FsBegin { .. } | SessionMsg::FsDone { .. })) => self.file_message(m),
                 _ => {}
             },
@@ -402,8 +435,7 @@ impl SessionShared {
                         Err(e) => log::debug!("bad tile: {e}"),
                     }
                     if h.is_last() {
-                        self.window_frames += 1;
-                        replies.push(SessionMsg::Ack { seq: h.seq });
+                        self.window_frames += 1; // acked on arrival: see `ack_for`
                     }
                 }
             }
@@ -420,6 +452,14 @@ impl SessionShared {
         }
         replies
     }
+}
+
+/// The ack for a picture's last part, sent the moment it arrives (before
+/// decoding), so the host's round-trip measurement sees the network only.
+pub fn ack_for(msg: &Message) -> Option<SessionMsg> {
+    let Message::Binary(b) = msg else { return None };
+    let (h, _) = TileHeader::decode(b)?;
+    h.is_last().then_some(SessionMsg::Ack { seq: h.seq })
 }
 
 /// Decode the picture in a binary message (`None` for anything else).
@@ -462,6 +502,23 @@ impl SessionHandle {
 
     pub fn send(&self, m: SessionMsg) {
         let _ = self.tx.send(m);
+    }
+
+    /// Put `text` (copied on this computer) on the remote clipboard, unless
+    /// it is already there or the session only watches. Sent before any
+    /// input that follows, so a Ctrl+V right after pastes it.
+    pub fn send_clipboard(&self, text: &str) {
+        if text.is_empty() || text.len() > crate::clipboard::MAX_TEXT {
+            return;
+        }
+        {
+            let mut s = self.shared.lock().unwrap();
+            if s.view_only || s.remote_clipboard.as_deref().is_some_and(|r| crate::clipboard::same_text(r, text)) {
+                return;
+            }
+            s.remote_clipboard = Some(text.to_string());
+        }
+        self.send(SessionMsg::Clipboard { text: text.to_string() });
     }
 
     /// Switch between "only watch" and "control" (ignored for locked links).
@@ -617,6 +674,11 @@ async fn network_task(
                     Some(Err(_)) | None => { close("Connection lost".into()); break; }
                 };
                 if let Message::Close(_) = msg { close("Connection closed".into()); break; }
+                if let Some(ack) = ack_for(&msg)
+                    && sink.send(Message::Text(serde_json::to_string(&ack).unwrap().into())).await.is_err()
+                {
+                    close("Connection lost".into()); break;
+                }
                 let decoded = decode_picture(&msg);
                 let replies = shared.lock().unwrap().apply_decoded(&msg, decoded, &quality);
                 for r in replies {
@@ -665,6 +727,7 @@ async fn demo_task(
         tokio::select! {
             out = out_rx.recv() => match out {
                 Some(msg) => {
+                    if let Some(ack) = ack_for(&msg) { let _ = cmd_tx.send(ack); }
                     let decoded = decode_picture(&msg);
                     let replies = shared.lock().unwrap().apply_decoded(&msg, decoded, &quality);
                     for r in replies { let _ = cmd_tx.send(r); }
@@ -750,7 +813,11 @@ mod tests {
             view_only: true,
         };
         let r = s.apply(&Message::Text(serde_json::to_string(&hello).unwrap().into()), &q);
-        assert_eq!(r, vec![SessionMsg::Quality { quality: q }], "sends our quality on hello");
+        assert_eq!(
+            r,
+            vec![SessionMsg::Quality { quality: q }, SessionMsg::PointerMode { local: true }],
+            "sends our quality on hello and asks to draw the pointer here"
+        );
         assert_eq!(s.state, ConnState::Live);
         assert!(s.view_only, "host can force view-only");
         assert_eq!(s.monitors.len(), 2);
@@ -760,10 +827,26 @@ mod tests {
         let msgs = enc.encode(frame, &q, 1, 7).unwrap();
         let mut acks = Vec::new();
         for m in msgs {
-            acks.extend(s.apply(&Message::Binary(m.into()), &q));
+            let m = Message::Binary(m.into());
+            acks.extend(ack_for(&m));
+            assert!(s.apply(&m, &q).is_empty(), "acks go before decoding, not from apply");
         }
         assert_eq!(acks, vec![SessionMsg::Ack { seq: 7 }]);
+        assert_eq!(ack_for(&Message::Text("{}".into())), None);
         assert_eq!(s.canvases[&1].frame.as_ref().unwrap().width, 100);
+
+        // Pointer shapes are checked before use; positions are kept.
+        let arrow = crate::desktop::PointerImage::arrow();
+        let shape = |id, rgba: String| SessionMsg::PointerShape { id, width: arrow.width, height: arrow.height, hot_x: 0, hot_y: 0, rgba };
+        for bad in [shape(0, crate::util::base64_encode(&arrow.rgba)), shape(2, "AAAA".into()), shape(3, "not base64!".into())] {
+            s.apply(&Message::Text(serde_json::to_string(&bad).unwrap().into()), &q);
+        }
+        assert!(s.pointer_shapes.is_empty(), "broken shapes ignored");
+        s.apply(&Message::Text(serde_json::to_string(&shape(1, crate::util::base64_encode(&arrow.rgba))).unwrap().into()), &q);
+        assert_eq!(s.pointer_shapes[&1], arrow);
+        let pos = SessionMsg::Pointer { x: 10, y: 20, shape: 1 };
+        s.apply(&Message::Text(serde_json::to_string(&pos).unwrap().into()), &q);
+        assert_eq!(s.pointer, Some((10, 20, 1)));
 
         let closed = SessionMsg::Closed { reason: "bye".into() };
         s.apply(&Message::Text(serde_json::to_string(&closed).unwrap().into()), &q);

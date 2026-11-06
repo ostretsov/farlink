@@ -103,6 +103,30 @@ pub struct ViewerConfig {
     /// Check for viewer updates in the background.
     #[serde(default = "yes")]
     pub auto_update: bool,
+    /// How remote screens are drawn in their windows (last choice is remembered).
+    #[serde(default)]
+    pub scale_mode: ScaleMode,
+}
+
+/// How a remote screen is drawn in its window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScaleMode {
+    /// One remote pixel = one local pixel; the window is sized to the remote
+    /// screen, scroll bars if it does not fit, black around it if bigger.
+    #[default]
+    Original,
+    /// Stretch (keeping the aspect ratio) to fill the window.
+    Fit,
+}
+
+impl ScaleMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            ScaleMode::Original => "Original size",
+            ScaleMode::Fit => "Fit to window",
+        }
+    }
 }
 
 fn yes() -> bool {
@@ -124,6 +148,7 @@ impl Default for ViewerConfig {
             view_only_default: false,
             recent_links: Vec::new(),
             auto_update: true,
+            scale_mode: ScaleMode::default(),
         }
     }
 }

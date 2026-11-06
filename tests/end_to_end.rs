@@ -187,6 +187,30 @@ async fn real_helper_streams_both_monitors_to_admin_viewer() {
     assert!(q.scale_pct < 100);
     assert_eq!((f0.width, f0.height), q.scaled_size(1600, 900));
 
+    // The viewer asks to draw the pointer itself: shape and position come
+    // through the relay as their own small messages.
+    send(&mut viewer, &SessionMsg::PointerMode { local: true }).await;
+    let (mut shape, mut pos) = (None, None);
+    while shape.is_none() || pos.is_none() {
+        let msg = tokio::time::timeout(Duration::from_secs(20), viewer.next()).await.unwrap().unwrap().unwrap();
+        match msg {
+            Message::Binary(b) => {
+                if let Some((h, _)) = TileHeader::decode(&b)
+                    && h.is_last()
+                {
+                    send(&mut viewer, &SessionMsg::Ack { seq: h.seq }).await;
+                }
+            }
+            Message::Text(t) => match serde_json::from_str::<SessionMsg>(&t) {
+                Ok(SessionMsg::PointerShape { id, .. }) => shape = Some(id),
+                Ok(SessionMsg::Pointer { x, y, shape }) => pos = Some((x, y, shape)),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    assert_eq!(pos, Some((100, 100, shape.unwrap())), "the demo pointer's start position");
+
     // The admin overview lists the live session.
     let o = s.overview().await;
     assert_eq!(o.sessions.len(), 1);
@@ -1040,4 +1064,67 @@ async fn previews_follow_access_rules_and_are_shared_briefly() {
     let api = s.api();
     let err = blocking(move || api.preview(&office_pc).unwrap_err()).await;
     assert!(err.to_string().contains("offline"), "{err}");
+}
+
+/// Next copied text the viewer gets.
+async fn next_clip(ws: &mut Ws) -> String {
+    loop {
+        if let SessionMsg::Clipboard { text } = next_json::<SessionMsg>(ws).await {
+            return text;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn copied_text_goes_both_ways_in_control_sessions_only() {
+    use farlink::clipboard::{demo_get, demo_set};
+    let s = start_server().await;
+    let cfg_dir = farlink::util::unique_temp_dir("farlink-e2e-clipboard");
+    let cfg = HostConfig { server_url: s.url.clone(), enroll_token: Some(s.relay.enroll_token()), machine_id: None, secret: None };
+    tokio::spawn(run_agent(cfg_dir.join("host.json"), cfg, HostOptions { demo: true, no_update: true }));
+    let mut id = None;
+    for _ in 0..50 {
+        if let Some(m) = s.overview().await.machines.iter().find(|m| m.online) {
+            id = Some(m.machine.id.clone());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let id = id.expect("online");
+    let (mut viewer, _) = connect_async(s.ws(&format!("/ws/view/{id}?token={}", s.admin))).await.unwrap();
+    let _hello: SessionMsg = next_json(&mut viewer).await;
+    send(&mut viewer, &SessionMsg::Watch { monitors: vec![] }).await;
+
+    let wait_remote = |want: &'static str| async move {
+        for _ in 0..50 {
+            if demo_get().as_deref() == Some(want) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    };
+
+    // Viewer -> remote computer.
+    send(&mut viewer, &SessionMsg::Clipboard { text: "copied on my PC ✓".into() }).await;
+    assert!(wait_remote("copied on my PC ✓").await);
+    // Remote computer -> viewer (what the viewer just sent is not echoed).
+    demo_set("copied on the remote PC");
+    assert_eq!(next_clip(&mut viewer).await, "copied on the remote PC");
+
+    // Only watching: nothing in either direction.
+    send(&mut viewer, &SessionMsg::SetViewOnly { view_only: true }).await;
+    assert_eq!(next_mode(&mut viewer).await, (true, false));
+    send(&mut viewer, &SessionMsg::Clipboard { text: "must not arrive".into() }).await;
+    demo_set("secret while watching");
+    let leaked = tokio::time::timeout(Duration::from_millis(1500), next_clip(&mut viewer)).await;
+    assert!(leaked.is_err(), "view-only session got copied text: {leaked:?}");
+    assert_eq!(demo_get().as_deref(), Some("secret while watching"));
+
+    // Control again: only text copied from now on is shared.
+    send(&mut viewer, &SessionMsg::SetViewOnly { view_only: false }).await;
+    assert_eq!(next_mode(&mut viewer).await, (false, false));
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    demo_set("after switching back");
+    assert_eq!(next_clip(&mut viewer).await, "after switching back");
 }

@@ -2,6 +2,7 @@
 //! (outgoing only — nothing listens on this machine), opens a session socket
 //! when someone wants to see the screen, and installs updates by itself.
 
+use crate::clipboard::ClipboardSync;
 use crate::codec::{Frame, MonitorEncoder, prepare};
 use crate::config::{HostConfig, save_json};
 use crate::desktop::{Desktop, TestPattern, open_desktop};
@@ -270,6 +271,13 @@ pub async fn run_session(server: String, machine_id: String, secret: String, ses
     let stop2 = stop.clone();
     let file_out = out_tx.clone();
     let mut files = crate::files::FileService::default();
+    // Copied text both ways (control sessions only).
+    let clip = Arc::new(std::sync::Mutex::new(ClipboardSync::for_host(demo)));
+    let clip_view_only = Arc::new(AtomicBool::new(view_only));
+    {
+        let (clip, tx, vo, stop) = (clip.clone(), out_tx.clone(), clip_view_only.clone(), stop.clone());
+        std::thread::Builder::new().name("clipboard".into()).spawn(move || crate::clipboard::poll_loop(clip, tx, vo, stop))?;
+    }
     std::thread::Builder::new()
         .name("screen".into())
         .spawn(move || screen_loop(demo, view_only, cmd_rx, out_tx, stop2))?;
@@ -281,7 +289,19 @@ pub async fn run_session(server: String, machine_id: String, secret: String, ses
                         if let Ok(m) = serde_json::from_str::<SessionMsg>(&t) {
                             if matches!(m, SessionMsg::Closed { .. }) { break; }
                             // Only the relay sends this, after checking the person may switch.
-                            if let SessionMsg::SetViewOnly { view_only: v } = m { view_only = v; }
+                            if let SessionMsg::SetViewOnly { view_only: v } = m {
+                                view_only = v;
+                                clip_view_only.store(v, Ordering::Relaxed);
+                            }
+                            if let SessionMsg::Clipboard { text } = m {
+                                // Done before later messages go on, so the Ctrl+V
+                                // that follows pastes this text.
+                                if !view_only {
+                                    let clip = clip.clone();
+                                    let _ = tokio::task::spawn_blocking(move || clip.lock().unwrap().receive(text)).await;
+                                }
+                                continue;
+                            }
                             if m.is_file_request() {
                                 // Files only in control sessions (the relay checks too).
                                 if !view_only { files.handle(m, &file_out).await; }
@@ -319,13 +339,25 @@ pub async fn run_session(server: String, machine_id: String, secret: String, ses
 /// Capture + encode loop on its own thread (screen APIs are not async).
 pub fn screen_loop(
     demo: bool,
+    view_only: bool,
+    rx: std::sync::mpsc::Receiver<SessionMsg>,
+    tx: tokio::sync::mpsc::Sender<Message>,
+    stop: Arc<AtomicBool>,
+) {
+    run_screen(&|| desktop(demo), view_only, rx, tx, stop)
+}
+
+/// [`screen_loop`] with the desktop to use (`open` is called again when the
+/// screen stops working, e.g. after a desktop switch).
+pub fn run_screen(
+    open: &dyn Fn() -> Result<Box<dyn Desktop>>,
     mut view_only: bool,
     rx: std::sync::mpsc::Receiver<SessionMsg>,
     tx: tokio::sync::mpsc::Sender<Message>,
     stop: Arc<AtomicBool>,
 ) {
     let send_json = |m: &SessionMsg| tx.blocking_send(Message::Text(serde_json::to_string(m).unwrap().into())).is_ok();
-    let mut desk = match desktop(demo) {
+    let mut desk = match open() {
         Ok(d) => d,
         Err(e) => {
             send_json(&SessionMsg::Notice { text: format!("Cannot show this screen: {e:#}") });
@@ -359,34 +391,53 @@ pub fn screen_loop(
     let mut watch: Option<Vec<u8>> = None;
     let mut idle = IdleTracker::new(Instant::now());
     let mut seq: u32 = 0;
-    let mut last_sent: u32 = 0;
-    let mut acked: u32 = 0;
-    let mut waiting_since: Option<Instant> = None;
+    let mut flow = FlowControl::new(Instant::now());
     let mut last_monitor_check = Instant::now();
     let mut errors = 0u32;
+    // When to look at the screen next. Until then the thread waits for
+    // viewer messages, so input is applied the moment it arrives.
+    let mut next_look = Instant::now();
+    let mut last_look = Instant::now() - Duration::from_secs(1);
+    let mut pointer = PointerSender::default();
 
     while !stop.load(Ordering::Relaxed) {
-        let start = Instant::now();
         loop {
-            match rx.try_recv() {
-                Ok(SessionMsg::Quality { quality: q }) => {
+            let now = Instant::now();
+            let msg = if now >= next_look {
+                match rx.try_recv() {
+                    Ok(m) => m,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                }
+            } else {
+                match rx.recv_timeout(next_look - now) {
+                    Ok(m) => m,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            };
+            match msg {
+                SessionMsg::Quality { quality: q } => {
                     quality = q.clamped();
                     encoders.iter_mut().for_each(|e| e.reset());
                     prev_raw.iter_mut().for_each(|p| *p = None);
                 }
-                Ok(SessionMsg::SetViewOnly { view_only: v }) => view_only = v,
-                Ok(SessionMsg::Input { event }) => {
-                    idle.activity(Instant::now());
+                SessionMsg::SetViewOnly { view_only: v } => view_only = v,
+                SessionMsg::Input { event } => {
+                    let now = Instant::now();
+                    idle.activity(now);
                     if !view_only && let Err(e) = desk.input(&monitors, &event) {
                         log::debug!("input: {e}");
                     }
+                    next_look = next_look.min(after_input(now, last_look));
                 }
-                Ok(SessionMsg::Ack { seq: s }) => acked = acked.max(s),
-                Ok(SessionMsg::Refresh) => {
+                SessionMsg::Ack { seq: s } => flow.acked(s, Instant::now()),
+                SessionMsg::Refresh => {
                     encoders.iter_mut().for_each(|e| e.reset());
                     prev_raw.iter_mut().for_each(|p| *p = None);
+                    pointer.resend();
                 }
-                Ok(SessionMsg::Watch { monitors: w }) => {
+                SessionMsg::Watch { monitors: w } => {
                     // Screens that come back into view get a complete picture.
                     for (i, m) in monitors.iter().enumerate() {
                         let was = watch.as_ref().is_none_or(|v| v.contains(&m.index));
@@ -398,11 +449,24 @@ pub fn screen_loop(
                     watch = Some(w);
                     idle.activity(Instant::now());
                 }
-                Ok(_) => {}
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                SessionMsg::PointerMode { local } => {
+                    // Only if this system can tell where the pointer is.
+                    let on = local && desk.pointer().is_some();
+                    if on != pointer.on {
+                        pointer = PointerSender { on, ..PointerSender::default() };
+                        desk.set_pointer_in_picture(!on);
+                        // Pictures with / without the pointer drawn in.
+                        encoders.iter_mut().for_each(|e| e.reset());
+                        prev_raw.iter_mut().for_each(|p| *p = None);
+                    }
+                }
+                _ => {}
             }
         }
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let start = Instant::now();
 
         if last_monitor_check.elapsed() > Duration::from_secs(3) {
             last_monitor_check = Instant::now();
@@ -419,17 +483,20 @@ pub fn screen_loop(
             }
         }
 
-        // Flow control: at most two pictures on the way. A lost ack can't
-        // freeze the session for more than 3 seconds.
-        if last_sent.wrapping_sub(acked) >= 2 && last_sent > acked {
-            let since = *waiting_since.get_or_insert_with(Instant::now);
-            if since.elapsed() < Duration::from_secs(3) {
-                std::thread::sleep(Duration::from_millis(5));
-                continue;
+        // The pointer goes on its own, small and quick, whatever the pictures do.
+        let moved = pointer.step(desk.as_mut(), start);
+        if !moved.is_empty() {
+            idle.activity(start);
+            if !moved.iter().all(send_json) {
+                return;
             }
-            acked = last_sent;
         }
-        waiting_since = None;
+
+        // Flow control: only so many pictures on the way (see `FlowControl`).
+        if !flow.can_send(start) {
+            next_look = start + Duration::from_millis(5);
+            continue;
+        }
 
         // Auto quality: parts first sent as rough JPEG (photos, video) are
         // sent again sharp once that screen has been still for a moment.
@@ -455,7 +522,8 @@ pub fn screen_loop(
             }
         }
         if refined {
-            last_sent = seq;
+            flow.sent(seq, Instant::now());
+            next_look = Instant::now();
             continue; // flow control first, then look at the screen again
         }
 
@@ -464,10 +532,11 @@ pub fn screen_loop(
         let now = Instant::now();
         let changed = desk.changed();
         if !changed && !idle.recheck_due(now) {
-            sleep_until_next(start, idle.interval(&quality, now));
+            next_look = next_after(start, idle.interval(&quality, now), &pointer);
             continue;
         }
         idle.checked(now);
+        last_look = now;
 
         seq = seq.wrapping_add(1).max(1);
         let mut sent_any = false;
@@ -485,8 +554,10 @@ pub fn screen_loop(
                     log::debug!("capture: {e}");
                     if errors > 10 {
                         std::thread::sleep(Duration::from_millis(500));
-                        if let Ok(d) = desktop(demo) {
+                        if let Ok(mut d) = open() {
+                            d.set_pointer_in_picture(!pointer.on);
                             desk = d;
+                            pointer.resend();
                         }
                         errors = 0;
                     }
@@ -519,16 +590,182 @@ pub fn screen_loop(
             }
         }
         if sent_any {
-            last_sent = seq;
+            flow.sent(seq, Instant::now());
             idle.activity(Instant::now());
         }
-        sleep_until_next(start, idle.interval(&quality, Instant::now()));
+        next_look = next_after(start, idle.interval(&quality, Instant::now()), &pointer);
     }
 }
 
-fn sleep_until_next(start: Instant, interval: Duration) {
-    if let Some(rest) = interval.checked_sub(start.elapsed()) {
-        std::thread::sleep(rest);
+/// How many pictures may be on the way to the viewer (sent, not yet
+/// acknowledged). Too few wastes a long link (the host waits a whole round
+/// trip per picture); too many lets pictures queue up, so what the viewer
+/// sees falls behind. The window grows while every slot gets used and the
+/// round trip stays near the best seen, and shrinks as soon as the round
+/// trip grows (pictures are queueing somewhere).
+pub struct FlowControl {
+    /// Pictures on the way: (seq, when sent).
+    in_flight: std::collections::VecDeque<(u32, Instant)>,
+    window: usize,
+    /// Best round trip lately (the link without queues), and when it was set.
+    base_rtt: Option<(Duration, Instant)>,
+    /// When the window last changed (changes at most once per round trip).
+    changed: Instant,
+    /// A picture was held back or sent into a full window since the last change.
+    limited: bool,
+}
+
+impl FlowControl {
+    pub const MIN: usize = 2;
+    pub const MAX: usize = 8;
+    /// A picture not acknowledged after this long is taken as lost, so a
+    /// lost ack can't freeze the session.
+    pub const LOST_AFTER: Duration = Duration::from_secs(3);
+    /// The best round trip is measured afresh this often (routes change).
+    const BASE_FOR: Duration = Duration::from_secs(30);
+
+    pub fn new(now: Instant) -> FlowControl {
+        FlowControl { in_flight: Default::default(), window: Self::MIN, base_rtt: None, changed: now, limited: false }
+    }
+
+    pub fn window(&self) -> usize {
+        self.window
+    }
+
+    /// May another picture go now?
+    pub fn can_send(&mut self, now: Instant) -> bool {
+        if self.in_flight.front().is_some_and(|f| now.duration_since(f.1) >= Self::LOST_AFTER) {
+            self.in_flight.clear();
+        }
+        let ok = self.in_flight.len() < self.window;
+        if !ok {
+            self.limited = true;
+        }
+        ok
+    }
+
+    pub fn sent(&mut self, seq: u32, now: Instant) {
+        self.in_flight.push_back((seq, now));
+        if self.in_flight.len() >= self.window {
+            self.limited = true;
+        }
+    }
+
+    /// The viewer has picture `seq` (and so everything before it).
+    pub fn acked(&mut self, seq: u32, now: Instant) {
+        let mut sent_at = None;
+        // `seq` wraps around; compare by distance.
+        while let Some(&(s, t)) = self.in_flight.front()
+            && (seq.wrapping_sub(s) as i32) >= 0
+        {
+            self.in_flight.pop_front();
+            sent_at = Some(t);
+        }
+        let Some(sent_at) = sent_at else { return };
+        let rtt = now.duration_since(sent_at);
+        let base = match self.base_rtt {
+            Some((b, set)) if rtt >= b && now.duration_since(set) < Self::BASE_FOR => b,
+            _ => {
+                self.base_rtt = Some((rtt, now));
+                rtt
+            }
+        };
+        if now.duration_since(self.changed) < rtt.max(Duration::from_millis(10)) {
+            return;
+        }
+        let queueing = rtt > base + (base / 2).max(Duration::from_millis(20));
+        if queueing && self.window > Self::MIN {
+            self.window -= 1;
+            self.changed = now;
+        } else if !queueing && self.limited && self.window < Self::MAX {
+            self.window += 1;
+            self.changed = now;
+        }
+        self.limited = false;
+    }
+}
+
+/// After mouse / keyboard input the screen is looked at again this soon
+/// (the reaction is usually drawn by then) instead of at the next regular
+/// time, which can be up to [`IdleTracker::IDLE_INTERVAL`] away.
+pub const INPUT_FOLLOW_UP: Duration = Duration::from_millis(8);
+/// Even while input keeps coming, at most one look at the screen per this.
+pub const MIN_LOOK_GAP: Duration = Duration::from_millis(15);
+/// How often the pointer is checked for viewers that draw it themselves.
+pub const POINTER_EVERY: Duration = Duration::from_millis(15);
+
+/// When to look at the screen after input arrived at `now`.
+pub fn after_input(now: Instant, last_look: Instant) -> Instant {
+    (now + INPUT_FOLLOW_UP).max(last_look + MIN_LOOK_GAP)
+}
+
+/// Next regular look; sooner while the pointer has to be followed.
+fn next_after(start: Instant, interval: Duration, pointer: &PointerSender) -> Instant {
+    let interval = if pointer.on && pointer.recently_moved(start) { interval.min(POINTER_EVERY) } else { interval };
+    start + interval
+}
+
+/// Sends the pointer's position and shape to viewers that draw it
+/// themselves ([`SessionMsg::PointerMode`]).
+#[derive(Default)]
+pub struct PointerSender {
+    /// The viewer asked for it and this system can do it.
+    pub on: bool,
+    /// Desktop shape key -> id sent to the viewer.
+    ids: std::collections::HashMap<u64, u32>,
+    last: Option<(i32, i32, u32)>,
+    checked: Option<Instant>,
+    moved: Option<Instant>,
+}
+
+impl PointerSender {
+    /// Send shape and position again (new viewer picture, new desktop).
+    pub fn resend(&mut self) {
+        self.ids.clear();
+        self.last = None;
+    }
+
+    fn recently_moved(&self, now: Instant) -> bool {
+        self.moved.is_some_and(|t| now.duration_since(t) < IdleTracker::IDLE_AFTER)
+    }
+
+    /// Look at the pointer (at most every [`POINTER_EVERY`]). Returns what to
+    /// send: nothing while it stays put, else a new shape (if any) and then
+    /// the position.
+    pub fn step(&mut self, desk: &mut dyn Desktop, now: Instant) -> Vec<SessionMsg> {
+        if !self.on || self.checked.is_some_and(|t| now.duration_since(t) < POINTER_EVERY) {
+            return Vec::new();
+        }
+        self.checked = Some(now);
+        let Some(p) = desk.pointer() else { return Vec::new() };
+        let mut out = Vec::new();
+        let id = match self.ids.get(&p.shape) {
+            Some(&id) => id,
+            None => match desk.pointer_image() {
+                Some(img) => {
+                    let id = self.ids.len() as u32 + 1;
+                    self.ids.insert(p.shape, id);
+                    out.push(SessionMsg::PointerShape {
+                        id,
+                        width: img.width,
+                        height: img.height,
+                        hot_x: img.hot_x,
+                        hot_y: img.hot_y,
+                        rgba: crate::util::base64_encode(&img.rgba),
+                    });
+                    id
+                }
+                None => self.last.map(|l| l.2).unwrap_or(0),
+            },
+        };
+        let now_at = (p.x, p.y, id);
+        if self.last == Some(now_at) {
+            return out;
+        }
+        self.last = Some(now_at);
+        self.moved = Some(now);
+        out.push(SessionMsg::Pointer { x: p.x, y: p.y, shape: id });
+        out
     }
 }
 
@@ -868,6 +1105,156 @@ mod tests {
         assert_eq!(tile_monitors(&one), HashSet::from([1]), "screen 1 window closed: not captured");
         let none = run_loop(vec![SessionMsg::Quality { quality: fast }, SessionMsg::Watch { monitors: vec![] }], 400);
         assert!(tile_monitors(&none).is_empty(), "all windows minimised: nothing captured");
+    }
+
+    /// The pretend computer, noting when input arrived and when the screen was read.
+    struct Timed {
+        inner: TestPattern,
+        log: Arc<std::sync::Mutex<Vec<(&'static str, Instant)>>>,
+    }
+
+    impl Desktop for Timed {
+        fn monitors(&mut self) -> Result<Vec<MonitorInfo>> {
+            self.inner.monitors()
+        }
+        fn capture(&mut self, m: &MonitorInfo) -> Result<Frame> {
+            self.log.lock().unwrap().push(("capture", Instant::now()));
+            self.inner.capture(m)
+        }
+        fn input(&mut self, m: &[MonitorInfo], ev: &crate::proto::InputEvent) -> Result<()> {
+            self.log.lock().unwrap().push(("input", Instant::now()));
+            self.inner.input(m, ev)
+        }
+        fn set_pointer_in_picture(&mut self, on: bool) {
+            self.inner.set_pointer_in_picture(on)
+        }
+        fn pointer(&mut self) -> Option<crate::desktop::PointerPos> {
+            self.inner.pointer()
+        }
+        fn pointer_image(&mut self) -> Option<crate::desktop::PointerImage> {
+            self.inner.pointer_image()
+        }
+    }
+
+    #[test]
+    fn input_is_applied_at_once_and_its_reaction_looked_at_soon() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let l2 = log.clone();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(1024);
+        let stop = Arc::new(AtomicBool::new(false));
+        let s2 = stop.clone();
+        // One picture a second: the old loop slept up to a second before
+        // even reading the input.
+        let slow = Quality { max_fps: 1, ..Quality::preset(Preset::Fast) };
+        cmd_tx.send(SessionMsg::Quality { quality: slow }).unwrap();
+        let th = std::thread::spawn(move || {
+            let open = move || -> Result<Box<dyn Desktop>> { Ok(Box::new(Timed { inner: TestPattern::new(&[(800, 600)]), log: l2.clone() })) };
+            run_screen(&open, false, cmd_rx, out_tx, s2)
+        });
+        // Acks so flow control never holds pictures back.
+        let acker = {
+            let cmd_tx = cmd_tx.clone();
+            std::thread::spawn(move || {
+                while let Some(m) = out_rx.blocking_recv() {
+                    if let Message::Binary(b) = &m
+                        && let Some((h, _)) = TileHeader::decode(b)
+                        && h.is_last()
+                    {
+                        let _ = cmd_tx.send(SessionMsg::Ack { seq: h.seq });
+                    }
+                }
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300)); // first picture sent, loop now waiting
+        let sent = Instant::now();
+        let click = crate::proto::InputEvent::MouseMove { mon: 0, x: 0.5, y: 0.5 };
+        cmd_tx.send(SessionMsg::Input { event: click }).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        stop.store(true, Ordering::Relaxed);
+        drop(cmd_tx);
+        th.join().unwrap();
+        acker.join().unwrap();
+        let log = log.lock().unwrap();
+        let input = log.iter().find(|(k, _)| *k == "input").expect("input applied").1;
+        assert!(input.duration_since(sent) < Duration::from_millis(30), "input waited {:?}", input.duration_since(sent));
+        let look = log.iter().find(|(k, t)| *k == "capture" && *t > input).expect("screen read after the input").1;
+        assert!(look.duration_since(input) < Duration::from_millis(100), "reaction looked at after {:?}", look.duration_since(input));
+    }
+
+    #[test]
+    fn pointer_is_sent_apart_from_the_pictures_when_the_viewer_draws_it() {
+        let fast = Quality::preset(Preset::Fast);
+        let move_to = |x| SessionMsg::Input { event: crate::proto::InputEvent::MouseMove { mon: 0, x, y: 0.5 } };
+        let msgs = run_loop(vec![SessionMsg::Quality { quality: fast }, SessionMsg::PointerMode { local: true }, move_to(0.25)], 400);
+        let json: Vec<SessionMsg> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                Message::Text(t) => serde_json::from_str(t).ok(),
+                _ => None,
+            })
+            .collect();
+        let shapes: Vec<_> = json.iter().filter(|m| matches!(m, SessionMsg::PointerShape { .. })).collect();
+        assert_eq!(shapes.len(), 1, "the shape goes once");
+        let SessionMsg::PointerShape { id, width, height, rgba, .. } = shapes[0] else { unreachable!() };
+        assert_eq!(crate::util::base64_decode(rgba).unwrap().len(), (width * height * 4) as usize);
+        let last = json.iter().rev().find_map(|m| match m {
+            SessionMsg::Pointer { x, y, shape } => Some((*x, *y, *shape)),
+            _ => None,
+        });
+        assert_eq!(last, Some((400, 450, *id)), "follows the injected move (1600x900 screen)");
+        // Without asking, nothing pointer-related is sent.
+        let plain = run_loop(vec![SessionMsg::Quality { quality: fast }], 300);
+        assert!(!plain.iter().any(|m| matches!(m, Message::Text(t) if t.contains("pointer"))));
+    }
+
+    #[test]
+    fn flow_window_grows_on_a_long_free_link_and_shrinks_when_pictures_queue() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut f = FlowControl::new(t0);
+        assert_eq!(f.window(), FlowControl::MIN);
+        // 100 ms round trip, always room: every round trip one more slot.
+        let mut seq = 0;
+        let mut t = 0;
+        for _ in 0..20 {
+            while f.can_send(ms(t)) {
+                seq += 1;
+                f.sent(seq, ms(t));
+            }
+            t += 100;
+            f.acked(seq, ms(t));
+        }
+        assert_eq!(f.window(), FlowControl::MAX, "a long, empty link gets more pictures on the way");
+        // Now acks come back late (pictures queue): the window shrinks.
+        for _ in 0..20 {
+            while f.can_send(ms(t)) {
+                seq += 1;
+                f.sent(seq, ms(t));
+            }
+            t += 400;
+            f.acked(seq, ms(t));
+        }
+        assert_eq!(f.window(), FlowControl::MIN, "but never below the old fixed two");
+    }
+
+    #[test]
+    fn flow_control_survives_lost_acks_and_wrapping_numbers() {
+        let t0 = Instant::now();
+        let mut f = FlowControl::new(t0);
+        f.sent(u32::MAX - 1, t0);
+        f.sent(u32::MAX, t0);
+        assert!(!f.can_send(t0));
+        f.acked(u32::MAX - 1, t0 + Duration::from_millis(5));
+        assert!(f.can_send(t0), "one acked: room again");
+        f.sent(1, t0); // numbers wrapped
+        f.acked(1, t0 + Duration::from_millis(6));
+        assert!(f.can_send(t0), "ack after wrap clears older pictures too");
+        f.sent(2, t0);
+        f.sent(3, t0);
+        assert!(!f.can_send(t0 + Duration::from_secs(1)));
+        assert!(f.can_send(t0 + FlowControl::LOST_AFTER), "lost acks don't freeze the session");
+        f.acked(1, t0 + Duration::from_secs(4)); // stale ack: harmless
     }
 
     #[test]

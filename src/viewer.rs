@@ -1,7 +1,7 @@
 //! Desktop viewer (egui): machine list, details, quality, temporary links and
 //! one native window per remote monitor, reopened where it was left.
 
-use crate::config::{ViewerConfig, load_json, save_json, viewer_dir};
+use crate::config::{ScaleMode, ViewerConfig, load_json, save_json, viewer_dir};
 use crate::layout::{LayoutStore, WindowPlace, default_place};
 use crate::codec::Frame;
 use crate::net::{Api, ConnState, SessionHandle, Target, TransferState, decode_preview, demo_preview, parse_link};
@@ -124,10 +124,23 @@ struct OpenSession {
     scroll_acc: Vec2,
     fullscreen: HashSet<u8>,
     minimized: HashSet<u8>,
+    /// Original size or fit to window (all screens of this session).
+    scale: ScaleMode,
+    /// The user picked another scale mode: remember it as the default.
+    scale_changed: bool,
+    /// Scale mode each screen window was last drawn with (to resize on a switch).
+    applied_scale: HashMap<u8, ScaleMode>,
     /// Last "watching these screens" sent to the helper.
     last_watch: Option<Vec<u8>>,
     /// Open file browser window, if any.
     files: Option<FilesView>,
+    /// Screen windows that had the keyboard last frame (the local clipboard
+    /// is shared when one gets it).
+    focused: HashSet<u8>,
+    /// Remote pointer shapes as textures (with their pictures, for size and hot spot).
+    pointer_textures: HashMap<u32, (egui::TextureHandle, [u32; 4])>,
+    /// Remote pointer position (virtual-desktop pixels) and shape id.
+    remote_pointer: Option<(i32, i32, u32)>,
 }
 
 /// Two-pane file browser: this computer on the left, the remote one on the right.
@@ -372,6 +385,14 @@ impl OpenSession {
                 }
             }
         }
+        for (id, img) in &shared.pointer_shapes {
+            if !self.pointer_textures.contains_key(id) {
+                let pic = egui::ColorImage::from_rgba_unmultiplied([img.width as usize, img.height as usize], &img.rgba);
+                let tex = ctx.load_texture(format!("s{}p{}", self.id, id), pic, egui::TextureOptions::LINEAR);
+                self.pointer_textures.insert(*id, (tex, [img.width, img.height, img.hot_x, img.hot_y]));
+            }
+        }
+        self.remote_pointer = shared.pointer;
         if self.key.is_none() && shared.state == ConnState::Live {
             self.key = Some(match &self.machine_id {
                 Some(id) => id.clone(),
@@ -404,16 +425,19 @@ pub fn remote_key(key: egui::Key) -> Option<(&'static str, bool)> {
 }
 
 /// Turn this frame's egui events into remote input for monitor `mon` shown
-/// in `rect`. `keyboard` is false when the window isn't focused.
+/// in `rect`, of which only `visible` is on screen (scrolled picture).
+/// `keyboard` is false when the window isn't focused.
 pub fn map_events(
     events: &[egui::Event],
     rect: Rect,
+    visible: Rect,
     mon: u8,
     prev_mods: &mut egui::Modifiers,
     mods: egui::Modifiers,
     keyboard: bool,
 ) -> Vec<InputEvent> {
     let norm = |p: Pos2| ((p.x - rect.min.x) / rect.width(), (p.y - rect.min.y) / rect.height());
+    let hit = |p: Pos2| rect.contains(p) && visible.contains(p);
     let mut out = Vec::new();
     if keyboard {
         for (was, now, name) in [
@@ -430,12 +454,12 @@ pub fn map_events(
     let mut last_move = None;
     for ev in events {
         match ev {
-            egui::Event::PointerMoved(p) if rect.contains(*p) => {
+            egui::Event::PointerMoved(p) if hit(*p) => {
                 let (x, y) = norm(*p);
                 last_move = Some(InputEvent::MouseMove { mon, x, y });
             }
             egui::Event::PointerButton { pos, button, pressed, .. } => {
-                if *pressed && !rect.contains(*pos) {
+                if *pressed && !hit(*pos) {
                     continue;
                 }
                 let button = match button {
@@ -781,8 +805,14 @@ impl ViewerApp {
             scroll_acc: Vec2::ZERO,
             fullscreen: HashSet::new(),
             minimized: HashSet::new(),
+            scale: self.cfg.scale_mode,
+            scale_changed: false,
+            applied_scale: HashMap::new(),
             last_watch: None,
             files: None,
+            focused: HashSet::new(),
+            pointer_textures: HashMap::new(),
+            remote_pointer: None,
         });
         self.next_session += 1;
     }
@@ -1653,9 +1683,17 @@ impl ViewerApp {
         let local = ctx.input(|i| i.viewport().monitor_size).unwrap_or(Vec2::new(1920.0, 1080.0));
         let mut dirty = false;
         let mut to_close = Vec::new();
+        let mut new_scale = None;
         for s in &mut self.sessions {
+            if std::mem::take(&mut s.scale_changed) {
+                new_scale = Some(s.scale);
+            }
             let (monitors, live) = {
-                let sh = s.handle.shared.lock().unwrap();
+                let mut sh = s.handle.shared.lock().unwrap();
+                // Text copied on the remote computer goes on this one's clipboard.
+                if let Some(text) = sh.clipboard_in.take() {
+                    ctx.copy_text(text);
+                }
                 (sh.monitors.clone(), sh.state == ConnState::Live)
             };
             if !live {
@@ -1671,9 +1709,13 @@ impl ViewerApp {
                     .builders
                     .entry(mon.index)
                     .or_insert_with(|| {
-                        let place = self.layouts.get(&key, &fp).unwrap_or_else(|| {
+                        let mut place = self.layouts.get(&key, &fp).unwrap_or_else(|| {
                             default_place(mon.index as usize, monitors.len(), mon.width, mon.height, (local.x, local.y))
                         });
+                        if s.scale == ScaleMode::Original {
+                            let size = original_window_size(mon, ctx.pixels_per_point(), Some(local));
+                            (place.w, place.h) = (size.x, size.y);
+                        }
                         ViewportBuilder::default()
                             .with_title(format!("{} - Screen {} ({}x{})", s.name, mon.index + 1, mon.width, mon.height))
                             .with_position([place.x, place.y])
@@ -1720,6 +1762,12 @@ impl ViewerApp {
         }
         if !to_close.is_empty() {
             self.sessions.retain(|s| !to_close.contains(&s.id));
+        }
+        if let Some(m) = new_scale
+            && m != self.cfg.scale_mode
+        {
+            self.cfg.scale_mode = m;
+            self.save_cfg();
         }
         if dirty && self.layouts_dirty.is_none() {
             self.layouts_dirty = Some(Instant::now());
@@ -1782,6 +1830,15 @@ fn monitor_window(ui: &mut egui::Ui, s: &mut OpenSession, mon: &MonitorInfo, key
     let ctx = ui.ctx().clone();
     let mut result = MonitorResult::Nothing;
     let info = ctx.input(|i| i.viewport().clone());
+    let ppp = ctx.pixels_per_point();
+    let applied = s.applied_scale.insert(mon.index, s.scale);
+    if applied.is_some_and(|a| a != s.scale)
+        && s.scale == ScaleMode::Original
+        && !info.fullscreen.unwrap_or(false)
+        && !info.maximized.unwrap_or(false)
+    {
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(original_window_size(mon, ppp, info.monitor_size)));
+    }
     if let (Some(outer), Some(inner)) = (info.outer_rect, info.inner_rect) {
         let fullscreen = info.fullscreen.unwrap_or(false);
         let maximized = info.maximized.unwrap_or(false);
@@ -1844,10 +1901,18 @@ fn monitor_window(ui: &mut egui::Ui, s: &mut OpenSession, mon: &MonitorInfo, key
                             }
                         }
                     });
+                    egui::ComboBox::from_id_salt("scale").selected_text(s.scale.label()).width(110.0).show_ui(ui, |ui| {
+                        for m in [ScaleMode::Original, ScaleMode::Fit] {
+                            if ui.add(egui::Button::new(m.label()).selected(s.scale == m).frame(false)).clicked() && s.scale != m {
+                                s.scale = m;
+                                s.scale_changed = true;
+                            }
+                        }
+                    });
                 });
             });
         });
-    egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(8, 9, 12))).show(ui, |ui| {
+    egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::BLACK)).show(ui, |ui| {
         let avail = ui.available_rect_before_wrap();
         let Some((tex, _)) = s.textures.get(&mon.index) else {
             ui.centered_and_justified(|ui| {
@@ -1855,38 +1920,138 @@ fn monitor_window(ui: &mut egui::Ui, s: &mut OpenSession, mon: &MonitorInfo, key
             });
             return;
         };
-        let size = tex.size_vec2();
-        let rect = fit_rect(avail, size.x, size.y);
-        let resp = ui.allocate_rect(avail, if view_only { Sense::hover() } else { Sense::click_and_drag() });
-        ui.painter().image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
-        if view_only {
-            return;
-        }
-        let hovering = resp.hovered();
-        if hovering && ctx.pointer_hover_pos().is_some_and(|p| rect.contains(p)) {
-            // The remote pointer is drawn in the picture.
-            ctx.set_cursor_icon(egui::CursorIcon::None);
-        }
-        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(false));
-        let (events, mods) = ctx.input(|i| (i.events.clone(), i.modifiers));
-        for ev in map_events(&events, rect, mon.index, &mut s.mods, mods, focused) {
-            match ev {
-                InputEvent::Scroll { dx, dy } => {
-                    if !hovering {
-                        continue;
-                    }
-                    s.scroll_acc += Vec2::new(dx, dy);
-                    let (sx, sy) = (s.scroll_acc.x.trunc(), s.scroll_acc.y.trunc());
-                    if sx != 0.0 || sy != 0.0 {
-                        s.scroll_acc -= Vec2::new(sx, sy);
-                        s.handle.send(SessionMsg::Input { event: InputEvent::Scroll { dx: sx, dy: sy } });
-                    }
-                }
-                other => s.handle.send(SessionMsg::Input { event: other }),
+        let (tex, size) = (tex.id(), tex.size_vec2());
+        let sense = if view_only { Sense::hover() } else { Sense::click_and_drag() };
+        // One remote pixel = one physical pixel here.
+        let original = Vec2::new(mon.width.max(1) as f32, mon.height.max(1) as f32) / ppp;
+        match s.scale {
+            ScaleMode::Fit => {
+                let rect = fit_rect(avail, size.x, size.y);
+                let resp = ui.allocate_rect(avail, sense);
+                screen_picture(ui, s, mon, tex, rect, avail, resp.hovered(), view_only);
+            }
+            ScaleMode::Original if original.x <= avail.width() + 0.5 && original.y <= avail.height() + 0.5 => {
+                let rect = snap_rect(Rect::from_center_size(avail.center(), original), ppp);
+                let resp = ui.allocate_rect(avail, sense);
+                screen_picture(ui, s, mon, tex, rect, avail, resp.hovered(), view_only);
+            }
+            ScaleMode::Original => {
+                // Bigger than the window: scroll bars (not the wheel — that goes to
+                // the remote computer), kept beside the picture rather than over it.
+                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                egui::ScrollArea::both()
+                    .scroll_source(egui::containers::scroll_area::ScrollSource::SCROLL_BAR)
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        let (outer, resp) = ui.allocate_exact_size(original.max(ui.available_size()), sense);
+                        let rect = snap_rect(Rect::from_center_size(outer.center(), original), ppp);
+                        let visible = ui.clip_rect();
+                        screen_picture(ui, s, mon, tex, rect, visible, resp.hovered(), view_only);
+                    });
             }
         }
     });
     result
+}
+
+/// Window size (in points) showing a remote screen at its original size,
+/// limited to the local screen.
+fn original_window_size(mon: &MonitorInfo, ppp: f32, screen: Option<Vec2>) -> Vec2 {
+    let mut size = Vec2::new(mon.width.max(1) as f32 / ppp, mon.height.max(1) as f32 / ppp + 36.0); // + toolbar
+    if let Some(sc) = screen {
+        size = size.min(Vec2::new(sc.x, sc.y - 60.0));
+    }
+    size.max(Vec2::new(320.0, 200.0)).round()
+}
+
+/// Move a rect onto whole physical pixels so a 1:1 picture stays sharp.
+fn snap_rect(r: Rect, ppp: f32) -> Rect {
+    let min = Pos2::new((r.min.x * ppp).round() / ppp, (r.min.y * ppp).round() / ppp);
+    Rect::from_min_size(min, r.size())
+}
+
+/// Draw a remote screen in `rect` (only `visible` of it on screen) and send
+/// this frame's input to the remote computer.
+#[allow(clippy::too_many_arguments)]
+fn screen_picture(
+    ui: &mut egui::Ui,
+    s: &mut OpenSession,
+    mon: &MonitorInfo,
+    tex: egui::TextureId,
+    rect: Rect,
+    visible: Rect,
+    hovering: bool,
+    view_only: bool,
+) {
+    let ctx = ui.ctx().clone();
+    ui.painter().image(tex, rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+    let local = ctx.pointer_hover_pos().filter(|p| hovering && !view_only && rect.contains(*p) && visible.contains(*p));
+    if local.is_some() {
+        // Our own pointer is hidden: the remote one is drawn instead.
+        ctx.set_cursor_icon(egui::CursorIcon::None);
+    }
+    draw_remote_pointer(ui, s, mon, rect, visible, local);
+    if view_only {
+        return;
+    }
+    let focused = ctx.input(|i| i.viewport().focused.unwrap_or(false));
+    let (events, mods) = ctx.input(|i| (i.events.clone(), i.modifiers));
+    // Text copied here reaches the remote clipboard before the keys that
+    // paste it: on Ctrl+V, and when this window gets the keyboard (so the
+    // remote right-click "Paste" works too).
+    if focused && s.focused.insert(mon.index) && let Some(text) = crate::clipboard::system_get() {
+        s.handle.send_clipboard(&text);
+    } else if !focused {
+        s.focused.remove(&mon.index);
+    }
+    if focused {
+        for ev in &events {
+            if let egui::Event::Paste(text) = ev {
+                s.handle.send_clipboard(text);
+            }
+        }
+    }
+    for ev in map_events(&events, rect, visible, mon.index, &mut s.mods, mods, focused) {
+        match ev {
+            InputEvent::Scroll { dx, dy } => {
+                if !hovering {
+                    continue;
+                }
+                s.scroll_acc += Vec2::new(dx, dy);
+                let (sx, sy) = (s.scroll_acc.x.trunc(), s.scroll_acc.y.trunc());
+                if sx != 0.0 || sy != 0.0 {
+                    s.scroll_acc -= Vec2::new(sx, sy);
+                    s.handle.send(SessionMsg::Input { event: InputEvent::Scroll { dx: sx, dy: sy } });
+                }
+            }
+            other => s.handle.send(SessionMsg::Input { event: other }),
+        }
+    }
+}
+
+/// Draw the remote pointer, if the helper sends it separately (otherwise it
+/// is part of the picture). While the mouse is over the picture in control
+/// mode it is drawn right where the local mouse is, so it moves with no
+/// delay at all; otherwise where the remote computer says it is.
+fn draw_remote_pointer(ui: &egui::Ui, s: &OpenSession, mon: &MonitorInfo, rect: Rect, visible: Rect, local: Option<Pos2>) {
+    let Some((rx, ry, shape)) = s.remote_pointer else { return };
+    let Some((tex, [w, h, hx, hy])) = s.pointer_textures.get(&shape) else { return };
+    let at = match local {
+        Some(p) => p,
+        None => {
+            let (lx, ly) = (rx - mon.x, ry - mon.y);
+            if lx < 0 || ly < 0 || lx >= mon.width as i32 || ly >= mon.height as i32 {
+                return; // on another screen
+            }
+            rect.min + Vec2::new(lx as f32 / mon.width.max(1) as f32 * rect.width(), ly as f32 / mon.height.max(1) as f32 * rect.height())
+        }
+    };
+    // Same size as on the remote screen, whatever the picture's scale.
+    let ppp = ui.ctx().pixels_per_point();
+    let size = Vec2::new(*w as f32, *h as f32) / ppp;
+    let min = at - Vec2::new(*hx as f32, *hy as f32) / ppp;
+    let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    ui.painter().with_clip_rect(visible).image(tex.id(), Rect::from_min_size(min, size), uv, Color32::WHITE);
 }
 
 impl eframe::App for ViewerApp {
@@ -2134,7 +2299,7 @@ mod tests {
             egui::Event::PointerMoved(Pos2::new(200.0, 100.0)),
             egui::Event::PointerMoved(Pos2::new(900.0, 900.0)), // outside: ignored
         ];
-        let out = map_events(&evs, rect(), 1, &mut prev, egui::Modifiers::default(), true);
+        let out = map_events(&evs, rect(), rect(), 1, &mut prev, egui::Modifiers::default(), true);
         assert_eq!(out, vec![InputEvent::MouseMove { mon: 1, x: 0.5, y: 0.5 }], "only the last move inside is sent");
     }
 
@@ -2153,7 +2318,7 @@ mod tests {
             pressed: false,
             modifiers: Default::default(),
         };
-        let out = map_events(&[press_out, release_out], rect(), 0, &mut prev, Default::default(), true);
+        let out = map_events(&[press_out, release_out], rect(), rect(), 0, &mut prev, Default::default(), true);
         assert_eq!(out, vec![InputEvent::MouseButton { mon: 0, x: 0.0, y: 0.0, button: MouseButton::Right, down: false }]);
     }
 
@@ -2166,6 +2331,7 @@ mod tests {
         let out = map_events(
             &[key(egui::Key::A, Default::default()), egui::Event::Text("a".into()), key(egui::Key::Enter, Default::default())],
             rect(),
+            rect(),
             0,
             &mut prev,
             Default::default(),
@@ -2173,16 +2339,16 @@ mod tests {
         );
         assert_eq!(out, vec![InputEvent::Text { text: "a".into() }, InputEvent::Key { key: "Enter".into(), down: true }]);
         // Ctrl pressed: modifier goes down, Ctrl+S sent as key.
-        let out = map_events(&[key(egui::Key::S, ctrl)], rect(), 0, &mut prev, ctrl, true);
+        let out = map_events(&[key(egui::Key::S, ctrl)], rect(), rect(), 0, &mut prev, ctrl, true);
         assert_eq!(out, vec![InputEvent::Key { key: "Control".into(), down: true }, InputEvent::Key { key: "S".into(), down: true }]);
         // Ctrl released.
-        let out = map_events(&[], rect(), 0, &mut prev, Default::default(), true);
+        let out = map_events(&[], rect(), rect(), 0, &mut prev, Default::default(), true);
         assert_eq!(out, vec![InputEvent::Key { key: "Control".into(), down: false }]);
         // Copy shortcut becomes C.
-        let out = map_events(&[egui::Event::Copy], rect(), 0, &mut prev, Default::default(), true);
+        let out = map_events(&[egui::Event::Copy], rect(), rect(), 0, &mut prev, Default::default(), true);
         assert_eq!(out.len(), 2);
         // No keyboard when window not focused.
-        assert!(map_events(&[egui::Event::Text("x".into())], rect(), 0, &mut prev, Default::default(), false).is_empty());
+        assert!(map_events(&[egui::Event::Text("x".into())], rect(), rect(), 0, &mut prev, Default::default(), false).is_empty());
     }
 
     #[test]
@@ -2198,8 +2364,32 @@ mod tests {
             source: egui::MouseWheelSource::Wheel,
             modifiers: Default::default(),
         };
-        let out = map_events(&[wheel], rect(), 0, &mut prev, Default::default(), true);
+        let out = map_events(&[wheel], rect(), rect(), 0, &mut prev, Default::default(), true);
         assert_eq!(out, vec![InputEvent::Scroll { dx: 0.0, dy: 2.0 }]);
+    }
+
+    #[test]
+    fn scrolled_away_parts_take_no_clicks() {
+        // Picture scrolled so only its right half is on screen.
+        let visible = Rect::from_min_max(Pos2::new(200.0, 50.0), Pos2::new(300.0, 150.0));
+        let mut prev = egui::Modifiers::default();
+        let press = |x: f32| egui::Event::PointerButton {
+            pos: Pos2::new(x, 100.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        };
+        let out = map_events(&[press(150.0), press(250.0)], rect(), visible, 0, &mut prev, Default::default(), true);
+        assert_eq!(out, vec![InputEvent::MouseButton { mon: 0, x: 0.75, y: 0.5, button: MouseButton::Left, down: true }]);
+    }
+
+    #[test]
+    fn original_size_window_fits_the_screen() {
+        let mon = MonitorInfo { index: 0, name: String::new(), x: 0, y: 0, width: 1280, height: 720, primary: true };
+        assert_eq!(original_window_size(&mon, 1.0, Some(Vec2::new(1920.0, 1080.0))), Vec2::new(1280.0, 756.0));
+        assert_eq!(original_window_size(&mon, 2.0, None), Vec2::new(640.0, 396.0));
+        let big = MonitorInfo { width: 3840, height: 2160, ..mon };
+        assert_eq!(original_window_size(&big, 1.0, Some(Vec2::new(1920.0, 1080.0))), Vec2::new(1920.0, 1020.0));
     }
 
     #[test]

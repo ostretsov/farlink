@@ -7,7 +7,7 @@
 //! changed). Where that is not available (older systems, turned screens,
 //! briefly after a desktop switch) GDI `BitBlt` is used instead.
 
-use super::{Desktop, to_absolute};
+use super::{Desktop, PointerImage, PointerPos, to_absolute};
 use crate::codec::Frame;
 use crate::keys;
 use crate::proto::{InputEvent, MonitorInfo, MouseButton};
@@ -47,6 +47,11 @@ pub struct WinDesktop {
     monitors: Vec<MonitorInfo>,
     /// Pointer position + shape last time we looked.
     pointer: (i32, i32, usize, bool),
+    /// Draw the pointer into pictures (off when the viewer draws it).
+    pointer_in_picture: bool,
+    /// Shape of the last `pointer()` call, and its picture once made.
+    cursor: usize,
+    cursor_image: Option<(usize, PointerImage)>,
 }
 
 impl WinDesktop {
@@ -65,6 +70,9 @@ impl WinDesktop {
             gdi: HashMap::new(),
             monitors: Vec::new(),
             pointer: (0, 0, 0, false),
+            pointer_in_picture: true,
+            cursor: 0,
+            cursor_image: None,
         };
         d.follow_input_desktop();
         Ok(d)
@@ -120,14 +128,21 @@ impl WinDesktop {
         self.dxgi.as_ref()?.outputs.iter().position(|o| o.x == m.x && o.y == m.y && o.width == m.width && o.height == m.height)
     }
 
+    /// Cheap pointer check for `changed()`: position + shape. Uses the
+    /// position even when Windows calls the pointer hidden, because we then
+    /// draw an arrow there (see `pointer_now`).
     fn pointer_state() -> (i32, i32, usize, bool) {
         unsafe {
             let mut ci: CURSORINFO = zeroed();
             ci.cbSize = size_of::<CURSORINFO>() as u32;
-            if GetCursorInfo(&mut ci) == 0 {
-                return (0, 0, 0, false);
+            if GetCursorInfo(&mut ci) != 0 {
+                return (ci.ptScreenPos.x, ci.ptScreenPos.y, ci.hCursor as usize, ci.flags & CURSOR_SHOWING != 0);
             }
-            (ci.ptScreenPos.x, ci.ptScreenPos.y, ci.hCursor as usize, ci.flags & CURSOR_SHOWING != 0)
+            let mut pos: POINT = zeroed();
+            if GetCursorPos(&mut pos) != 0 {
+                return (pos.x, pos.y, 0, false);
+            }
+            (0, 0, 0, false)
         }
     }
 
@@ -151,7 +166,11 @@ impl WinDesktop {
                 self.gdi.clear();
                 bail!("screen capture failed");
             }
-            draw_pointer_on(surf.dc, m.x, m.y);
+            if self.pointer_in_picture
+                && let Some(p) = pointer_now()
+            {
+                draw_pointer_on(surf.dc, &p, m.x, m.y);
+            }
         }
         Ok(Frame::from_bgra(m.width, m.height, surf.pixels(), w as usize * 4))
     }
@@ -296,25 +315,147 @@ impl Drop for GdiSurface {
     }
 }
 
-/// Draw the current mouse pointer onto `dc`, whose (0,0) is screen point
-/// (`ox`, `oy`). Windows handles every pointer kind (colour, black/white,
-/// inverting) itself.
-unsafe fn draw_pointer_on(dc: HDC, ox: i32, oy: i32) {
+/// The mouse pointer as it should appear in the picture.
+struct Pointer {
+    /// Screen position of the pointer's top-left corner (hot spot subtracted).
+    left: i32,
+    top: i32,
+    w: i32,
+    h: i32,
+    /// Hot spot inside the pointer picture.
+    hot_x: i32,
+    hot_y: i32,
+    cursor: HCURSOR,
+}
+
+/// Where the pointer is and what it looks like right now.
+///
+/// Windows often reports the pointer as hidden while it is really there for
+/// us: no physical mouse plugged in (Windows then hides it, and our injected
+/// input does not bring it back), touch/pen input (`CURSOR_SUPPRESSED`), or a
+/// shape we may not read from the SYSTEM helper. The viewer hides its own
+/// pointer over the picture, so in all those cases we draw the normal arrow
+/// at the real position instead of nothing.
+unsafe fn pointer_now() -> Option<Pointer> {
     unsafe {
         let mut ci: CURSORINFO = zeroed();
         ci.cbSize = size_of::<CURSORINFO>() as u32;
-        if GetCursorInfo(&mut ci) == 0 || ci.flags & CURSOR_SHOWING == 0 {
-            return;
+        let info_ok = GetCursorInfo(&mut ci) != 0;
+        let mut pos = ci.ptScreenPos;
+        if !info_ok && GetCursorPos(&mut pos) == 0 {
+            return None;
+        }
+        let mut cursor = ci.hCursor;
+        if !info_ok || ci.flags & CURSOR_SHOWING == 0 || cursor.is_null() {
+            note_pointer_fallback(info_ok, ci.flags);
+            cursor = LoadCursorW(null_mut(), IDC_ARROW);
         }
         let mut ii: ICONINFO = zeroed();
-        if GetIconInfo(ci.hCursor, &mut ii) == 0 {
-            return;
+        if GetIconInfo(cursor, &mut ii) == 0 {
+            let arrow = LoadCursorW(null_mut(), IDC_ARROW);
+            if arrow == cursor || GetIconInfo(arrow, &mut ii) == 0 {
+                return None;
+            }
+            cursor = arrow;
         }
-        let x = ci.ptScreenPos.x - ii.xHotspot as i32 - ox;
-        let y = ci.ptScreenPos.y - ii.yHotspot as i32 - oy;
-        DrawIconEx(dc, x, y, ci.hCursor, 0, 0, 0, null_mut(), DI_NORMAL);
+        let mut bm: BITMAP = zeroed();
+        let (w, h) = if !ii.hbmColor.is_null() && GetObjectW(ii.hbmColor as HGDIOBJ, size_of::<BITMAP>() as i32, &mut bm as *mut _ as *mut _) != 0 {
+            (bm.bmWidth, bm.bmHeight)
+        } else if !ii.hbmMask.is_null() && GetObjectW(ii.hbmMask as HGDIOBJ, size_of::<BITMAP>() as i32, &mut bm as *mut _ as *mut _) != 0 {
+            (bm.bmWidth, bm.bmHeight / 2) // AND mask on top of XOR mask
+        } else {
+            (32, 32)
+        };
         free_icon_info(&ii);
+        Some(Pointer {
+            left: pos.x - ii.xHotspot as i32,
+            top: pos.y - ii.yHotspot as i32,
+            w: w.clamp(1, 256),
+            h: h.clamp(1, 256),
+            hot_x: ii.xHotspot as i32,
+            hot_y: ii.yHotspot as i32,
+            cursor,
+        })
     }
+}
+
+/// Log once why the real pointer could not be used.
+fn note_pointer_fallback(info_ok: bool, flags: u32) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static NOTED: AtomicBool = AtomicBool::new(false);
+    if !NOTED.swap(true, Ordering::Relaxed) {
+        if info_ok {
+            log::info!("Windows reports the mouse pointer hidden (flags {flags:#x}); drawing an arrow instead");
+        } else {
+            log::info!("cannot read the mouse pointer ({}); drawing an arrow instead", std::io::Error::last_os_error());
+        }
+    }
+}
+
+/// Draw the pointer onto `dc`, whose (0,0) is screen point (`ox`, `oy`).
+/// Windows handles every pointer kind (colour, black/white, inverting) itself.
+unsafe fn draw_pointer_on(dc: HDC, p: &Pointer, ox: i32, oy: i32) {
+    unsafe {
+        DrawIconEx(dc, p.left - ox, p.top - oy, p.cursor, 0, 0, 0, null_mut(), DI_NORMAL);
+    }
+}
+
+/// The pointer as a picture of its own, for viewers that draw it. Windows
+/// draws it once on black and once on white: the difference gives the
+/// transparency. Inverting parts (the text I-beam) become black with a white
+/// edge, so they show on any background.
+fn cursor_picture(p: &Pointer) -> Option<PointerImage> {
+    let (w, h) = (p.w, p.h);
+    let mut black = GdiSurface::new(w, h).ok()?;
+    let mut white = GdiSurface::new(w, h).ok()?;
+    black.pixels().fill(0);
+    white.pixels().fill(255);
+    unsafe {
+        DrawIconEx(black.dc, 0, 0, p.cursor, 0, 0, 0, null_mut(), DI_NORMAL);
+        DrawIconEx(white.dc, 0, 0, p.cursor, 0, 0, 0, null_mut(), DI_NORMAL);
+    }
+    let (b, wh) = (black.pixels().to_vec(), white.pixels().to_vec());
+    let n = (w * h) as usize;
+    let mut rgba = vec![0u8; n * 4];
+    let mut inverted = vec![false; n];
+    for i in 0..n {
+        let (bp, wp) = (&b[i * 4..i * 4 + 3], &wh[i * 4..i * 4 + 3]);
+        if (0..3).any(|c| wp[c] < bp[c]) {
+            inverted[i] = true;
+            rgba[i * 4..i * 4 + 4].copy_from_slice(&[0, 0, 0, 255]);
+            continue;
+        }
+        // On black: colour * alpha. On white: that + (255 - alpha) * 255 / 255.
+        let a = 255 - (wp[1] as i32 - bp[1] as i32).clamp(0, 255);
+        if a == 0 {
+            continue;
+        }
+        let un = |v: u8| (v as i32 * 255 / a).min(255) as u8;
+        rgba[i * 4..i * 4 + 4].copy_from_slice(&[un(bp[2]), un(bp[1]), un(bp[0]), a as u8]);
+    }
+    // White edge around inverting parts.
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) as usize;
+            if rgba[i * 4 + 3] != 0 {
+                continue;
+            }
+            let near = [(-1, 0), (1, 0), (0, -1), (0, 1)].iter().any(|(dx, dy)| {
+                let (nx, ny) = (x + dx, y + dy);
+                nx >= 0 && ny >= 0 && nx < w && ny < h && inverted[(ny * w + nx) as usize]
+            });
+            if near {
+                rgba[i * 4..i * 4 + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+        }
+    }
+    Some(PointerImage {
+        width: w as u32,
+        height: h as u32,
+        hot_x: p.hot_x.clamp(0, w - 1) as u32,
+        hot_y: p.hot_y.clamp(0, h - 1) as u32,
+        rgba,
+    })
 }
 
 unsafe fn free_icon_info(ii: &ICONINFO) {
@@ -328,37 +469,11 @@ unsafe fn free_icon_info(ii: &ICONINFO) {
     }
 }
 
-/// Pointer box on monitor `m`: (left, top, width, height) in monitor pixels.
-unsafe fn pointer_box(m: &MonitorInfo) -> Option<(i32, i32, i32, i32)> {
-    unsafe {
-        let mut ci: CURSORINFO = zeroed();
-        ci.cbSize = size_of::<CURSORINFO>() as u32;
-        if GetCursorInfo(&mut ci) == 0 || ci.flags & CURSOR_SHOWING == 0 {
-            return None;
-        }
-        let mut ii: ICONINFO = zeroed();
-        if GetIconInfo(ci.hCursor, &mut ii) == 0 {
-            return None;
-        }
-        let mut bm: BITMAP = zeroed();
-        let (w, h) = if !ii.hbmColor.is_null() && GetObjectW(ii.hbmColor as HGDIOBJ, size_of::<BITMAP>() as i32, &mut bm as *mut _ as *mut _) != 0 {
-            (bm.bmWidth, bm.bmHeight)
-        } else if !ii.hbmMask.is_null() && GetObjectW(ii.hbmMask as HGDIOBJ, size_of::<BITMAP>() as i32, &mut bm as *mut _ as *mut _) != 0 {
-            (bm.bmWidth, bm.bmHeight / 2) // AND mask on top of XOR mask
-        } else {
-            (32, 32)
-        };
-        free_icon_info(&ii);
-        let left = ci.ptScreenPos.x - ii.xHotspot as i32 - m.x;
-        let top = ci.ptScreenPos.y - ii.yHotspot as i32 - m.y;
-        Some((left, top, w.clamp(1, 256), h.clamp(1, 256)))
-    }
-}
-
 /// Draw the pointer into a captured RGBA picture of monitor `m` (DXGI
 /// pictures don't contain it).
 fn draw_pointer(frame: &mut Frame, m: &MonitorInfo) {
-    let Some((left, top, w, h)) = (unsafe { pointer_box(m) }) else { return };
+    let Some(p) = (unsafe { pointer_now() }) else { return };
+    let (left, top, w, h) = (p.left - m.x, p.top - m.y, p.w, p.h);
     let x0 = left.max(0);
     let y0 = top.max(0);
     let x1 = (left + w).min(frame.width as i32);
@@ -382,7 +497,7 @@ fn draw_pointer(frame: &mut Frame, m: &MonitorInfo) {
             }
         }
     }
-    unsafe { draw_pointer_on(surf.dc, m.x + x0, m.y + y0) };
+    unsafe { draw_pointer_on(surf.dc, &p, m.x + x0, m.y + y0) };
     let px = surf.pixels();
     for row in 0..rh as usize {
         let src = &px[row * rw as usize * 4..][..rw as usize * 4];
@@ -445,9 +560,12 @@ impl Desktop for WinDesktop {
     fn changed(&mut self) -> bool {
         self.follow_input_desktop();
         self.ensure_dxgi();
-        let pointer = Self::pointer_state();
-        let mut changed = pointer != self.pointer;
-        self.pointer = pointer;
+        let mut changed = false;
+        if self.pointer_in_picture {
+            let pointer = Self::pointer_state();
+            changed = pointer != self.pointer;
+            self.pointer = pointer;
+        }
         let Some(d) = self.dxgi.as_mut() else { return true }; // GDI can't tell
         for o in &mut d.outputs {
             match o.poll() {
@@ -471,10 +589,37 @@ impl Desktop for WinDesktop {
             && f.height == m.height
         {
             let mut frame = f.clone();
-            draw_pointer(&mut frame, m);
+            if self.pointer_in_picture {
+                draw_pointer(&mut frame, m);
+            }
             return Ok(frame);
         }
         self.capture_gdi(m)
+    }
+
+    fn set_pointer_in_picture(&mut self, on: bool) {
+        self.pointer_in_picture = on;
+    }
+
+    fn pointer(&mut self) -> Option<PointerPos> {
+        let p = unsafe { pointer_now() }?;
+        self.cursor = p.cursor as usize;
+        Some(PointerPos { x: p.left + p.hot_x, y: p.top + p.hot_y, shape: p.cursor as usize as u64 })
+    }
+
+    fn pointer_image(&mut self) -> Option<PointerImage> {
+        if let Some((c, img)) = &self.cursor_image
+            && *c == self.cursor
+        {
+            return Some(img.clone());
+        }
+        let p = unsafe { pointer_now() }?;
+        if p.cursor as usize != self.cursor {
+            return None; // changed in between; asked again next time
+        }
+        let img = cursor_picture(&p)?;
+        self.cursor_image = Some((self.cursor, img.clone()));
+        Some(img)
     }
 
     fn input(&mut self, monitors: &[MonitorInfo], ev: &InputEvent) -> Result<()> {

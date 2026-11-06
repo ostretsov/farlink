@@ -56,6 +56,7 @@ body.viewer { height: 100vh; display: flex; flex-direction: column; overflow: hi
 .stage { flex: 1; display: flex; gap: 8px; padding: 8px; align-items: center; justify-content: center; min-height: 0; background: #0a0c0f; }
 .mon { position: relative; flex: 1 1 0; min-width: 0; height: 100%; display: flex; align-items: center; justify-content: center; }
 .mon canvas { max-width: 100%; max-height: 100%; background: #12151a; box-shadow: 0 6px 30px rgba(0, 0, 0, .5); outline: none; cursor: default; }
+.mon .rptr { position: absolute; pointer-events: none; image-rendering: auto; }
 .mon .label { position: absolute; top: 6px; left: 8px; font-size: 12px; color: var(--muted); background: rgba(0, 0, 0, .5); padding: 2px 7px; border-radius: 6px; }
 .overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 10px; color: var(--muted); text-align: center; }
 .stat { font-size: 12px; color: var(--muted); }

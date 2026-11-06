@@ -50,7 +50,7 @@
   };
   $('mode').onclick = () => {
     if (viewLocked) return;
-    viewOnly = !viewOnly; setMode();
+    viewOnly = !viewOnly; setMode(); showPointer();
     send({ t: 'set_view_only', view_only: viewOnly });
   };
   setMode();
@@ -63,6 +63,13 @@
   ws.binaryType = 'arraybuffer';
   const send = (m) => ws.readyState === 1 && ws.send(JSON.stringify(m));
   const input = (event) => { if (!viewOnly) send({ t: 'input', event }); };
+  // Copied text shared with the remote computer (control sessions only).
+  let remoteClip = null;
+  const sendClip = (text) => {
+    if (viewOnly || !text || text === remoteClip) return;
+    remoteClip = text;
+    send({ t: 'clipboard', text });
+  };
 
   const mons = new Map(); // index -> {canvas, ctx, wrap}
   let monitors = [];
@@ -82,13 +89,56 @@
       canvas.width = m.width; canvas.height = m.height; canvas.tabIndex = 0;
       const label = document.createElement('div');
       label.className = 'label'; label.textContent = `Screen ${m.index + 1} · ${m.width}×${m.height}`;
-      wrap.append(canvas, label);
+      // The remote pointer while the mouse is elsewhere (or in view-only).
+      const ptr = document.createElement('img');
+      ptr.className = 'rptr'; ptr.hidden = true;
+      wrap.append(canvas, label, ptr);
       $('stage').append(wrap);
-      mons.set(m.index, { canvas, ctx: canvas.getContext('2d'), wrap });
+      const entry = { canvas, ctx: canvas.getContext('2d'), wrap, ptr, info: m, over: false };
+      mons.set(m.index, entry);
+      canvas.addEventListener('mouseenter', () => { entry.over = true; showPointer(); });
+      canvas.addEventListener('mouseleave', () => { entry.over = false; showPointer(); });
       hookInput(canvas, m.index);
     }
     showScreens();
+    showPointer();
   }
+
+  // ---- mouse pointer: the helper sends its shape and position, and this
+  // page shows it as the real mouse cursor, so it moves with no delay ----
+  const shapes = new Map(); // id -> { url, w, h, hx, hy }
+  let rptr = null;          // { x, y, shape } in remote desktop pixels
+  function addShape(m) {
+    const raw = atob(m.rgba);
+    if (raw.length !== m.width * m.height * 4) return;
+    const c = document.createElement('canvas');
+    c.width = m.width; c.height = m.height;
+    const img = new ImageData(m.width, m.height);
+    for (let i = 0; i < raw.length; i++) img.data[i] = raw.charCodeAt(i);
+    c.getContext('2d').putImageData(img, 0, 0);
+    shapes.set(m.id, { url: c.toDataURL('image/png'), w: m.width, h: m.height, hx: m.hot_x, hy: m.hot_y });
+  }
+  function showPointer() {
+    const sh = rptr && shapes.get(rptr.shape);
+    for (const [, m] of mons) {
+      // As the real cursor while controlling (browsers show at most 128 px).
+      if (!shapes.size) m.canvas.style.cursor = '';
+      else if (viewOnly) m.canvas.style.cursor = '';
+      else if (!rptr || !rptr.shape) m.canvas.style.cursor = 'none';
+      else if (sh && sh.w <= 128 && sh.h <= 128) m.canvas.style.cursor = `url(${sh.url}) ${sh.hx} ${sh.hy}, default`;
+      // Elsewhere: a picture at the remote position.
+      const i = m.info;
+      const on = sh && (viewOnly || !m.over) && rptr.x >= i.x && rptr.y >= i.y && rptr.x < i.x + i.width && rptr.y < i.y + i.height;
+      m.ptr.hidden = !on;
+      if (!on) continue;
+      const cr = m.canvas.getBoundingClientRect(), wr = m.wrap.getBoundingClientRect();
+      const k = cr.width / i.width;
+      if (m.ptr.dataset.url !== sh.url) { m.ptr.src = sh.url; m.ptr.dataset.url = sh.url; }
+      m.ptr.style.left = (cr.left - wr.left + (rptr.x - i.x) * k - sh.hx) + 'px';
+      m.ptr.style.top = (cr.top - wr.top + (rptr.y - i.y) * k - sh.hy) + 'px';
+    }
+  }
+  window.addEventListener('resize', showPointer);
   function showScreens() {
     const v = $('screens').value;
     for (const [i, m] of mons) m.wrap.classList.toggle('hidden', v !== 'all' && +v !== i);
@@ -134,7 +184,23 @@
       const unit = e.deltaMode === 1 ? 1 : 1 / 100;
       input({ k: 'scroll', dx: -e.deltaX * unit, dy: -e.deltaY * unit });
     }, { passive: false });
+    // Ctrl+V: the browser's paste event brings the copied text, which goes to
+    // the remote clipboard first; then Ctrl+V is pressed there.
+    let pasteKeys = false;
+    const pressV = () => { input({ k: 'key', key: 'V', down: true }); input({ k: 'key', key: 'V', down: false }); };
+    canvas.addEventListener('paste', (e) => {
+      e.preventDefault();
+      sendClip(e.clipboardData && e.clipboardData.getData('text/plain'));
+      if (pasteKeys) { pasteKeys = false; pressV(); }
+    });
     canvas.addEventListener('keydown', (e) => {
+      if (e.ctrlKey && !e.altKey && e.code === 'KeyV') {
+        // No preventDefault: that would stop the paste event. If the browser
+        // sends none, press Ctrl+V anyway.
+        pasteKeys = true;
+        setTimeout(() => { if (pasteKeys) { pasteKeys = false; pressV(); } }, 0);
+        return;
+      }
       e.preventDefault();
       const plain = e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey;
       if (plain) { input({ k: 'text', text: e.key }); return; }
@@ -143,6 +209,7 @@
     });
     canvas.addEventListener('keyup', (e) => {
       e.preventDefault();
+      if (e.ctrlKey && !e.altKey && e.code === 'KeyV') return; // already pressed and released
       const plain = e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey;
       const k = keyName(e.code);
       if (k && !plain) input({ k: 'key', key: k, down: false });
@@ -159,10 +226,20 @@
         $('status').textContent = `${m.os} · ${m.monitors.length} screen(s)`;
         buildScreens(m.monitors);
         sendQuality();
+        send({ t: 'pointer_mode', local: true });
+      } else if (m.t === 'pointer_shape') {
+        addShape(m); showPointer();
+      } else if (m.t === 'pointer') {
+        rptr = m; showPointer();
       } else if (m.t === 'view_mode') {
-        viewOnly = m.view_only; viewLocked = m.locked; setMode();
+        viewOnly = m.view_only; viewLocked = m.locked; setMode(); showPointer();
       } else if (m.t === 'monitors') {
         buildScreens(m.monitors); send({ t: 'refresh' });
+      } else if (m.t === 'clipboard') {
+        // Copied on the remote computer: put it on this one's clipboard
+        // (browsers allow that only while the page has focus).
+        remoteClip = m.text;
+        if (navigator.clipboard) navigator.clipboard.writeText(m.text).catch(() => {});
       } else if (m.t === 'notice') {
         $('status').textContent = m.text;
       } else if (m.t.startsWith('fs_')) {
@@ -182,6 +259,9 @@
     const fw = dv.getUint16(4, true), fh = dv.getUint16(6, true);
     const x = dv.getUint16(8, true), y = dv.getUint16(10, true);
     const seq = dv.getUint32(16, true);
+    // Acknowledged on arrival (before drawing): the helper measures the
+    // network's round trip with these to decide how many pictures to send ahead.
+    if (flags & 1) { frames++; send({ t: 'ack', seq }); }
     const blob = new Blob([new Uint8Array(buf, 20)], { type: fmt === 0 ? 'image/jpeg' : 'image/png' });
     // Draw in arrival order so older tiles never cover newer ones.
     chain = chain.then(async () => {
@@ -190,7 +270,6 @@
       if (m.canvas.width !== fw || m.canvas.height !== fh) { m.canvas.width = fw; m.canvas.height = fh; }
       const bmp = await createImageBitmap(blob);
       m.ctx.drawImage(bmp, x, y); bmp.close();
-      if (flags & 1) { frames++; send({ t: 'ack', seq }); }
     }).catch(() => {});
   };
   ws.onclose = () => { if ($('status').textContent !== 'Disconnected') $('status').textContent = 'Connection lost'; };

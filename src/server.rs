@@ -1339,6 +1339,12 @@ pub fn viewer_message_allowed(text: &str, view_only: bool) -> bool {
     }
 }
 
+/// May this text message from the host reach the viewer? Copied text never
+/// goes to view-only viewers (the host holds it back too).
+pub fn host_message_allowed(text: &str, view_only: bool) -> bool {
+    !(view_only && text.trim_start().starts_with(r#"{"t":"clipboard""#))
+}
+
 async fn viewer_loop(
     r: Shared,
     viewer: WebSocket,
@@ -1362,6 +1368,8 @@ async fn viewer_loop(
     let mode = |v: bool| Message::Text(serde_json::to_string(&SessionMsg::ViewMode { view_only: v, locked }).unwrap().into());
     let _ = vs.send(mode(view_only)).await;
     let (mut hs, mut hr) = host.split();
+    let view_only_now = Arc::new(std::sync::atomic::AtomicBool::new(view_only));
+    let down_view_only = view_only_now.clone();
     // Pictures (host → viewer) flow in their own task: a big picture on its
     // way to a slow viewer never holds up mouse, keys and acks going back.
     let (to_viewer, mut to_viewer_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
@@ -1370,6 +1378,11 @@ async fn viewer_loop(
             tokio::select! {
                 m = hr.next() => match m {
                     Some(Ok(msg @ (Message::Text(_) | Message::Binary(_)))) => {
+                        if let Message::Text(t) = &msg
+                            && !host_message_allowed(t.as_str(), down_view_only.load(std::sync::atomic::Ordering::Relaxed))
+                        {
+                            continue;
+                        }
                         if vs.send(msg).await.is_err() { break String::new(); }
                     }
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break "The remote computer ended the session".to_string(),
@@ -1392,6 +1405,7 @@ async fn viewer_loop(
                         let next = want || locked;
                         if next != view_only {
                             view_only = next;
+                            view_only_now.store(view_only, std::sync::atomic::Ordering::Relaxed);
                             if let Some(e) = r.sessions.lock().unwrap().get_mut(&session_id) {
                                 e.view.view_only = view_only;
                             }
@@ -1451,6 +1465,17 @@ async fn viewer_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copied_text_only_flows_in_control_sessions() {
+        let clip = serde_json::to_string(&SessionMsg::Clipboard { text: "secret".into() }).unwrap();
+        assert!(!viewer_message_allowed(&clip, true));
+        assert!(viewer_message_allowed(&clip, false));
+        assert!(!host_message_allowed(&clip, true));
+        assert!(host_message_allowed(&clip, false));
+        let notice = serde_json::to_string(&SessionMsg::Notice { text: "hi".into() }).unwrap();
+        assert!(host_message_allowed(&notice, true));
+    }
 
     #[test]
     fn view_only_blocks_input_but_not_acks() {

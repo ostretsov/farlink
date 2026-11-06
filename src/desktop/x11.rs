@@ -1,7 +1,7 @@
 //! Ubuntu / Linux X11: RandR for monitors, GetImage for pictures, XFixes for
 //! the mouse pointer, XTest for mouse and keyboard. Pure Rust (no C headers).
 
-use super::{Desktop, draw_cursor, to_absolute};
+use super::{Desktop, PointerImage, PointerPos, draw_cursor, to_absolute};
 use crate::codec::Frame;
 use crate::keys;
 use crate::proto::{InputEvent, MonitorInfo, MouseButton};
@@ -36,6 +36,10 @@ pub struct X11Desktop {
     damage: Option<u32>,
     first: bool,
     last_pointer: (i16, i16),
+    /// Draw the pointer into pictures (off when the viewer draws it).
+    pointer_in_picture: bool,
+    /// Last pointer shape read: X cursor serial, content key, picture.
+    cursor: Option<(u32, u64, PointerImage)>,
 }
 
 impl X11Desktop {
@@ -67,6 +71,8 @@ impl X11Desktop {
             damage,
             first: true,
             last_pointer: (i16::MIN, i16::MIN),
+            pointer_in_picture: true,
+            cursor: None,
         };
         d.load_keymap()?;
         Ok(d)
@@ -171,7 +177,8 @@ impl Desktop for X11Desktop {
             changed = true;
         }
         // The pointer is drawn into the picture, so a move counts as a change.
-        if let Ok(cookie) = self.conn.query_pointer(self.root)
+        if self.pointer_in_picture
+            && let Ok(cookie) = self.conn.query_pointer(self.root)
             && let Ok(p) = cookie.reply()
             && (p.root_x, p.root_y) != self.last_pointer
         {
@@ -234,6 +241,7 @@ impl Desktop for X11Desktop {
         }
         let mut frame = Frame::from_bgra(m.width, m.height, &reply.data, m.width as usize * 4);
         if self.has_xfixes
+            && self.pointer_in_picture
             && let Ok(cur) = self.conn.xfixes_get_cursor_image().and_then(|c| Ok(c.reply()))
             && let Ok(cur) = cur
         {
@@ -242,6 +250,38 @@ impl Desktop for X11Desktop {
             draw_cursor(&mut frame, left, top, cur.width as u32, cur.height as u32, &cur.cursor_image);
         }
         Ok(frame)
+    }
+
+    fn set_pointer_in_picture(&mut self, on: bool) {
+        self.pointer_in_picture = on;
+    }
+
+    fn pointer(&mut self) -> Option<PointerPos> {
+        if !self.has_xfixes {
+            return None;
+        }
+        // One request gives position, shape serial and picture.
+        let cur = self.conn.xfixes_get_cursor_image().ok()?.reply().ok()?;
+        let key = match &self.cursor {
+            Some((serial, key, _)) if *serial == cur.cursor_serial => *key,
+            _ => {
+                let img = PointerImage::from_premultiplied_argb(
+                    cur.width as u32,
+                    cur.height as u32,
+                    cur.xhot as u32,
+                    cur.yhot as u32,
+                    &cur.cursor_image,
+                );
+                let key = img.key();
+                self.cursor = Some((cur.cursor_serial, key, img));
+                key
+            }
+        };
+        Some(PointerPos { x: cur.x as i32, y: cur.y as i32, shape: key })
+    }
+
+    fn pointer_image(&mut self) -> Option<PointerImage> {
+        self.cursor.as_ref().map(|c| c.2.clone())
     }
 
     fn input(&mut self, monitors: &[MonitorInfo], ev: &InputEvent) -> Result<()> {

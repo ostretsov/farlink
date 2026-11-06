@@ -104,6 +104,25 @@ pub enum SessionMsg {
     FsMkdir { req: u32, path: String },
     /// host -> viewer: an upload / mkdir finished (or a download failed).
     FsDone { req: u32, path: String, error: Option<String> },
+
+    /// Text copied on one side, for the other side's clipboard (both
+    /// directions, control sessions only: the relay drops it otherwise).
+    Clipboard { text: String },
+
+    // ---- mouse pointer drawn by the viewer ----
+    /// viewer -> host: `local` = the viewer draws the mouse pointer itself
+    /// (it moves without waiting for the network), so leave it out of the
+    /// pictures and send [`SessionMsg::PointerShape`] / [`SessionMsg::Pointer`]
+    /// instead. A host that can't do that keeps drawing it into the pictures
+    /// and never sends a shape.
+    PointerMode { local: bool },
+    /// host -> viewer: a pointer shape, sent once per `id`. `rgba` is
+    /// base64 of `width * height` straight (not premultiplied) RGBA pixels;
+    /// (`hot_x`, `hot_y`) is the point that touches things.
+    PointerShape { id: u32, width: u32, height: u32, hot_x: u32, hot_y: u32, rgba: String },
+    /// host -> viewer: the pointer's hot spot in virtual-desktop pixels (as
+    /// [`MonitorInfo`] positions) and its shape (`0` = hidden).
+    Pointer { x: i32, y: i32, shape: u32 },
 }
 
 /// One entry of a folder listing.
@@ -128,6 +147,7 @@ impl SessionMsg {
                 | SessionMsg::FsDownload { .. }
                 | SessionMsg::FsUpload { .. }
                 | SessionMsg::FsMkdir { .. }
+                | SessionMsg::Clipboard { .. }
         )
     }
 }

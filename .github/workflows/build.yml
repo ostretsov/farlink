@@ -1,12 +1,16 @@
 # Farlink CI/CD
 #
-# * Every push and pull request: tests on Linux, a Windows test run, and builds
-#   for every platform (downloadable from the run's "Artifacts").
+# * Every push and pull request: tests on Linux and Windows only.
+# * Manual run ("Run workflow"): tests, then builds for every platform
+#   (downloadable from the run's "Artifacts").
 # * Pushing a version tag (e.g. `git tag v0.2.0 && git push origin v0.2.0`):
-#   the same, then a GitHub Release with the programs, the ready `dist/`
+#   tests, builds, then a GitHub Release with the programs, the ready `dist/`
 #   archive and checksums. The tag must match `version` in Cargo.toml.
+#   (Release builds only run here, so pushing main + tag together doesn't
+#   build the same commit twice.)
 
 name: build
+run-name: "${{ github.ref_name }}: ${{ github.event.head_commit.message || github.event.pull_request.title || 'manual run' }}"
 
 on:
   push:
@@ -63,6 +67,7 @@ jobs:
         run: cargo test --locked
 
   build-linux:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     name: Build Linux x86_64
     needs: test-linux
     runs-on: ubuntu-24.04
@@ -85,6 +90,7 @@ jobs:
           if-no-files-found: error
 
   build-linux-arm64:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     name: Build Linux ARM64
     needs: test-linux
     runs-on: ubuntu-24.04-arm
@@ -107,6 +113,7 @@ jobs:
           if-no-files-found: error
 
   build-windows:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     name: Build Windows x86_64
     needs: test-linux
     runs-on: ubuntu-24.04
