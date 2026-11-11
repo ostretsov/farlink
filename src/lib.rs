@@ -7,6 +7,7 @@
 //! * `farlink-host`   — helper on every remote machine. It can only be
 //!   controlled (never controls others) and only connects out to the relay.
 
+pub mod autostart;
 pub mod clipboard;
 pub mod codec;
 pub mod config;
@@ -23,6 +24,7 @@ pub mod quality;
 pub mod server;
 pub mod server_update;
 pub mod tls;
+pub mod tray;
 pub mod update;
 pub mod util;
 pub mod version;

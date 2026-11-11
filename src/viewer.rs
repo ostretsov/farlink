@@ -8,6 +8,7 @@ use crate::net::{Api, ConnState, SessionHandle, Target, TransferState, decode_pr
 use crate::proto::{InputEvent, MonitorInfo, MouseButton, SessionMsg, monitor_fingerprint};
 use crate::quality::{Codec, ColorDepth, Preset, Quality};
 use crate::server::{MachineSummary, MachineView, Overview};
+use crate::tray::{Tray, TrayEvent, TrayStatus};
 use crate::util::{human_duration, normalize_server_url, now_secs};
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Layout, Margin, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2,
@@ -42,14 +43,21 @@ pub struct ViewerOptions {
     pub demo: bool,
     /// Open this temporary link right away.
     pub open_link: Option<String>,
+    /// Start hidden in the tray (`--tray`, used when starting at login).
+    pub start_hidden: bool,
 }
+
+/// Set when the app really quits (tray "Quit", restart after an update):
+/// closing the main window otherwise only hides it to the tray.
+static QUITTING: AtomicBool = AtomicBool::new(false);
 
 pub fn run(opts: ViewerOptions) -> eframe::Result<()> {
     let native = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
             .with_title("Farlink")
             .with_inner_size([1180.0, 760.0])
-            .with_min_inner_size([820.0, 520.0]),
+            .with_min_inner_size([820.0, 520.0])
+            .with_icon(Arc::new(egui::IconData { rgba: crate::tray::icon::rgba(256), width: 256, height: 256 })),
         ..Default::default()
     };
     eframe::run_native("Farlink", native, Box::new(move |cc| Ok(Box::new(ViewerApp::new(&cc.egui_ctx, opts)))))
@@ -591,6 +599,12 @@ pub struct ViewerApp {
     shot_requested: bool,
     shot_done: Arc<AtomicBool>,
     demo: bool,
+    /// The icon in the system tray (not in screenshots).
+    tray: Option<Tray>,
+    /// The main window is hidden in the tray.
+    hidden: bool,
+    /// Started with `--tray`: hide the window in the first frame.
+    hide_pending: bool,
 }
 
 /// Sample computers for the demo mode and screenshots.
@@ -716,6 +730,9 @@ impl ViewerApp {
             shot_requested: false,
             shot_done: Arc::new(AtomicBool::new(false)),
             demo,
+            tray: None,
+            hidden: false,
+            hide_pending: false,
             opts,
         };
         if demo {
@@ -742,7 +759,88 @@ impl ViewerApp {
             }
             app.updater.start(ctx, &app.cfg.server_url, app.cfg.auto_update);
         }
+        if !screenshot {
+            app.setup_autostart();
+            let retry = if app.opts.start_hidden { crate::tray::RETRY_AT_LOGIN } else { Duration::from_secs(5) };
+            app.tray = Some(Tray::start(ctx, crate::autostart::is_enabled(), retry));
+        }
+        // Hidden in the first frame (a command sent from here is lost).
+        app.hide_pending = app.opts.start_hidden && app.tray.is_some();
         app
+    }
+
+    /// Switches "Start at login" on once, on the first start of an installed
+    /// app (not development builds or the demo), and keeps it pointing at
+    /// this exe.
+    fn setup_autostart(&mut self) {
+        let Ok(exe) = std::env::current_exe() else { return };
+        if !self.cfg.autostart_set_up && !self.demo && !cfg!(debug_assertions) {
+            match crate::autostart::set(true, &exe) {
+                Ok(()) => {
+                    self.cfg.autostart_set_up = true;
+                    self.save_cfg();
+                }
+                Err(e) => log::warn!("start at login: {e:#}"),
+            }
+        } else if let Err(e) = crate::autostart::refresh(&exe) {
+            log::warn!("start at login: {e:#}");
+        }
+    }
+
+    fn hide_window(&mut self, ctx: &egui::Context) {
+        self.hidden = true;
+        ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Visible(false));
+    }
+
+    fn show_window(&mut self, ctx: &egui::Context) {
+        self.hidden = false;
+        ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Focus);
+    }
+
+    /// Tray clicks, and closing the main window (hides it while there is a tray).
+    fn tray_step(&mut self, ctx: &egui::Context) {
+        if std::mem::take(&mut self.hide_pending) {
+            self.hide_window(ctx);
+        }
+        while let Some(event) = self.tray.as_ref().and_then(Tray::try_recv) {
+            match event {
+                TrayEvent::Open => self.show_window(ctx),
+                TrayEvent::ToggleAutostart => {
+                    let on = !crate::autostart::is_enabled();
+                    match std::env::current_exe().map_err(anyhow::Error::from).and_then(|exe| crate::autostart::set(on, &exe)) {
+                        Ok(()) => {
+                            self.cfg.autostart_set_up = true;
+                            self.save_cfg();
+                        }
+                        Err(e) => self.toast = Some((format!("Start at login: {e:#}"), Instant::now())),
+                    }
+                    if let Some(t) = &self.tray {
+                        t.set_autostart(crate::autostart::is_enabled());
+                    }
+                }
+                TrayEvent::Quit => quit_app(ctx),
+            }
+        }
+        let status = self.tray.as_ref().map(Tray::status);
+        // Started hidden but there is no tray to bring it back: show the window.
+        if self.hidden && status == Some(TrayStatus::Failed) {
+            self.show_window(ctx);
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && !QUITTING.load(Ordering::SeqCst) {
+            if status == Some(TrayStatus::Ready) {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                self.hide_window(ctx);
+            } else {
+                QUITTING.store(true, Ordering::SeqCst);
+            }
+        }
+        if QUITTING.load(Ordering::SeqCst)
+            && let Some(t) = self.tray.take()
+        {
+            t.shutdown();
+        }
     }
 
     fn signed_in(&self) -> bool {
@@ -960,7 +1058,7 @@ impl ViewerApp {
         let p = self.preview.as_ref().unwrap();
         let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
         let due = p.fetched.is_none_or(|t| t.elapsed() >= PREVIEW_EVERY);
-        if self.job_preview.is_none() && due && !minimized {
+        if self.job_preview.is_none() && due && !minimized && !self.hidden {
             if self.demo {
                 let tick = (now_secs() / 5) as u32;
                 self.job_preview = Some(spawn_job(ctx, move || {
@@ -1959,12 +2057,20 @@ fn check_and_install(server: &str, already: Option<&str>) -> anyhow::Result<Opti
     Ok(Some(info.version))
 }
 
-/// Start the (updated) program again and close this one.
+/// Start the (updated) program again and close this one. The restart is
+/// asked for in the open window, so the new one starts shown too.
 fn restart_app(ctx: &egui::Context) {
-    match std::env::current_exe().and_then(|exe| std::process::Command::new(exe).args(std::env::args_os().skip(1)).spawn()) {
-        Ok(_) => ctx.send_viewport_cmd(ViewportCommand::Close),
+    let args = std::env::args_os().skip(1).filter(|a| a != crate::autostart::TRAY_SWITCH);
+    match std::env::current_exe().and_then(|exe| std::process::Command::new(exe).args(args).spawn()) {
+        Ok(_) => quit_app(ctx),
         Err(e) => log::warn!("restart: {e}"),
     }
+}
+
+/// Really close the app (not just hide it to the tray).
+fn quit_app(ctx: &egui::Context) {
+    QUITTING.store(true, Ordering::SeqCst);
+    ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Close);
 }
 
 enum MonitorResult {
@@ -2217,6 +2323,7 @@ fn draw_remote_pointer(ui: &egui::Ui, s: &OpenSession, mon: &MonitorInfo, rect: 
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.tray_step(&ctx);
         self.poll_jobs(&ctx);
         self.preview_step(&ctx);
         if self.signed_in() && !self.demo && self.last_refresh.is_none_or(|t| t.elapsed() > Duration::from_secs(5)) {

@@ -34,6 +34,8 @@ Data flow: host keeps a control WebSocket `/ws/agent` to the relay → a viewer 
 | `files.rs` | Host-side file service: list folders, upload/download in chunks, safe names, never overwrite | File transfer |
 | `net.rs` | Viewer networking: `Api` (blocking REST via ureq), `SessionHandle`/`SessionShared` (live session state, transfers, mode), demo session | Desktop app ⇄ server |
 | `viewer.rs` | **Desktop UI** (≈2000 lines). Sections, in order: colours/style · jobs · `OpenSession` · input mapping (`map_events`) · `ViewerApp` state + `sample_overview` · top bar · bottom bar (connections) · machine list (right-click rename) · rename dialog · `preview_step` (selected online computer without open session: pictures every 5 s, drawn in the screens card) · central/login/details/grant/screens/quality cards · monitor windows · screenshot · `monitor_window` · file browser (`FilesView`, `files_window`) · `Updater` (app self-update: start-up, hourly, "Check for updates" + "Restart" in the bottom bar) · widgets · tests | Anything visible in the app |
+| `tray/` | System tray icon + menu (Open · Start at login · Quit): `icon.rs` draws the app icon in code (purple tile, white monitor, pointer; also the window icon; preview with `cargo run --example icon_preview -- DIR`), `linux.rs` (ksni StatusNotifierItem, retries while the desktop's tray comes up), `windows.rs` (Shell_NotifyIconW on a hidden window thread; never run on real Windows). Events wake egui; closing the main window hides it to the tray (`QUITTING` in `viewer.rs` really quits) | Tray |
+| `autostart.rs` | "Start at login" for the app (`farlink --tray` = start hidden): XDG `~/.config/autostart/farlink.desktop` / `HKCU\…\Run`. Switched on once on the first start of a release build (`ViewerConfig.autostart_set_up`) | Autostart |
 | `layout.rs` | Remembered window positions per machine+monitor (`layouts.json`) | Window placement |
 | `config.rs` | Settings files (host/viewer/server), atomic JSON save | New settings |
 | `install.rs` | Install plans as data (`Step`s): Windows service + firewall, Linux user service, server (HTTPS itself: `--port`, auto cert on 443 or cert files; removes old Caddy site); `execute` | Installers |
@@ -54,6 +56,7 @@ make test            # all tests (must stay green)
 make check           # compile-check Linux + Windows (cross)
 cargo test -- --ignored x11_capture   # real X11 capture on this machine (needs a display)
 cargo run --bin farlink -- --demo     # viewer with sample computers, no server
+cargo run --bin farlink -- --demo --tray   # same, starting hidden in the tray
 cargo run --bin farlink -- --screenshot shots/now.png   # renders ~120 frames, saves PNG, exits
 FARLINK_SHOT_FILES=1 / FARLINK_SHOT_RENAME=1 / FARLINK_SHOT_PREVIEW=1  (with --screenshot)  # file browser / rename dialog / preview (no session)
 make all             # release builds Linux + Windows → dist/

@@ -106,6 +106,10 @@ pub struct ViewerConfig {
     /// How remote screens are drawn in their windows (last choice is remembered).
     #[serde(default)]
     pub scale_mode: ScaleMode,
+    /// "Start at login" was switched on once (on the first start); after that
+    /// only the tray menu changes it.
+    #[serde(default)]
+    pub autostart_set_up: bool,
 }
 
 /// How a remote screen is drawn in its window.
@@ -149,6 +153,7 @@ impl Default for ViewerConfig {
             recent_links: Vec::new(),
             auto_update: true,
             scale_mode: ScaleMode::default(),
+            autostart_set_up: false,
         }
     }
 }

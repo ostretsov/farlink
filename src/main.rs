@@ -5,6 +5,7 @@
 //! farlink https://…/g/TOKEN       # open a temporary link
 //! farlink --demo                  # sample computers, no server needed
 //! farlink --screenshot out.png    # draw ~120 frames, save the window, exit
+//! farlink --tray                  # start hidden in the tray (at login)
 //! ```
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
@@ -19,6 +20,7 @@ fn main() -> eframe::Result<()> {
         screenshot: args.get("screenshot").map(Into::into),
         demo: args.has("demo"),
         open_link: args.positional.iter().find(|a| a.contains("/g/")).cloned(),
+        start_hidden: args.has("tray"),
     };
     run(opts)
 }
