@@ -29,7 +29,9 @@ const ASSETS: &[(&str, &str, &str)] = &[
     ("farlink-linux-x86_64", "x86_64-unknown-linux-gnu", "farlink"),
     ("farlink-host-linux-x86_64", "x86_64-unknown-linux-gnu", "farlink-host"),
     ("farlink-server-linux-x86_64", "x86_64-unknown-linux-gnu", "farlink-server"),
+    ("farlink-linux-x86_64.deb", "x86_64-unknown-linux-gnu", "farlink.deb"),
     ("farlink-linux-arm64", "aarch64-unknown-linux-gnu", "farlink"),
+    ("farlink-linux-arm64.deb", "aarch64-unknown-linux-gnu", "farlink.deb"),
     ("farlink-host-linux-arm64", "aarch64-unknown-linux-gnu", "farlink-host"),
     ("farlink-server-linux-arm64", "aarch64-unknown-linux-gnu", "farlink-server"),
     ("farlink-windows-x86_64.exe", "x86_64-pc-windows-gnu", "farlink.exe"),
@@ -385,8 +387,8 @@ mod tests {
     #[test]
     fn every_program_has_an_asset() {
         for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-gnu"] {
-            for base in ["farlink", "farlink-host"] {
-                let file = crate::util::exe_name(base, target);
+            for base in ["farlink", "farlink-host", crate::util::DEB_APP] {
+                let Some(file) = crate::util::published_file(base, target) else { continue };
                 assert!(ASSETS.iter().any(|a| a.1 == target && a.2 == file), "{target}/{file}");
             }
         }

@@ -12,7 +12,7 @@ use crate::config::{ServerConfig, load_json, save_json};
 use crate::grants::{Grant, HostInfo, Machine, Store, Who};
 use crate::proto::{AgentMsg, Preview, PreviewShot, SessionMsg};
 use crate::update::UpdateInfo;
-use crate::util::{exe_name, now_secs, random_token, sha256_hex};
+use crate::util::{now_secs, random_token, sha256_hex};
 use anyhow::Result;
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -39,7 +39,7 @@ const ADMIN_JS: &str = include_str!("web/admin.js");
 const VIEWER_JS: &str = include_str!("web/viewer.js");
 
 /// Files that may be downloaded from the releases folder.
-const PUBLISHED_APPS: [&str; 2] = ["farlink-host", "farlink"];
+const PUBLISHED_APPS: [&str; 3] = ["farlink-host", "farlink", crate::util::DEB_APP];
 
 struct AgentConn {
     tx: mpsc::UnboundedSender<AgentMsg>,
@@ -212,7 +212,7 @@ impl Relay {
             return None;
         }
         let version = self.release_version()?;
-        let file = exe_name(app, target);
+        let file = crate::util::published_file(app, target)?;
         let path = self.cfg.releases_dir.join(target).join(&file);
         let meta = std::fs::metadata(&path).ok()?;
         let mtime = meta.modified().ok()?;
@@ -708,7 +708,7 @@ async fn install_windows_cmd(State(r): State<Shared>, Path(token): Path<String>)
 }
 
 async fn download(State(r): State<Shared>, Path((target, file)): Path<(String, String)>) -> Response {
-    let allowed = PUBLISHED_APPS.iter().any(|a| exe_name(a, &target) == file);
+    let allowed = PUBLISHED_APPS.iter().any(|a| crate::util::published_file(a, &target).as_deref() == Some(file.as_str()));
     if !allowed || !safe_segment(&target) {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }

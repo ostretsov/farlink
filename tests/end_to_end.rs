@@ -386,6 +386,32 @@ async fn published_updates_are_offered_and_verified() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_desktop_app_package_is_offered_to_linux_apps_only() {
+    let s = start_server().await;
+    let linux = "aarch64-unknown-linux-gnu";
+    let rel = s.relay.cfg.releases_dir.join(linux);
+    std::fs::create_dir_all(&rel).unwrap();
+    std::fs::write(rel.join("farlink"), b"bare app").unwrap();
+    std::fs::write(rel.join("farlink.deb"), b"app package").unwrap();
+    std::fs::write(s.relay.cfg.releases_dir.join("version.txt"), "9.2.0\n").unwrap();
+
+    let url = s.url.clone();
+    blocking(move || {
+        let deb = farlink::util::DEB_APP;
+        let info = farlink::update::check(&url, deb, linux, "0.1.0").unwrap().expect("package offered");
+        assert_eq!(info.path, "/download/aarch64-unknown-linux-gnu/farlink.deb");
+        assert_eq!(farlink::update::download(&url, &info).unwrap(), b"app package");
+        // The bare program is still there for apps not installed from the package.
+        let bare = farlink::update::check(&url, "farlink", linux, "0.1.0").unwrap().unwrap();
+        assert_eq!(farlink::update::download(&url, &bare).unwrap(), b"bare app");
+        // No package for Windows, and no other file names through the download route.
+        assert!(farlink::update::check(&url, deb, "x86_64-pc-windows-gnu", "0.1.0").unwrap().is_none());
+        assert!(ureq::get(&format!("{url}/download/{linux}/farlink.deb.part")).call().is_err());
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn admin_forces_helper_updates_and_sees_how_they_went() {
     let s = start_server().await;
     let (mut agent, id, secret) = fake_host(&s).await;

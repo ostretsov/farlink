@@ -33,16 +33,17 @@ Data flow: host keeps a control WebSocket `/ws/agent` to the relay → a viewer 
 | `clipboard.rs` | Shared copied text: `ClipboardSync` (`last` stops echoes, `\r\n`-tolerant), process-wide arboard clipboard (`system_get/set`), demo clipboard for tests, host `poll_loop` (500 ms, nothing while view-only). Host applies incoming text before forwarding later input; relay drops it both ways for view-only (`host_message_allowed`); viewer sends on Ctrl+V / window focus, browser on `paste` | Clipboard |
 | `files.rs` | Host-side file service: list folders, upload/download in chunks, safe names, never overwrite | File transfer |
 | `net.rs` | Viewer networking: `Api` (blocking REST via ureq), `SessionHandle`/`SessionShared` (live session state, transfers, mode), demo session | Desktop app ⇄ server |
-| `viewer.rs` | **Desktop UI** (≈2000 lines). Sections, in order: colours/style · jobs · `OpenSession` · input mapping (`map_events`) · `ViewerApp` state + `sample_overview` · top bar · bottom bar (connections) · machine list (right-click rename) · rename dialog · `preview_step` (selected online computer without open session: pictures every 5 s, drawn in the screens card) · central/login/details/grant/screens/quality cards · monitor windows · screenshot · `monitor_window` · file browser (`FilesView`, `files_window`) · `Updater` (app self-update: start-up, hourly, "Check for updates" + "Restart" in the bottom bar) · widgets · tests | Anything visible in the app |
+| `viewer.rs` | **Desktop UI** (≈2000 lines). Sections, in order: colours/style · jobs · `OpenSession` · input mapping (`map_events`) · `ViewerApp` state + `sample_overview` · top bar · bottom bar (connections) · machine list (right-click rename) · rename dialog · `preview_step` (selected online computer without open session: pictures every 5 s, drawn in the screens card) · central/login/details/grant/screens/quality cards · monitor windows · screenshot · `monitor_window` · file browser (`FilesView`, `files_window`) · `Updater` (app self-update: start-up, hourly, "Check for updates" + "Restart" in the bottom bar; installed from the .deb → downloads the newer .deb, "Install" asks for the password; `app_exe()` = path read at start, since `current_exe` names `farlink.old` after an update) · widgets · tests | Anything visible in the app |
 | `tray/` | System tray icon + menu (Open · Start at login · Quit): `icon.rs` draws the app icon in code (purple tile, white monitor, pointer; also the window icon; preview with `cargo run --example icon_preview -- DIR`), `linux.rs` (ksni StatusNotifierItem, retries while the desktop's tray comes up), `windows.rs` (Shell_NotifyIconW on a hidden window thread; never run on real Windows). Events wake egui; closing the main window hides it to the tray (`QUITTING` in `viewer.rs` really quits) | Tray |
 | `autostart.rs` | "Start at login" for the app (`farlink --tray` = start hidden): XDG `~/.config/autostart/farlink.desktop` / `HKCU\…\Run`. Switched on once on the first start of a release build (`ViewerConfig.autostart_set_up`) | Autostart |
 | `layout.rs` | Remembered window positions per machine+monitor (`layouts.json`) | Window placement |
 | `config.rs` | Settings files (host/viewer/server), atomic JSON save | New settings |
 | `install.rs` | Install plans as data (`Step`s): Windows service + firewall, Linux user service, server (HTTPS itself: `--port`, auto cert on 443 or cert files; removes old Caddy site); `execute` | Installers |
 | `server_update.rs` | Server follows GitHub Releases (`update_from_github`): hourly check, verify assets against `SHA256SUMS.txt`, replace own exe, publish computer programs, re-exec in place (loop guard `FARLINK_UPDATED_TO`). `UpdateStatus` (saved in `<data>/update-status.json`, sent in `Overview.server_update`: version, last check, last update), `POST /api/server/check-update` (admin) wakes the loop via `Relay.update_now`. Asset names must match `build.yml` | Server auto-update |
-| `update.rs` | Self-update: check, download, SHA-256 verify, swap exe; `install_published` (forced: any version that differs) | Updates |
+| `update.rs` | Self-update: check, download, SHA-256 verify, swap exe; `install_published` (forced: any version that differs); Debian package: `installed_from_deb` (app at `/usr/bin/farlink`), `download_deb` (to `~/.cache/farlink`), `install_deb` (`pkexec apt-get install`) | Updates |
 | `keys.rs` | Key names ⇄ X11 keysyms / Windows VK codes | Keyboard |
-| `util.rs`, `version.rs` | Small helpers, CLI `Args`, version compare | — |
+| `util.rs`, `version.rs` | Small helpers, CLI `Args`, version compare, `published_file` (app → file in `releases/<target>/`; `DEB_APP` = `farlink.deb`, Linux only) | — |
+| `packaging/` | Desktop app `.deb`: `deb.sh` (dpkg-deb; glibc minimum read from the binary), `farlink.desktop` (`StartupWMClass=farlink` = the viewport `app_id`), `icons/` (PNGs from `make icons`) | Linux package |
 | `web/` | Browser UI embedded with `include_str!`: `admin.html/js` (web admin + person view), `viewer.html/js` (in-browser viewer + files panel), `install.html`, `message.html`, `app.css` | Web UI (plain JS, no build step) |
 
 Tests: unit tests live at the bottom of each module; `tests/end_to_end.rs` starts a real relay on a
@@ -86,7 +87,7 @@ cargo run --bin farlink-host -- run --demo --verbose --server http://127.0.0.1:8
 * Edition 2024 with let-chains. Dev profile has no debug info (disk on the dev machine is tight).
 * Windows code compiles via `make check` but has **never run on real Windows** — test there before
   claiming it works. Ubuntu is X11 only (no Wayland).
-* Release layout the server expects: `releases/version.txt` + `releases/<rust-target>/<program>`;
+* Release layout the server expects: `releases/version.txt` + `releases/<rust-target>/<program>` (+ `farlink.deb` on Linux, built by `make dist`/`make deb`);
   `util::current_target()` must match the folder names (`x86_64-pc-windows-gnu`, not msvc).
 
 ## CI/CD

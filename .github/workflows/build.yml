@@ -176,6 +176,8 @@ jobs:
           cp dist/releases/x86_64-unknown-linux-gnu/farlink-host   "upload/farlink-host-linux-x86_64"
           cp dist/releases/aarch64-unknown-linux-gnu/farlink       "upload/farlink-linux-arm64"
           cp dist/releases/aarch64-unknown-linux-gnu/farlink-host  "upload/farlink-host-linux-arm64"
+          cp dist/releases/x86_64-unknown-linux-gnu/farlink.deb    "upload/farlink-linux-x86_64.deb"
+          cp dist/releases/aarch64-unknown-linux-gnu/farlink.deb   "upload/farlink-linux-arm64.deb"
           cp target/aarch64-unknown-linux-gnu/release/farlink-server "upload/farlink-server-linux-arm64"
           cp dist/releases/x86_64-pc-windows-gnu/farlink.exe       "upload/farlink-windows-x86_64.exe"
           cp dist/releases/x86_64-pc-windows-gnu/farlink-host.exe  "upload/farlink-host-windows-x86_64.exe"
@@ -205,5 +207,7 @@ jobs:
           body: |
             **Server (new install or update):** download the `farlink-<version>.tar.gz` archive below,
             unpack it on the server and follow `INSTALL-SERVER.md` inside it.
+            **Desktop app on Ubuntu/Debian:** `sudo apt install ./farlink-linux-x86_64.deb` (or `-arm64`);
+            it then offers newer packages from your server itself.
             **Update every computer:** `sudo /opt/farlink-server/farlink-server publish <version> ./releases --config /etc/farlink-server/config.json`
             in the unpacked folder; computers update themselves in the background.

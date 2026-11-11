@@ -51,10 +51,21 @@ pub struct ViewerOptions {
 /// closing the main window otherwise only hides it to the tray.
 static QUITTING: AtomicBool = AtomicBool::new(false);
 
+/// This program's file, read once at start. Later `current_exe` names the
+/// moved-aside old file (`farlink.old`) or `(deleted)` once an update has
+/// replaced it, and "Restart" must start the new one.
+static EXE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+fn app_exe() -> std::io::Result<PathBuf> {
+    EXE.get_or_init(|| std::env::current_exe().ok()).clone().ok_or_else(|| std::io::Error::other("program path unknown"))
+}
+
 pub fn run(opts: ViewerOptions) -> eframe::Result<()> {
+    let _ = app_exe();
     let native = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
             .with_title("Farlink")
+            .with_app_id("farlink") // X11 WM_CLASS / Wayland app id: matches farlink.desktop
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([820.0, 520.0])
             .with_icon(Arc::new(egui::IconData { rgba: crate::tray::icon::rgba(256), width: 256, height: 256 })),
@@ -754,7 +765,7 @@ impl ViewerApp {
             app.open_link(ctx, &link);
         }
         if !screenshot && !app.demo {
-            if let Ok(exe) = std::env::current_exe() {
+            if let Ok(exe) = app_exe() {
                 crate::update::cleanup_old(&exe);
             }
             app.updater.start(ctx, &app.cfg.server_url, app.cfg.auto_update);
@@ -773,7 +784,7 @@ impl ViewerApp {
     /// app (not development builds or the demo), and keeps it pointing at
     /// this exe.
     fn setup_autostart(&mut self) {
-        let Ok(exe) = std::env::current_exe() else { return };
+        let Ok(exe) = app_exe() else { return };
         if !self.cfg.autostart_set_up && !self.demo && !cfg!(debug_assertions) {
             match crate::autostart::set(true, &exe) {
                 Ok(()) => {
@@ -809,7 +820,7 @@ impl ViewerApp {
                 TrayEvent::Open => self.show_window(ctx),
                 TrayEvent::ToggleAutostart => {
                     let on = !crate::autostart::is_enabled();
-                    match std::env::current_exe().map_err(anyhow::Error::from).and_then(|exe| crate::autostart::set(on, &exe)) {
+                    match app_exe().map_err(anyhow::Error::from).and_then(|exe| crate::autostart::set(on, &exe)) {
                         Ok(()) => {
                             self.cfg.autostart_set_up = true;
                             self.save_cfg();
@@ -1145,6 +1156,17 @@ impl ViewerApp {
             ui.label(small(format!("· updated to {v}"), ACCENT));
             if ui.add(egui::Link::new(small("Restart".into(), ACCENT))).on_hover_text("Close Farlink and start the new version").clicked() {
                 restart_app(ui.ctx());
+            }
+        } else if st.installing {
+            ui.label(small("· installing the update...".into(), MUTED));
+        } else if let Some((v, _)) = &st.deb {
+            if !st.text.is_empty() {
+                ui.label(small(format!("· {}", st.text), AMBER));
+            }
+            ui.label(small(format!("· {v} available"), ACCENT));
+            let tip = "Install the new Farlink package (asks for your password)";
+            if ui.add(egui::Link::new(small("Install".into(), ACCENT))).on_hover_text(tip).clicked() {
+                self.updater.install_deb(ui.ctx());
             }
         } else {
             if !st.text.is_empty() {
@@ -1967,6 +1989,11 @@ struct UpdaterState {
     last_check: Option<Instant>,
     /// Version installed next to the running one, waiting for a restart.
     installed: Option<String>,
+    /// App installed from the .deb: a newer package downloaded and waiting
+    /// for "Install" (it asks for the password, so never on its own).
+    deb: Option<(String, PathBuf)>,
+    /// The .deb is being installed (password dialog / apt running).
+    installing: bool,
 }
 
 impl Updater {
@@ -2000,9 +2027,17 @@ impl Updater {
                 let (text, error, installed) = if server.is_empty() {
                     ("sign in to check for updates".to_string(), false, None)
                 } else {
-                    match check_and_install(&server, lock.lock().unwrap().installed.as_deref()) {
-                        Ok(Some(v)) => (String::new(), false, Some(v)),
-                        Ok(None) => ("up to date".to_string(), false, None),
+                    let already = {
+                        let st = lock.lock().unwrap();
+                        st.installed.clone().or_else(|| st.deb.as_ref().map(|d| d.0.clone()))
+                    };
+                    match check_and_install(&server, already.as_deref()) {
+                        Ok(Checked::Installed(v)) => (String::new(), false, Some(v)),
+                        Ok(Checked::DebReady(v, path)) => {
+                            lock.lock().unwrap().deb = Some((v, path));
+                            (String::new(), false, None)
+                        }
+                        Ok(Checked::UpToDate) => ("up to date".to_string(), false, None),
                         Err(e) => {
                             log::warn!("update check: {e:#}");
                             ("could not check for updates".to_string(), true, None)
@@ -2042,26 +2077,81 @@ impl Updater {
         st.checking = true; // shown at once, before the thread wakes
         self.shared.1.notify_all();
     }
+
+    /// Install the downloaded .deb (asks for the password).
+    fn install_deb(&self, ctx: &egui::Context) {
+        let (version, path) = {
+            let mut st = self.shared.0.lock().unwrap();
+            let Some(deb) = st.deb.clone() else { return };
+            if st.installing {
+                return;
+            }
+            st.installing = true;
+            st.text.clear();
+            deb
+        };
+        let shared = self.shared.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = crate::update::install_deb(&path);
+            let mut st = shared.0.lock().unwrap();
+            st.installing = false;
+            match result {
+                Ok(()) => {
+                    log::info!("installed farlink {} -> {version} (.deb)", crate::VERSION);
+                    let _ = std::fs::remove_file(&path);
+                    st.deb = None;
+                    st.installed = Some(version);
+                }
+                Err(e) => {
+                    log::warn!("installing {}: {e:#}", path.display());
+                    st.text = format!("not installed: {e:#}");
+                    st.error = true;
+                }
+            }
+            drop(st);
+            ctx.request_repaint();
+        });
+    }
+}
+
+enum Checked {
+    UpToDate,
+    /// The program file was replaced: restart to use it.
+    Installed(String),
+    /// App from the .deb: the newer package is downloaded, see [`Updater::install_deb`].
+    DebReady(String, PathBuf),
 }
 
 /// Install the server's version if it is newer than the running one and not
-/// installed already. Returns the version installed now.
-fn check_and_install(server: &str, already: Option<&str>) -> anyhow::Result<Option<String>> {
+/// installed (or downloaded) already. An app installed from the .deb gets the
+/// newer .deb instead of its bare program file.
+fn check_and_install(server: &str, already: Option<&str>) -> anyhow::Result<Checked> {
     let target = crate::util::current_target();
-    let Some(info) = crate::update::check(server, "farlink", target, already.unwrap_or(crate::VERSION))? else {
-        return Ok(None);
+    let installed = already.unwrap_or(crate::VERSION);
+    let exe = app_exe()?;
+    if crate::update::installed_from_deb(&exe) {
+        let Some(info) = crate::update::check(server, crate::util::DEB_APP, target, installed)? else {
+            return Ok(Checked::UpToDate);
+        };
+        let path = crate::update::download_deb(server, &info)?;
+        log::info!("farlink {} downloaded: {}", info.version, path.display());
+        return Ok(Checked::DebReady(info.version, path));
+    }
+    let Some(info) = crate::update::check(server, "farlink", target, installed)? else {
+        return Ok(Checked::UpToDate);
     };
     let bytes = crate::update::download(server, &info)?; // checks size and SHA-256
-    crate::update::replace_exe(&std::env::current_exe()?, &bytes)?;
+    crate::update::replace_exe(&exe, &bytes)?;
     log::info!("updated farlink {} -> {}", crate::VERSION, info.version);
-    Ok(Some(info.version))
+    Ok(Checked::Installed(info.version))
 }
 
 /// Start the (updated) program again and close this one. The restart is
 /// asked for in the open window, so the new one starts shown too.
 fn restart_app(ctx: &egui::Context) {
     let args = std::env::args_os().skip(1).filter(|a| a != crate::autostart::TRAY_SWITCH);
-    match std::env::current_exe().and_then(|exe| std::process::Command::new(exe).args(args).spawn()) {
+    match app_exe().and_then(|exe| std::process::Command::new(exe).args(args).spawn()) {
         Ok(_) => quit_app(ctx),
         Err(e) => log::warn!("restart: {e}"),
     }

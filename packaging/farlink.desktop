@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Farlink
+GenericName=Remote Desktop
+Comment=See and control your computers
+Exec=farlink
+Icon=farlink
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=remote;desktop;vnc;support;
+StartupWMClass=farlink

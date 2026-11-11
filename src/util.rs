@@ -147,6 +147,18 @@ pub fn exe_name(base: &str, target: &str) -> String {
     if target.contains("windows") { format!("{base}.exe") } else { base.to_string() }
 }
 
+/// The desktop app as a Debian package (Linux only): what an app installed
+/// from the .deb asks the server for instead of the bare program.
+pub const DEB_APP: &str = "farlink-deb";
+
+/// File a published app has in `releases/<target>/` (`None`: not offered there).
+pub fn published_file(app: &str, target: &str) -> Option<String> {
+    if app == DEB_APP {
+        return target.contains("linux").then(|| "farlink.deb".to_string());
+    }
+    Some(exe_name(app, target))
+}
+
 /// Operating system label for the machine list.
 pub fn os_label() -> String {
     if cfg!(windows) {
@@ -286,6 +298,9 @@ mod tests {
     fn exe_names() {
         assert_eq!(exe_name("farlink-host", "x86_64-pc-windows-gnu"), "farlink-host.exe");
         assert_eq!(exe_name("farlink-host", "x86_64-unknown-linux-gnu"), "farlink-host");
+        assert_eq!(published_file(DEB_APP, "aarch64-unknown-linux-gnu").as_deref(), Some("farlink.deb"));
+        assert_eq!(published_file(DEB_APP, "x86_64-pc-windows-gnu"), None);
+        assert_eq!(published_file("farlink", "x86_64-pc-windows-gnu").as_deref(), Some("farlink.exe"));
     }
 
     #[test]

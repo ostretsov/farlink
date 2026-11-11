@@ -6,6 +6,8 @@
 #   make linux-arm64  Linux ARM64    (needs an ARM64 machine or a cross linker)
 #   make windows      Windows x86_64 (viewer, helper) - cross-built with mingw-w64
 #   make dist         lay the builds out the way the server expects (dist/)
+#   make deb          the desktop app as .deb packages (into dist/releases/<target>/)
+#   make icons        regenerate packaging/icons from the icon code
 #   make test         all automated tests
 #   make check        compile-check every platform without building binaries
 #   make run-demo     start the viewer with sample computers
@@ -28,7 +30,7 @@ REL  := $(DIST)/releases
 LINUX_BINS   := farlink farlink-host farlink-server
 WINDOWS_BINS := farlink farlink-host
 
-.PHONY: all linux linux-arm64 windows dist package test check run-demo clean version help \
+.PHONY: all linux linux-arm64 windows dist deb icons package test check run-demo clean version help \
         targets dist-linux dist-linux-arm64 dist-windows
 
 all: linux windows dist
@@ -81,12 +83,22 @@ dist:
 	@if [ -f target/$(LINUX)/release/farlink ]; then $(MAKE) --no-print-directory dist-linux; fi
 	@if [ -f target/$(LINUX_ARM64)/release/farlink ]; then $(MAKE) --no-print-directory dist-linux-arm64; fi
 	@if [ -f target/$(WINDOWS)/release/farlink.exe ]; then $(MAKE) --no-print-directory dist-windows; fi
+	@if command -v dpkg-deb >/dev/null; then $(MAKE) --no-print-directory deb; else echo "no dpkg-deb: skipping .deb packages"; fi
 	echo "$(VERSION)" > $(REL)/version.txt
 	cp README.md INSTALL-SERVER.md $(DIST)/
 	@echo
 	@echo "Farlink $(VERSION) is in ./$(DIST)"
 	@echo "First install on a server:  sudo ./farlink-server install --domain remote.example.com"
 	@echo "Publish an update later:    sudo farlink-server publish $(VERSION) ./releases --config /etc/farlink-server/config.json"
+
+# The desktop app as a Debian package per built Linux platform. The server
+# publishes it as releases/<target>/farlink.deb; apps installed from it update with it.
+deb:
+	@if [ -f target/$(LINUX)/release/farlink ]; then packaging/deb.sh target/$(LINUX)/release/farlink amd64 $(VERSION) $(REL)/$(LINUX)/farlink.deb; fi
+	@if [ -f target/$(LINUX_ARM64)/release/farlink ]; then packaging/deb.sh target/$(LINUX_ARM64)/release/farlink arm64 $(VERSION) $(REL)/$(LINUX_ARM64)/farlink.deb; fi
+
+icons:
+	$(CARGO) run --example icon_preview -- packaging/icons
 
 # One archive with everything (what the GitHub release attaches).
 package: dist

@@ -95,7 +95,7 @@ fn publish(cfg: &ServerConfig, version: &str, from: &Path) -> Result<()> {
             let f = f?;
             let name = f.file_name();
             let name_s = name.to_string_lossy();
-            if ["farlink", "farlink.exe", "farlink-host", "farlink-host.exe"].contains(&name_s.as_ref()) {
+            if ["farlink", "farlink.exe", "farlink-host", "farlink-host.exe", "farlink.deb"].contains(&name_s.as_ref()) {
                 // Copy then rename so a half-copied file is never served.
                 let tmp = dest.join(format!("{name_s}.part"));
                 std::fs::copy(f.path(), &tmp)?;
