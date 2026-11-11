@@ -41,7 +41,13 @@ jobs:
           targets: x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@v2
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y mingw-w64 libxkbcommon-dev libwayland-dev
+        run: |
+          # The runner's apt mirror sometimes fails to resolve for a while: retry.
+          for i in 1 2 3; do
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y mingw-w64 libxkbcommon-dev libwayland-dev && exit 0
+            echo "apt failed (attempt $i), retrying in 60 s"; sleep 60
+          done
+          exit 1
       - name: Version tag matches Cargo.toml
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -126,7 +132,13 @@ jobs:
         with:
           key: release-windows
       - name: Install mingw-w64
-        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+        run: |
+          # The runner's apt mirror sometimes fails to resolve for a while: retry.
+          for i in 1 2 3; do
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y mingw-w64 && exit 0
+            echo "apt failed (attempt $i), retrying in 60 s"; sleep 60
+          done
+          exit 1
       - run: make windows
       - uses: actions/upload-artifact@v4
         with:
