@@ -173,7 +173,14 @@
   remembered('farlink_quality', 'quality');
   remembered('farlink_color', 'color');
   $('cad').onclick = () => input({ k: 'ctrl_alt_del' });
-  $('fs').onclick = () => (document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen());
+  $('fs').onclick = async () => {
+    if (document.fullscreenElement) return document.exitFullscreen();
+    await document.documentElement.requestFullscreen();
+    // In full screen Chrome and Edge can hand Alt+Tab to the page (Keyboard
+    // Lock), so it switches windows on the remote computer. Other browsers
+    // keep it for this computer. Ends with full screen.
+    try { await navigator.keyboard?.lock?.(['Tab', 'AltLeft', 'AltRight']); } catch (_) { /* not supported */ }
+  };
 
   function pos(canvas, e) {
     const r = canvas.getBoundingClientRect();

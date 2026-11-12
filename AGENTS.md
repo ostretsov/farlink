@@ -41,7 +41,8 @@ Data flow: host keeps a control WebSocket `/ws/agent` to the relay → a viewer 
 | `install.rs` | Install plans as data (`Step`s): Windows service + firewall, Linux user service, server (HTTPS itself: `--port`, auto cert on 443 or cert files; removes old Caddy site); `execute` | Installers |
 | `server_update.rs` | Server follows GitHub Releases (`update_from_github`): hourly check, verify assets against `SHA256SUMS.txt`, replace own exe, publish computer programs, re-exec in place (loop guard `FARLINK_UPDATED_TO`). `UpdateStatus` (saved in `<data>/update-status.json`, sent in `Overview.server_update`: version, last check, last update), `POST /api/server/check-update` (admin) wakes the loop via `Relay.update_now`. Asset names must match `build.yml` | Server auto-update |
 | `update.rs` | Self-update: check, download, SHA-256 verify, swap exe; `install_published` (forced: any version that differs); Debian package: `installed_from_deb` (app at `/usr/bin/farlink`), `download_deb` (to `~/.cache/farlink`), `install_deb` (`pkexec apt-get install`) | Updates |
-| `keys.rs` | Key names ⇄ X11 keysyms / Windows VK codes | Keyboard |
+| `keys.rs` | Key names ⇄ X11 keysyms / Windows VK codes (`name_for_keysym` the other way) | Keyboard |
+| `keygrab.rs` | Alt+Tab for the remote computer: while Alt is held in a focused screen window (control, mouse on the picture) `AltGrab` grabs the keyboard on that window (X11 only) and forwards keys itself (`Forward`) until Alt is let go; the browser uses Keyboard Lock in full screen (Chrome/Edge). Real-X test: `cargo test -- --ignored x11_alt_tab` | Keyboard shortcuts the local desktop would take |
 | `util.rs`, `version.rs` | Small helpers, CLI `Args`, version compare, `published_file` (app → file in `releases/<target>/`; `DEB_APP` = `farlink.deb`, Linux only) | — |
 | `packaging/` | Desktop app `.deb`: `deb.sh` (dpkg-deb; glibc minimum read from the binary), `farlink.desktop` (`StartupWMClass=farlink` = the viewport `app_id`), `icons/` (PNGs from `make icons`) | Linux package |
 | `web/` | Browser UI embedded with `include_str!`: `admin.html/js` (web admin + person view), `viewer.html/js` (in-browser viewer + files panel), `install.html`, `message.html`, `app.css` | Web UI (plain JS, no build step) |
@@ -56,6 +57,7 @@ updates, rename, screen previews).
 make test            # all tests (must stay green)
 make check           # compile-check Linux + Windows (cross)
 cargo test -- --ignored x11_capture   # real X11 capture on this machine (needs a display)
+cargo test -- --ignored x11_alt_tab   # real keyboard grab + XTest Alt+Tab (needs a display)
 cargo run --bin farlink -- --demo     # viewer with sample computers, no server
 cargo run --bin farlink -- --demo --tray   # same, starting hidden in the tray
 cargo run --bin farlink -- --screenshot shots/now.png   # renders ~120 frames, saves PNG, exits

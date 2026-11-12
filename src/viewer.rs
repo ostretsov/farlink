@@ -158,6 +158,8 @@ struct OpenSession {
     controls_changed: bool,
     /// Hidden controls brought back by resting the mouse at the top edge.
     reveal: HashMap<u8, Reveal>,
+    /// Keyboard grabbed while Alt is held, so Alt+Tab reaches the remote computer.
+    alt_grab: Option<crate::keygrab::AltGrab>,
     /// Last "watching these screens" sent to the helper.
     last_watch: Option<Vec<u8>>,
     /// Open file browser window, if any.
@@ -920,6 +922,7 @@ impl ViewerApp {
             controls_hidden: self.cfg.hide_controls,
             controls_changed: false,
             reveal: HashMap::new(),
+            alt_grab: None,
             last_watch: None,
             files: None,
             focused: HashSet::new(),
@@ -2479,7 +2482,16 @@ fn screen_picture(
             }
         }
     }
-    for ev in map_events(&events, rect, visible, mon.index, &mut s.mods, mods, focused) {
+    // Alt+Tab & co. for the remote computer: while Alt is held the keys come
+    // from the grab (see crate::keygrab), not from here.
+    if let Some(held) = s.alt_grab.as_ref().and_then(|g| g.finished()) {
+        s.alt_grab = None;
+        // Alt is still down over there: let go of it as soon as egui has.
+        s.mods = egui::Modifiers { alt: true, shift: held.shift, ctrl: held.ctrl, ..s.mods };
+    }
+    let grabbed = s.alt_grab.is_some();
+    let alt_pressed = focused && !grabbed && mods.alt && !s.mods.alt && local.is_some();
+    for ev in map_events(&events, rect, visible, mon.index, &mut s.mods, mods, focused && !grabbed) {
         match ev {
             InputEvent::Scroll { dx, dy } => {
                 if !hovering {
@@ -2494,6 +2506,14 @@ fn screen_picture(
             }
             other => s.handle.send(SessionMsg::Input { event: other }),
         }
+    }
+    if alt_pressed {
+        let held = crate::keygrab::Held { shift: s.mods.shift, ctrl: s.mods.ctrl };
+        s.alt_grab = crate::keygrab::AltGrab::start(s.handle.input_sender(), held);
+    }
+    if s.alt_grab.is_some() {
+        // Look again for the grab's end (nothing else wakes the window then).
+        ctx.request_repaint_after(Duration::from_millis(50));
     }
 }
 

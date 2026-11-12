@@ -57,6 +57,30 @@ pub fn keysym(name: &str) -> Option<u32> {
     }
 }
 
+/// Key name for an X11 keysym (the key's first, unshifted symbol), for keys
+/// read straight from the X server. Right-hand modifiers and Shift+Tab
+/// count as the plain ones.
+pub fn name_for_keysym(ks: u32) -> Option<String> {
+    let ks = match ks {
+        0xffe2 => 0xffe1, // Shift_R
+        0xffe4 => 0xffe3, // Control_R
+        0xffea => 0xffe9, // Alt_R
+        0xffec => 0xffeb, // Super_R
+        0xfe20 => 0xff09, // ISO_Left_Tab (Shift+Tab)
+        0xff8d => 0xff0d, // KP_Enter
+        k => k,
+    };
+    if let Some(&(name, ..)) = TABLE.iter().find(|e| e.1 == ks) {
+        return Some(name.to_string());
+    }
+    match ks {
+        0xffbe..=0xffd5 => Some(format!("F{}", ks - 0xffbe + 1)),
+        0x61..=0x7a => Some(((ks - 32) as u8 as char).to_string()),
+        0x41..=0x5a | 0x30..=0x39 => Some((ks as u8 as char).to_string()),
+        _ => None,
+    }
+}
+
 /// Windows virtual-key code and "extended key" flag for a key name.
 pub fn windows_vk(name: &str) -> Option<(u16, bool)> {
     if let Some(&(_, _, vk, ext)) = TABLE.iter().find(|e| e.0 == name) {
@@ -105,6 +129,19 @@ pub fn all_names() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keysyms_name_their_keys_back() {
+        for name in all_names() {
+            let ks = keysym(&name).unwrap();
+            assert_eq!(name_for_keysym(ks).as_deref(), Some(name.as_str()), "{name}");
+        }
+        assert_eq!(name_for_keysym(0x61).as_deref(), Some("A"), "lower-case letter");
+        assert_eq!(name_for_keysym(0xfe20).as_deref(), Some("Tab"), "Shift+Tab");
+        assert_eq!(name_for_keysym(0xffea).as_deref(), Some("Alt"), "right Alt");
+        assert_eq!(name_for_keysym(0xffc1).as_deref(), Some("F4"));
+        assert_eq!(name_for_keysym(0x6c1), None, "Cyrillic letter: no key name");
+    }
 
     #[test]
     fn letters_digits_and_function_keys() {

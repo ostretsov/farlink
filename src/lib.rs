@@ -16,6 +16,7 @@ pub mod files;
 pub mod grants;
 pub mod host;
 pub mod install;
+pub mod keygrab;
 pub mod keys;
 pub mod layout;
 pub mod net;

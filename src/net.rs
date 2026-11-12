@@ -2,7 +2,7 @@
 
 use crate::codec::Canvas;
 use crate::codec::Frame;
-use crate::proto::{FileChunk, FsEntry, MonitorInfo, PREVIEW_MAX, Preview, PreviewShot, SessionMsg, TileHeader};
+use crate::proto::{FileChunk, FsEntry, InputEvent, MonitorInfo, PREVIEW_MAX, Preview, PreviewShot, SessionMsg, TileHeader};
 use crate::quality::Quality;
 use crate::server::Overview;
 use crate::util::{url_encode, ws_url};
@@ -502,6 +502,14 @@ impl SessionHandle {
 
     pub fn send(&self, m: SessionMsg) {
         let _ = self.tx.send(m);
+    }
+
+    /// Sends input from another thread (keys read during an Alt+Tab grab).
+    pub fn input_sender(&self) -> impl Fn(InputEvent) + Send + 'static {
+        let tx = self.tx.clone();
+        move |event| {
+            let _ = tx.send(SessionMsg::Input { event });
+        }
     }
 
     /// Put `text` (copied on this computer) on the remote clipboard, unless
