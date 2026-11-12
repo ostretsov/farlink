@@ -407,6 +407,7 @@ pub fn run_screen(
     let mut next_look = Instant::now();
     let mut last_look = Instant::now() - Duration::from_secs(1);
     let mut pointer = PointerSender::default();
+    let mut last_input: Option<Instant> = None;
 
     while !stop.load(Ordering::Relaxed) {
         loop {
@@ -434,8 +435,11 @@ pub fn run_screen(
                 SessionMsg::Input { event } => {
                     let now = Instant::now();
                     idle.activity(now);
-                    if !view_only && let Err(e) = desk.input(&monitors, &event) {
-                        log::debug!("input: {e}");
+                    if !view_only {
+                        last_input = Some(now);
+                        if let Err(e) = desk.input(&monitors, &event) {
+                            log::debug!("input: {e}");
+                        }
                     }
                     next_look = next_look.min(after_input(now, last_look));
                 }
@@ -540,7 +544,8 @@ pub fn run_screen(
         let now = Instant::now();
         let changed = desk.changed();
         if !changed && !idle.recheck_due(now) {
-            next_look = next_after(start, idle.interval(&quality, now), &pointer);
+            let regular = idle.interval(&quality, now);
+            next_look = next_after(start, look_interval(regular, last_input.map(|t| now.duration_since(t)), None), &pointer);
             continue;
         }
         idle.checked(now);
@@ -582,6 +587,7 @@ pub fn run_screen(
                 prev_raw[i] = Some(frame);
                 prepared
             };
+            encoders[i].tight = flow.far();
             match encoders[i].encode(prepared, &quality, m.index, seq) {
                 Ok(msgs) => {
                     if !msgs.is_empty() {
@@ -601,7 +607,10 @@ pub fn run_screen(
             flow.sent(seq, Instant::now());
             idle.activity(Instant::now());
         }
-        next_look = next_after(start, idle.interval(&quality, Instant::now()), &pointer);
+        let now = Instant::now();
+        let regular = idle.interval(&quality, now);
+        let interval = look_interval(regular, last_input.map(|t| now.duration_since(t)), Some(now.duration_since(start)));
+        next_look = next_after(start, interval, &pointer);
     }
 }
 
@@ -629,6 +638,7 @@ impl FlowControl {
     /// A picture not acknowledged after this long is taken as lost, so a
     /// lost ack can't freeze the session.
     pub const LOST_AFTER: Duration = Duration::from_secs(3);
+    pub const FAR: Duration = Duration::from_millis(40);
     /// The best round trip is measured afresh this often (routes change).
     const BASE_FOR: Duration = Duration::from_secs(30);
 
@@ -638,6 +648,12 @@ impl FlowControl {
 
     pub fn window(&self) -> usize {
         self.window
+    }
+
+    /// The viewer is far away (round trip of [`Self::FAR`] or more): bytes
+    /// cost more than CPU there, so lossless parts are compressed harder.
+    pub fn far(&self) -> bool {
+        self.base_rtt.is_some_and(|(rtt, _)| rtt >= Self::FAR)
     }
 
     /// May another picture go now?
@@ -701,6 +717,29 @@ pub const INPUT_FOLLOW_UP: Duration = Duration::from_millis(8);
 pub const MIN_LOOK_GAP: Duration = Duration::from_millis(15);
 /// How often the pointer is checked for viewers that draw it themselves.
 pub const POINTER_EVERY: Duration = Duration::from_millis(15);
+
+/// For this long after input the screen is watched closely: programs answer
+/// a click or key within a few frames, and that answer should not wait for
+/// the next regular look (33 ms apart at 30 pictures per second).
+pub const INPUT_BURST: Duration = Duration::from_millis(200);
+/// Time between cheap "did anything change?" checks during the burst.
+pub const BURST_POLL: Duration = Duration::from_millis(8);
+/// Time between pictures during the burst.
+pub const BURST_FRAME: Duration = Duration::from_millis(16);
+
+/// Time until the next look. `regular`: the normal pace; `since_input`: how
+/// long ago mouse / keyboard input arrived; `cost`: how long this look took
+/// when the screen was read (`None`: the system said nothing changed, which
+/// costs nothing). A slow capture is never repeated faster than it can go.
+pub fn look_interval(regular: Duration, since_input: Option<Duration>, cost: Option<Duration>) -> Duration {
+    if since_input.is_none_or(|t| t >= INPUT_BURST) {
+        return regular;
+    }
+    match cost {
+        None => regular.min(BURST_POLL),
+        Some(cost) => regular.min(BURST_FRAME.max(cost * 2)),
+    }
+}
 
 /// When to look at the screen after input arrived at `now`.
 pub fn after_input(now: Instant, last_look: Instant) -> Instant {
@@ -1244,6 +1283,28 @@ mod tests {
             f.acked(seq, ms(t));
         }
         assert_eq!(f.window(), FlowControl::MIN, "but never below the old fixed two");
+        assert!(f.far(), "100 ms away: worth compressing harder");
+        let mut near = FlowControl::new(t0);
+        assert!(!near.far(), "unknown distance: quick compression");
+        near.sent(1, ms(0));
+        near.acked(1, ms(5));
+        assert!(!near.far());
+    }
+
+    #[test]
+    fn the_screen_is_watched_closely_right_after_input() {
+        let ms = Duration::from_millis;
+        let regular = ms(33);
+        // No input lately: the normal pace.
+        assert_eq!(look_interval(regular, None, None), regular);
+        assert_eq!(look_interval(regular, Some(INPUT_BURST), Some(ms(2))), regular);
+        // Just after input: cheap checks every few ms, pictures at 60 per second.
+        assert_eq!(look_interval(regular, Some(ms(10)), None), BURST_POLL);
+        assert_eq!(look_interval(regular, Some(ms(10)), Some(ms(3))), BURST_FRAME);
+        // A slow capture gets room to breathe, and a faster regular pace wins.
+        assert_eq!(look_interval(regular, Some(ms(10)), Some(ms(12))), ms(24));
+        assert_eq!(look_interval(regular, Some(ms(10)), Some(ms(40))), regular);
+        assert_eq!(look_interval(ms(5), Some(ms(10)), None), ms(5));
     }
 
     #[test]

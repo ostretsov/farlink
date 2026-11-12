@@ -738,6 +738,7 @@ pub fn sample_overview() -> Overview {
             last_update_from: Some("0.0.9".into()),
             checking: false,
         },
+        slow_after_pause_fix: None,
     }
 }
 
@@ -3051,6 +3052,13 @@ fn relay_status(ui: &mut egui::Ui, o: &Overview, after_something: bool) {
         text.push_str(&format!(" · updated {}", ago(t)));
     }
     let mut tip = format!("Relay server version {}", o.server_version);
+    if let Some(fix) = &o.slow_after_pause_fix {
+        text.push_str(" · can be faster");
+        color = AMBER;
+        tip.push_str(&format!(
+            "\nThe relay's Linux slows connections down after every pause, so the picture after a click arrives later.\nRun once on the server (also shown in the web admin):\n{fix}"
+        ));
+    }
     match &u.source {
         Some(repo) => tip.push_str(&format!("\nUpdates itself from github.com/{repo} (hourly)")),
         None => tip.push_str("\nAutomatic updates are off"),

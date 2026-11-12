@@ -172,6 +172,12 @@ where
 
 /// Bind the address the settings ask for and run the server until it fails.
 pub async fn run(relay: crate::server::Shared, cfg: ServerConfig) -> Result<()> {
+    if crate::install::tcp_stays_warm() == Some(false) {
+        log::warn!(
+            "this Linux slows connections down after every pause, so pictures after a click arrive later than they could. Fix (as root): {}",
+            crate::install::TCP_WARM_FIX
+        );
+    }
     let listener = TcpListener::bind(&cfg.bind).await.with_context(|| format!("listening on {}", cfg.bind))?;
     if matches!(cfg.tls, Tls::Auto { .. }) && listener.local_addr()?.port() != 443 {
         log::warn!(

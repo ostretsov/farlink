@@ -205,6 +205,10 @@ function renderServer(admin) {
       : '<span class="muted">not updated since it was installed</span>'],
     ['Published for computers', data.release_version ? esc(data.release_version) : '<span class="muted">nothing yet</span>'],
   ];
+  if (data.slow_after_pause_fix) {
+    rows.push(['Speed', '<span class="tag bad">can be faster</span> This server slows connections down after every pause, so the picture after a click arrives later. Run once on the server:'
+      + `<div class="copybox" style="margin-top:6px"><code class="mono">${esc(data.slow_after_pause_fix)}</code><button type="button" class="small" onclick="copyText(data.slow_after_pause_fix)">Copy</button></div>`]);
+  }
   $('srvInfo').innerHTML = rows.map(([k, v]) => `<tr><td class="muted" style="width:275px">${k}</td><td>${v}</td></tr>`).join('');
 }
 let pendingCheck = false;

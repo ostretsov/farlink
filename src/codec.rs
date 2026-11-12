@@ -264,11 +264,13 @@ struct Encoded {
 
 /// Compress one part of a prepared picture.
 pub fn encode_rect(f: &Frame, r: Rect, q: &Quality) -> Result<(TileFormat, Vec<u8>)> {
-    let e = encode_part(f, r, q)?;
+    let e = encode_part(f, r, q, false)?;
     Ok((e.format, e.data))
 }
 
-fn encode_part(f: &Frame, r: Rect, q: &Quality) -> Result<Encoded> {
+/// `tight`: spend more time on lossless parts to make them smaller (worth it
+/// on a slow or far link, see [`MonitorEncoder::tight`]).
+fn encode_part(f: &Frame, r: Rect, q: &Quality, tight: bool) -> Result<Encoded> {
     let q = q.clamped();
     let mut tile = f.crop(r);
     let jpeg_part = |tile: &Frame, rough: bool| -> Result<Encoded> {
@@ -280,8 +282,8 @@ fn encode_part(f: &Frame, r: Rect, q: &Quality) -> Result<Encoded> {
         quantize(&mut tile, q.color);
         // A palette of the colours really used compresses better than a fixed one.
         let data = match palette_of(&tile) {
-            Some((palette, indexed)) => png_indexed(&tile, &palette, &indexed)?,
-            None => png_lossless(&tile, q.color)?,
+            Some((palette, indexed)) => png_indexed(&tile, &palette, &indexed, tight)?,
+            None => png_lossless(&tile, q.color, tight)?,
         };
         Ok(Encoded { format: TileFormat::Png, data, rough: false })
     };
@@ -299,7 +301,7 @@ fn encode_part(f: &Frame, r: Rect, q: &Quality) -> Result<Encoded> {
             // photos too, and lossless photos are several times bigger.
             if let Some((palette, indexed)) = palette_of(&tile) {
                 if q.color == ColorDepth::Full {
-                    return Ok(Encoded { format: TileFormat::Png, data: png_indexed(&tile, &palette, &indexed)?, rough: false });
+                    return Ok(Encoded { format: TileFormat::Png, data: png_indexed(&tile, &palette, &indexed, tight)?, rough: false });
                 }
                 return lossless(tile);
             }
@@ -336,11 +338,21 @@ fn jpeg(tile: &Frame, quality: u8, color: ColorDepth) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn png_lossless(tile: &Frame, color: ColorDepth) -> Result<Vec<u8>> {
+/// Fast: quickest, about a third bigger. Tight: zlib level 3, the best
+/// trade measured on desktop pictures (higher levels gain 2 % for twice the time).
+fn png_effort(enc: &mut png::Encoder<&mut Vec<u8>>, tight: bool) {
+    if tight {
+        enc.set_deflate_compression(png::DeflateCompression::Level(3));
+    } else {
+        enc.set_compression(png::Compression::Fast);
+    }
+}
+
+fn png_lossless(tile: &Frame, color: ColorDepth, tight: bool) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut enc = png::Encoder::new(&mut buf, tile.width, tile.height);
     enc.set_depth(png::BitDepth::Eight);
-    enc.set_compression(png::Compression::Fast);
+    png_effort(&mut enc, tight);
     let data: Vec<u8> = match color {
         ColorDepth::Gray => {
             enc.set_color(png::ColorType::Grayscale);
@@ -355,7 +367,7 @@ fn png_lossless(tile: &Frame, color: ColorDepth) -> Result<Vec<u8>> {
         ColorDepth::Full | ColorDepth::High => {
             // Few colours: a palette PNG is much smaller and quicker.
             if let Some((palette, indexed)) = palette_of(tile) {
-                return png_indexed(tile, &palette, &indexed);
+                return png_indexed(tile, &palette, &indexed, tight);
             }
             enc.set_color(png::ColorType::Rgb);
             tile.rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect()
@@ -367,11 +379,11 @@ fn png_lossless(tile: &Frame, color: ColorDepth) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn png_indexed(tile: &Frame, palette: &[u8], indexed: &[u8]) -> Result<Vec<u8>> {
+fn png_indexed(tile: &Frame, palette: &[u8], indexed: &[u8], tight: bool) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut enc = png::Encoder::new(&mut buf, tile.width, tile.height);
     enc.set_depth(png::BitDepth::Eight);
-    enc.set_compression(png::Compression::Fast);
+    png_effort(&mut enc, tight);
     enc.set_color(png::ColorType::Indexed);
     enc.set_palette(palette.to_vec());
     let mut w = enc.write_header()?;
@@ -428,18 +440,18 @@ fn encode_threads() -> usize {
 }
 
 /// Compress many parts, in parallel when there is enough work.
-fn encode_parts(f: &Frame, rects: &[Rect], q: &Quality) -> Vec<Result<Encoded>> {
+fn encode_parts(f: &Frame, rects: &[Rect], q: &Quality, tight: bool) -> Vec<Result<Encoded>> {
     let pixels: u64 = rects.iter().map(|r| r.w as u64 * r.h as u64).sum();
     let threads = encode_threads().min(rects.len());
     if threads <= 1 || pixels < 200_000 {
-        return rects.iter().map(|r| encode_part(f, *r, q)).collect();
+        return rects.iter().map(|r| encode_part(f, *r, q, tight)).collect();
     }
     let mut out: Vec<Option<Result<Encoded>>> = (0..rects.len()).map(|_| None).collect();
     std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
                 s.spawn(move || {
-                    rects.iter().enumerate().skip(t).step_by(threads).map(|(i, r)| (i, encode_part(f, *r, q))).collect::<Vec<_>>()
+                    rects.iter().enumerate().skip(t).step_by(threads).map(|(i, r)| (i, encode_part(f, *r, q, tight))).collect::<Vec<_>>()
                 })
             })
             .collect();
@@ -470,6 +482,10 @@ pub struct MonitorEncoder {
     prev: Option<Frame>,
     /// Per 64×64 tile (row by row): sent as rough JPEG, worth sharpening.
     rough: Vec<bool>,
+    /// Compress lossless parts harder (about 30 % smaller, some more CPU):
+    /// set by the host when the viewer is far away, where every extra
+    /// kilobyte costs more than the milliseconds spent here.
+    pub tight: bool,
 }
 
 impl MonitorEncoder {
@@ -532,7 +548,7 @@ impl MonitorEncoder {
         let cols = frame.width.div_ceil(TILE) as usize;
         let n = rects.len();
         let mut out = Vec::with_capacity(n);
-        for (i, (r, e)) in rects.iter().zip(encode_parts(frame, rects, q)).enumerate() {
+        for (i, (r, e)) in rects.iter().zip(encode_parts(frame, rects, q, self.tight)).enumerate() {
             let e = e?;
             for ty in r.y / TILE..(r.y + r.h).div_ceil(TILE) {
                 for tx in r.x / TILE..(r.x + r.w).div_ceil(TILE) {
@@ -734,6 +750,25 @@ mod tests {
         assert_eq!(fmt, TileFormat::Png);
         let p = decode_tile(fmt, &data).unwrap().pixel(15, 11);
         assert!(p[0] == p[1] && p[1] == p[2], "grey: {p:?}");
+    }
+
+    #[test]
+    fn tight_lossless_is_smaller_and_still_exact() {
+        let f = desktop_like(640, 256);
+        let q = Quality { codec: Codec::Png, ..Quality::default() };
+        let size = |tight: bool| {
+            let mut enc = MonitorEncoder { tight, ..Default::default() };
+            let msgs = enc.encode(f.clone(), &q, 0, 1).unwrap();
+            let mut canvas = Canvas::default();
+            for m in &msgs {
+                let (h, data) = TileHeader::decode(m).unwrap();
+                canvas.apply(&h, data).unwrap();
+            }
+            assert_eq!(canvas.frame.as_ref().unwrap().rgba, f.rgba, "lossless either way");
+            msgs.iter().map(|m| m.len()).sum::<usize>()
+        };
+        let (fast, tight) = (size(false), size(true));
+        assert!(tight < fast, "tight {tight} should be smaller than fast {fast}");
     }
 
     #[test]

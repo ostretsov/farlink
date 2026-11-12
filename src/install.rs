@@ -211,6 +211,27 @@ pub fn valid_domain(d: &str) -> bool {
 /// The server answers HTTPS on `port` itself. On 443 it fetches and renews a
 /// Let's Encrypt certificate on its own; on any other port Let's Encrypt can't
 /// check the domain, so `cert` (full chain + key PEM files) is required.
+/// Linux slows a connection down to its starting speed after every short
+/// pause (`tcp_slow_start_after_idle`, on by default). A remote desktop is
+/// mostly pauses: the big picture after a click then needs several round
+/// trips instead of one (measured: +540 ms for 300 KB at 180 ms away). The
+/// relay's installer switches that off; [`tcp_stays_warm`] checks it.
+pub const TCP_WARM_SYSCTL: &str = "/etc/sysctl.d/60-farlink.conf";
+pub const TCP_WARM_CONTENTS: &str =
+    "# Farlink relay: keep connections at speed after a pause (pictures after a click arrive in one go).
+net.ipv4.tcp_slow_start_after_idle = 0
+";
+/// The command that fixes an already installed relay (run as root).
+pub const TCP_WARM_FIX: &str =
+    "echo 'net.ipv4.tcp_slow_start_after_idle = 0' | sudo tee /etc/sysctl.d/60-farlink.conf && sudo sysctl -p /etc/sysctl.d/60-farlink.conf";
+
+/// Does this Linux keep connections at speed after a pause? `None`: not
+/// Linux, or it can't be read.
+pub fn tcp_stays_warm() -> Option<bool> {
+    let v = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_slow_start_after_idle").ok()?;
+    Some(v.trim() == "0")
+}
+
 /// `github` (`owner/repo`): the server then installs that repository's
 /// releases on its own (itself + the programs for computers).
 pub fn server_linux_plan(
@@ -275,6 +296,9 @@ pub fn server_linux_plan(
         // The service replaces its own program when it updates itself.
         Step::run("chown", &["-R", "farlink:farlink", "/opt/farlink-server"]),
         Step::WriteFile { path: "/etc/systemd/system/farlink-server.service".into(), contents: server_unit(&bin), mode: Some(0o644) },
+        // Keep connections fast after a pause (see `TCP_WARM_SYSCTL`).
+        Step::WriteFile { path: TCP_WARM_SYSCTL.into(), contents: TCP_WARM_CONTENTS.into(), mode: Some(0o644) },
+        Step::try_run("sysctl", &["-p", TCP_WARM_SYSCTL]),
     ]);
     if Path::new(OLD_CADDY_SITE).exists() {
         // Upgrading from the Caddy setup: its Farlink site points at the old
@@ -498,6 +522,12 @@ mod tests {
         let cmds = runs(&steps);
         assert!(cmds.contains(&"ufw allow 443/tcp".to_string()));
         assert!(!cmds.iter().any(|c| c.contains("80/tcp")), "port 80 is left alone");
+        assert!(
+            steps.iter().any(|s| matches!(s, Step::WriteFile { path, contents, .. }
+                if path == Path::new(TCP_WARM_SYSCTL) && contents.contains("net.ipv4.tcp_slow_start_after_idle = 0"))),
+            "connections stay at speed after a pause"
+        );
+        assert!(cmds.contains(&format!("sysctl -p {TCP_WARM_SYSCTL}")));
         assert!(!cmds.iter().any(|c| c.contains("apt-get install")), "no Caddy any more");
         assert_eq!(cfg.update_from_github, None);
         assert!(server_unit(Path::new("/x")).contains("ReadWritePaths=/var/lib/farlink-server /opt/farlink-server"));

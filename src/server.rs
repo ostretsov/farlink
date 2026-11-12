@@ -862,6 +862,11 @@ pub struct Overview {
     /// The server's own updates (what went wrong: admin only).
     #[serde(default)]
     pub server_update: crate::server_update::UpdateStatus,
+    /// The command that makes this relay faster, when its Linux still slows
+    /// connections down after every pause (admin only; see
+    /// `install::TCP_WARM_SYSCTL`).
+    #[serde(default)]
+    pub slow_after_pause_fix: Option<String>,
 }
 
 fn admin_role() -> String {
@@ -881,6 +886,7 @@ pub fn overview_for(r: &Relay, who: &Who) -> Overview {
         o.grants.clear();
         o.users.clear();
         o.install_url.clear();
+        o.slow_after_pause_fix = None;
         o.role = "user".into();
         if !o.server_update.last_check_ok && o.server_update.last_check.is_some() {
             o.server_update.last_check_result = "failed".into();
@@ -952,6 +958,7 @@ pub fn overview(r: &Relay) -> Overview {
         user_name: "Administrator".into(),
         users,
         server_update: r.update_status(),
+        slow_after_pause_fix: (crate::install::tcp_stays_warm() == Some(false)).then(|| crate::install::TCP_WARM_FIX.to_string()),
     }
 }
 
