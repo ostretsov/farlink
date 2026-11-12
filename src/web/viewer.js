@@ -159,7 +159,7 @@
     const q = Object.assign({}, PRESETS[$('quality').value], { color: $('color').value });
     send({ t: 'quality', quality: q });
   }
-  // Remember the picture choice in this browser (Balanced / full colour by default).
+  // Remember the picture choice in this browser (Balanced / colour optimised by default).
   const remembered = (key, sel) => {
     try {
       const v = localStorage.getItem(key);

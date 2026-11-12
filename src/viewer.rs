@@ -1185,11 +1185,15 @@ impl ViewerApp {
         let who = self.overview.as_ref().map(|o| o.user_name.clone()).unwrap_or_default();
         let version = self.overview.as_ref().map(|o| format!(" {}", o.server_version)).unwrap_or_default();
         let text = if who.is_empty() { format!("{server}{version}") } else { format!("{server}{version} · {who}") };
-        let dot = if self.overview_err.is_some() { DANGER } else { OK };
+        // Hover: the relay's version and updates; amber when something needs a look.
+        let (tip, warn) = self.overview.as_ref().map(relay_details).unwrap_or_default();
+        let dot = if self.overview_err.is_some() { DANGER } else if warn { AMBER } else { OK };
         let resp = status_text(ui, dot, &text);
-        if let Some(e) = &self.overview_err {
-            resp.on_hover_text(format!("{}: {e}", self.cfg.server_url));
-        }
+        match &self.overview_err {
+            Some(e) => resp.on_hover_text(format!("{}: {e}", self.cfg.server_url)),
+            None if !tip.is_empty() => resp.on_hover_text(tip),
+            None => resp,
+        };
     }
 
     /// "Farlink x.y.z · up to date · Check for updates" in the bottom bar.
@@ -1247,10 +1251,7 @@ impl ViewerApp {
             .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(14, 4)).stroke(Stroke::new(1.0, LINE)))
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
-                    let shown = self.update_status(ui);
-                    if let Some(o) = &self.overview {
-                        relay_status(ui, o, shown);
-                    }
+                    self.update_status(ui);
                     if self.toast.as_ref().is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(5)) {
                         self.toast = None;
                     }
@@ -2452,7 +2453,7 @@ fn monitor_bar(ui: &mut egui::Ui, s: &mut OpenSession, mon: &MonitorInfo, view_o
                 s.handle.send(SessionMsg::Input { event: InputEvent::CtrlAltDel });
             }
             let before = s.quality;
-            egui::ComboBox::from_id_salt("colors").selected_text(s.quality.color.short_label()).width(110.0).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("colors").selected_text(s.quality.color.short_label()).width(132.0).show_ui(ui, |ui| {
                 for c in ColorDepth::ALL {
                     if ui.add(egui::Button::new(c.label()).selected(s.quality.color == c).frame(false)).clicked() {
                         s.quality.color = c;
@@ -3031,47 +3032,36 @@ fn paint_job(p: &egui::Painter, pos: Pos2, mut job: egui::text::LayoutJob, max_w
     p.galley(at, galley, TEXT);
 }
 
-/// Status bar: relay version, when it last looked for and installed an update
-/// (details on hover).
-fn relay_status(ui: &mut egui::Ui, o: &Overview, after_something: bool) {
+/// What hovering the relay's address in the status bar tells: version, its
+/// own updates, and what could be better. The flag: something needs a look
+/// (update check failed, connections slow down after pauses).
+fn relay_details(o: &Overview) -> (String, bool) {
     let u = &o.server_update;
     let ago = |t: u64| format!("{} ago", crate::util::human_duration(o.now.saturating_sub(t)));
-    // The version itself is on the right, next to the relay's address.
-    let mut text = format!("{}relay", if after_something { "· " } else { "" });
-    let mut color = MUTED;
-    if u.checking {
-        text.push_str(" · checking for updates…");
-    } else if let Some(t) = u.last_check {
-        text.push_str(&format!(" · checked {}", ago(t)));
-        if !u.last_check_ok {
-            text.push_str(" (failed)");
-            color = AMBER;
-        }
-    }
-    if let Some(t) = u.last_update {
-        text.push_str(&format!(" · updated {}", ago(t)));
-    }
+    let mut warn = false;
     let mut tip = format!("Relay server version {}", o.server_version);
     if let Some(fix) = &o.slow_after_pause_fix {
-        text.push_str(" · can be faster");
-        color = AMBER;
+        warn = true;
         tip.push_str(&format!(
-            "\nThe relay's Linux slows connections down after every pause, so the picture after a click arrives later.\nRun once on the server (also shown in the web admin):\n{fix}"
+            "\nCan be faster: the relay's Linux slows connections down after every pause, so the picture after a click arrives later.\nRun once on the server (also shown in the web admin):\n{fix}"
         ));
     }
     match &u.source {
         Some(repo) => tip.push_str(&format!("\nUpdates itself from github.com/{repo} (hourly)")),
         None => tip.push_str("\nAutomatic updates are off"),
     }
-    if let Some(t) = u.last_check {
-        tip.push_str(&format!("\nLast check: {} — {}", ago(t), u.last_check_result));
+    if u.checking {
+        tip.push_str("\nChecking for updates…");
+    } else if let Some(t) = u.last_check {
+        warn |= !u.last_check_ok;
+        tip.push_str(&format!("\nLast check: {} — {}{}", ago(t), if u.last_check_ok { "" } else { "failed: " }, u.last_check_result));
     }
     match (u.last_update, &u.last_update_from) {
         (Some(t), Some(from)) => tip.push_str(&format!("\nLast update: {} ({from} → {})", ago(t), u.version)),
         (Some(t), None) => tip.push_str(&format!("\nLast update: {}", ago(t))),
         _ => tip.push_str("\nNot updated since it was installed"),
     }
-    ui.label(RichText::new(text).color(color).size(12.0)).on_hover_text(tip);
+    (tip, warn)
 }
 
 #[cfg(test)]

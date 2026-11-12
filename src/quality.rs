@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ColorDepth {
+    /// The colours the remote screen really uses, at most 256 of them,
+    /// learned by the host (`palette.rs`). Parts that need more (photos,
+    /// video) are sent as with [`ColorDepth::Full`].
+    Optimized,
     /// 16 million colours (24-bit).
     Full,
     /// 65 thousand colours (16-bit).
@@ -18,9 +22,11 @@ pub enum ColorDepth {
 }
 
 impl ColorDepth {
-    pub const ALL: [ColorDepth; 4] = [ColorDepth::Full, ColorDepth::High, ColorDepth::Low, ColorDepth::Gray];
+    pub const ALL: [ColorDepth; 5] =
+        [ColorDepth::Optimized, ColorDepth::Full, ColorDepth::High, ColorDepth::Low, ColorDepth::Gray];
     pub fn label(self) -> &'static str {
         match self {
+            ColorDepth::Optimized => "Colour optimised (the screen's own 256)",
             ColorDepth::Full => "Full colour (24-bit)",
             ColorDepth::High => "High colour (16-bit)",
             ColorDepth::Low => "256 colours (8-bit)",
@@ -29,6 +35,7 @@ impl ColorDepth {
     }
     pub fn short_label(self) -> &'static str {
         match self {
+            ColorDepth::Optimized => "Colour optimised",
             ColorDepth::Full => "Full colour",
             ColorDepth::High => "High colour",
             ColorDepth::Low => "256 colours",
@@ -116,7 +123,7 @@ impl Quality {
         match p {
             Preset::Fast => Quality { scale_pct: 75, max_fps: 20, codec: Codec::Jpeg, jpeg_quality: 50, color: ColorDepth::Full },
             Preset::Balanced | Preset::Custom => {
-                Quality { scale_pct: 100, max_fps: 30, codec: Codec::Auto, jpeg_quality: 75, color: ColorDepth::Full }
+                Quality { scale_pct: 100, max_fps: 30, codec: Codec::Auto, jpeg_quality: 75, color: ColorDepth::Optimized }
             }
             Preset::Sharp => Quality { scale_pct: 100, max_fps: 30, codec: Codec::Png, jpeg_quality: 90, color: ColorDepth::Full },
         }
@@ -173,6 +180,7 @@ impl Quality {
             Codec::Png => "PNG".to_string(),
         };
         let color = match q.color {
+            ColorDepth::Optimized => "optimised",
             ColorDepth::Full => "24-bit",
             ColorDepth::High => "16-bit",
             ColorDepth::Low => "8-bit",
@@ -226,7 +234,7 @@ mod tests {
     #[test]
     fn summary_text() {
         assert_eq!(Quality::preset(Preset::Fast).summary(), "75% · 20 fps · JPEG 50 · 24-bit");
-        assert_eq!(Quality::preset(Preset::Balanced).summary(), "100% · 30 fps · Auto · 24-bit");
+        assert_eq!(Quality::preset(Preset::Balanced).summary(), "100% · 30 fps · Auto · optimised");
     }
 
     #[test]

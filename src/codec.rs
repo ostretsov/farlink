@@ -8,6 +8,7 @@
 //!    (Auto: lossless palette PNG for text/windows, JPEG for photos, and
 //!    rough JPEG parts sharpened once they stop changing).
 
+use crate::palette::Palette;
 use crate::proto::{FLAG_LAST, TileFormat, TileHeader};
 use crate::quality::{Codec, ColorDepth, Quality};
 use anyhow::{Context, Result};
@@ -154,7 +155,8 @@ pub fn scale(src: &Frame, w: u32, h: u32) -> Frame {
 /// Reduce colours in place.
 pub fn quantize(f: &mut Frame, depth: ColorDepth) {
     match depth {
-        ColorDepth::Full => {}
+        // Optimised colours are chosen per part with the host's palette (`encode_part`).
+        ColorDepth::Full | ColorDepth::Optimized => {}
         ColorDepth::High => {
             for px in f.rgba.chunks_exact_mut(4) {
                 px[0] = (px[0] & 0xF8) | (px[0] >> 5);
@@ -264,15 +266,28 @@ struct Encoded {
 
 /// Compress one part of a prepared picture.
 pub fn encode_rect(f: &Frame, r: Rect, q: &Quality) -> Result<(TileFormat, Vec<u8>)> {
-    let e = encode_part(f, r, q, false)?;
+    let e = encode_part(f, r, q, false, None)?;
     Ok((e.format, e.data))
 }
 
 /// `tight`: spend more time on lossless parts to make them smaller (worth it
 /// on a slow or far link, see [`MonitorEncoder::tight`]).
-fn encode_part(f: &Frame, r: Rect, q: &Quality, tight: bool) -> Result<Encoded> {
-    let q = q.clamped();
+///
+/// `palette`: the screen's own colours ([`ColorDepth::Optimized`]). A part
+/// close enough to them goes as a small palette picture; other parts
+/// (photos, video) as if full colour was chosen.
+fn encode_part(f: &Frame, r: Rect, q: &Quality, tight: bool, palette: Option<&Palette>) -> Result<Encoded> {
+    let mut q = q.clamped();
     let mut tile = f.crop(r);
+    if q.color == ColorDepth::Optimized {
+        if let Some(p) = palette.filter(|_| q.codec != Codec::Jpeg) {
+            let m = p.map(&tile);
+            if m.far_share <= crate::palette::MAX_FAR_SHARE {
+                return Ok(Encoded { format: TileFormat::Png, data: png_indexed(&tile, &m.palette, &m.indexed, tight)?, rough: false });
+            }
+        }
+        q.color = ColorDepth::Full;
+    }
     let jpeg_part = |tile: &Frame, rough: bool| -> Result<Encoded> {
         // 16-bit colour only adds banding to a JPEG (bigger, not smaller): JPEG
         // parts use the real colours, or one grey channel for greyscale.
@@ -364,7 +379,7 @@ fn png_lossless(tile: &Frame, color: ColorDepth, tight: bool) -> Result<Vec<u8>>
             enc.set_palette(palette);
             tile.rgba.chunks_exact(4).map(|p| index_332(p[0], p[1], p[2])).collect()
         }
-        ColorDepth::Full | ColorDepth::High => {
+        ColorDepth::Full | ColorDepth::High | ColorDepth::Optimized => {
             // Few colours: a palette PNG is much smaller and quicker.
             if let Some((palette, indexed)) = palette_of(tile) {
                 return png_indexed(tile, &palette, &indexed, tight);
@@ -440,18 +455,18 @@ fn encode_threads() -> usize {
 }
 
 /// Compress many parts, in parallel when there is enough work.
-fn encode_parts(f: &Frame, rects: &[Rect], q: &Quality, tight: bool) -> Vec<Result<Encoded>> {
+fn encode_parts(f: &Frame, rects: &[Rect], q: &Quality, tight: bool, palette: Option<&Palette>) -> Vec<Result<Encoded>> {
     let pixels: u64 = rects.iter().map(|r| r.w as u64 * r.h as u64).sum();
     let threads = encode_threads().min(rects.len());
     if threads <= 1 || pixels < 200_000 {
-        return rects.iter().map(|r| encode_part(f, *r, q, tight)).collect();
+        return rects.iter().map(|r| encode_part(f, *r, q, tight, palette)).collect();
     }
     let mut out: Vec<Option<Result<Encoded>>> = (0..rects.len()).map(|_| None).collect();
     std::thread::scope(|s| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
                 s.spawn(move || {
-                    rects.iter().enumerate().skip(t).step_by(threads).map(|(i, r)| (i, encode_part(f, *r, q, tight))).collect::<Vec<_>>()
+                    rects.iter().enumerate().skip(t).step_by(threads).map(|(i, r)| (i, encode_part(f, *r, q, tight, palette))).collect::<Vec<_>>()
                 })
             })
             .collect();
@@ -486,9 +501,17 @@ pub struct MonitorEncoder {
     /// set by the host when the viewer is far away, where every extra
     /// kilobyte costs more than the milliseconds spent here.
     pub tight: bool,
+    /// The screen's own colours, for [`ColorDepth::Optimized`] (the host
+    /// learns them, see `palette.rs`). Without one such pictures go in full colour.
+    pub palette: Option<std::sync::Arc<Palette>>,
 }
 
 impl MonitorEncoder {
+    /// Nothing sent yet (or since [`Self::reset`]): the next picture goes whole.
+    pub fn is_reset(&self) -> bool {
+        self.prev.is_none()
+    }
+
     /// Forget the last picture so the next one is sent completely.
     pub fn reset(&mut self) {
         self.prev = None;
@@ -548,7 +571,7 @@ impl MonitorEncoder {
         let cols = frame.width.div_ceil(TILE) as usize;
         let n = rects.len();
         let mut out = Vec::with_capacity(n);
-        for (i, (r, e)) in rects.iter().zip(encode_parts(frame, rects, q, self.tight)).enumerate() {
+        for (i, (r, e)) in rects.iter().zip(encode_parts(frame, rects, q, self.tight, self.palette.as_deref())).enumerate() {
             let e = e?;
             for ty in r.y / TILE..(r.y + r.h).div_ceil(TILE) {
                 for tx in r.x / TILE..(r.x + r.w).div_ceil(TILE) {
@@ -772,6 +795,51 @@ mod tests {
     }
 
     #[test]
+    fn optimised_colours_use_the_screens_palette_where_it_fits() {
+        // A "window": flat areas and text in a handful of colours, with slightly noisy shades.
+        let mut f = Frame::filled(512, 128, [250, 250, 250, 255]);
+        f.fill_rect(Rect { x: 0, y: 0, w: 512, h: 24 }, [0, 102, 204, 255]);
+        for (i, px) in f.rgba.chunks_exact_mut(4).enumerate() {
+            if i % 7 == 0 {
+                px[0] = px[0].saturating_sub((i % 5) as u8); // 1-4 levels off: invisible
+            }
+            if i % 11 == 0 {
+                px[..3].copy_from_slice(&[30, 30, 30]);
+            }
+        }
+        let mut learner = crate::palette::PaletteLearner::default();
+        let now = std::time::Instant::now();
+        learner.observe(&f, now);
+        learner.step(now);
+        let q = Quality { codec: Codec::Png, color: ColorDepth::Optimized, ..Quality::default() };
+        let run = |palette: Option<std::sync::Arc<Palette>>, frame: &Frame| {
+            let mut enc = MonitorEncoder { palette, ..Default::default() };
+            let msgs = enc.encode(frame.clone(), &q, 0, 1).unwrap();
+            let mut canvas = Canvas::default();
+            for m in &msgs {
+                let (h, data) = TileHeader::decode(m).unwrap();
+                canvas.apply(&h, data).unwrap();
+            }
+            (msgs.iter().map(|m| m.len()).sum::<usize>(), canvas.frame.unwrap())
+        };
+        let (plain, exact) = run(None, &f);
+        assert_eq!(exact.rgba, f.rgba, "without a palette: full colour, lossless");
+        let (small, shown) = run(learner.palette(), &f);
+        assert!(small <= plain, "palette {small} vs full colour {plain}");
+        let worst = f.rgba.iter().zip(&shown.rgba).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+        assert!(worst <= 12, "colours stay close: worst channel difference {worst}");
+
+        // A photo-like picture does not fit 256 colours: it is sent in its real colours.
+        let photo = gradient(256, 128);
+        let (_, shown) = run(learner.palette(), &photo);
+        assert_eq!(shown.rgba, photo.rgba, "lossless codec: exact when the palette does not fit");
+        let auto = Quality { codec: Codec::Auto, ..q };
+        let mut enc = MonitorEncoder { palette: learner.palette(), ..Default::default() };
+        let msgs = enc.encode(photo.clone(), &auto, 0, 1).unwrap();
+        assert!(msgs.iter().all(|m| TileHeader::decode(m).unwrap().0.format == TileFormat::Jpeg), "Auto: photos stay JPEG");
+    }
+
+    #[test]
     fn fewer_colours_means_smaller_png() {
         // Photo-like noisy picture (smooth gradients compress too well to compare).
         let mut raw = Frame::new(256, 256);
@@ -957,20 +1025,39 @@ mod bench_colors {
     #[test]
     #[ignore]
     fn bench_color_depths() {
+        // BENCH_PNGS=a.png,b.png cargo test --release --lib bench_color_depths -- --ignored --nocapture
         let paths = std::env::var("BENCH_PNGS").unwrap();
         for p in paths.split(',') {
             let img = image::open(p).unwrap().to_rgba8();
             let raw = Frame { width: img.width(), height: img.height(), rgba: img.into_raw() };
-            for depth in ColorDepth::ALL {
-                let q = Quality { color: depth, ..Quality::default() };
-                let t = std::time::Instant::now();
-                let mut bytes = 0;
-                for _ in 0..5 {
-                    let f = raw.clone();
-                    let mut enc = MonitorEncoder::default();
-                    bytes = enc.encode(f, &q, 0, 1).unwrap().iter().map(|m| m.len()).sum::<usize>();
+            let name = std::path::Path::new(p).file_name().unwrap().to_string_lossy().to_string();
+            for codec in [Codec::Auto, Codec::Png] {
+                for depth in ColorDepth::ALL {
+                    for tight in [false, true] {
+                        let q = Quality { color: depth, codec, ..Quality::default() };
+                        let mut learner = crate::palette::PaletteLearner::default();
+                        let now = std::time::Instant::now();
+                        learner.observe(&raw, now);
+                        learner.step(now);
+                        let palette = (depth == ColorDepth::Optimized).then(|| learner.palette()).flatten();
+                        let t = std::time::Instant::now();
+                        let (mut bytes, mut by_palette) = (0, 0);
+                        for _ in 0..5 {
+                            let mut enc = MonitorEncoder { tight, palette: palette.clone(), ..Default::default() };
+                            let msgs = enc.encode(raw.clone(), &q, 0, 1).unwrap();
+                            bytes = msgs.iter().map(|m| m.len()).sum::<usize>();
+                            by_palette = msgs.iter().filter(|m| TileHeader::decode(m).unwrap().0.format == TileFormat::Png).count() * 100 / msgs.len();
+                        }
+                        eprintln!(
+                            "{name} {}x{} {codec:?} {depth:?}{}: {:.1} ms, {} KB, {by_palette}% of parts PNG",
+                            raw.width,
+                            raw.height,
+                            if tight { " tight" } else { "" },
+                            t.elapsed().as_secs_f64() * 200.0,
+                            bytes / 1024
+                        );
+                    }
                 }
-                eprintln!("{p} {}x{} {depth:?}: {:.1} ms, {} KB", raw.width, raw.height, t.elapsed().as_secs_f64() * 200.0, bytes / 1024);
             }
         }
     }

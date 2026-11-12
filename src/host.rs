@@ -23,6 +23,8 @@ const UPDATE_CHECK: Duration = Duration::from_secs(6 * 3600);
 const HEARTBEAT: Duration = Duration::from_secs(30);
 /// A screen still for this long gets its rough JPEG parts sent again sharp.
 const REFINE_AFTER: Duration = Duration::from_millis(300);
+/// A screen still for this long is sent again after its palette was replaced.
+const PALETTE_REPAINT_AFTER: Duration = Duration::from_millis(500);
 
 #[derive(Clone)]
 pub struct HostOptions {
@@ -408,6 +410,11 @@ pub fn run_screen(
     let mut last_look = Instant::now() - Duration::from_secs(1);
     let mut pointer = PointerSender::default();
     let mut last_input: Option<Instant> = None;
+    // "Colour optimised": the screen's own colours, learned as pictures go by.
+    let mut learner = crate::palette::PaletteLearner::default();
+    // The palette was replaced: the viewer's picture was drawn with the old
+    // one, so everything is sent again once the screen is still.
+    let mut repaint_for_palette = false;
 
     while !stop.load(Ordering::Relaxed) {
         loop {
@@ -510,6 +517,19 @@ pub fn run_screen(
             continue;
         }
 
+        let optimised = quality.color == crate::quality::ColorDepth::Optimized && quality.codec != crate::quality::Codec::Jpeg;
+        if optimised {
+            repaint_for_palette |= learner.step(start);
+            if repaint_for_palette && last_change.iter().all(|t| t.elapsed() >= PALETTE_REPAINT_AFTER) {
+                repaint_for_palette = false;
+                encoders.iter_mut().for_each(|e| e.reset());
+                prev_raw.iter_mut().for_each(|p| *p = None);
+                idle.activity(start); // look now, not at the idle pace
+            }
+        } else {
+            repaint_for_palette = false;
+        }
+
         // Auto quality: parts first sent as rough JPEG (photos, video) are
         // sent again sharp once that screen has been still for a moment.
         let mut refined = false;
@@ -542,7 +562,12 @@ pub fn run_screen(
         // Nothing changed on screen (X11 tells us), and no safety re-check is
         // due: don't even read the screen.
         let now = Instant::now();
-        let changed = desk.changed();
+        // After a reset (new palette, refresh...) the next picture is sent whole.
+        let reset = monitors
+            .iter()
+            .zip(&encoders)
+            .any(|(m, e)| e.is_reset() && watch.as_ref().is_none_or(|w| w.contains(&m.index)));
+        let changed = desk.changed() || reset;
         if !changed && !idle.recheck_due(now) {
             let regular = idle.interval(&quality, now);
             next_look = next_after(start, look_interval(regular, last_input.map(|t| now.duration_since(t)), None), &pointer);
@@ -588,6 +613,15 @@ pub fn run_screen(
                 prepared
             };
             encoders[i].tight = flow.far();
+            if optimised {
+                learner.observe(&prepared, start);
+                if learner.palette().is_none() {
+                    learner.step(start); // the first palette, before the first picture
+                }
+                encoders[i].palette = learner.palette();
+            } else {
+                encoders[i].palette = None;
+            }
             match encoders[i].encode(prepared, &quality, m.index, seq) {
                 Ok(msgs) => {
                     if !msgs.is_empty() {

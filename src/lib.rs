@@ -20,6 +20,7 @@ pub mod keygrab;
 pub mod keys;
 pub mod layout;
 pub mod net;
+pub mod palette;
 pub mod proto;
 pub mod quality;
 pub mod server;
