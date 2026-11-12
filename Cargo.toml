@@ -1,6 +1,6 @@
 [package]
 name = "farlink"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2024"
 description = "Farlink: self-hosted remote desktop (viewer, relay server with web admin, and host helper)"
 default-run = "farlink"
