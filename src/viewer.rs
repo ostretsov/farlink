@@ -64,7 +64,7 @@ pub fn run(opts: ViewerOptions) -> eframe::Result<()> {
     let _ = app_exe();
     let native = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
-            .with_title("Farlink")
+            .with_title(format!("Farlink {}", crate::VERSION))
             .with_app_id("farlink") // X11 WM_CLASS / Wayland app id: matches farlink.desktop
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([820.0, 520.0])
@@ -141,7 +141,10 @@ struct OpenSession {
     closed: HashSet<u8>,
     mods: egui::Modifiers,
     scroll_acc: Vec2,
-    fullscreen: HashSet<u8>,
+    /// Screens in full screen that were maximised before: GNOME ignores
+    /// "leave full screen" for a maximised window, so it is un-maximised on
+    /// the way in and maximised again on the way out.
+    max_before_fullscreen: HashSet<u8>,
     minimized: HashSet<u8>,
     /// Original size or fit to window (all screens of this session).
     scale: ScaleMode,
@@ -171,6 +174,10 @@ struct OpenSession {
     pointer_textures: HashMap<u32, (egui::TextureHandle, [u32; 4])>,
     /// Remote pointer position (virtual-desktop pixels) and shape id.
     remote_pointer: Option<(i32, i32, u32)>,
+    /// Opened with "Files": no screen windows (the helper captures nothing),
+    /// ends when the file browser is closed. "Show screens" turns it into a
+    /// normal connection.
+    files_only: bool,
 }
 
 /// Two-pane file browser: this computer on the left, the remote one on the right.
@@ -941,7 +948,7 @@ impl ViewerApp {
             closed: HashSet::new(),
             mods: egui::Modifiers::default(),
             scroll_acc: Vec2::ZERO,
-            fullscreen: HashSet::new(),
+            max_before_fullscreen: HashSet::new(),
             minimized: HashSet::new(),
             scale: self.cfg.scale_mode,
             scale_changed: false,
@@ -956,8 +963,18 @@ impl ViewerApp {
             focused: HashSet::new(),
             pointer_textures: HashMap::new(),
             remote_pointer: None,
+            files_only: false,
         });
         self.next_session += 1;
+    }
+
+    /// Exchange files with a computer without seeing or controlling its screens.
+    fn files_machine(&mut self, ctx: &egui::Context, m: &MachineSummary) {
+        self.connect_machine(ctx, m, false);
+        if let Some(s) = self.sessions.last_mut().filter(|s| s.machine_id.as_deref() == Some(m.id.as_str())) {
+            s.files_only = true;
+            s.open_files();
+        }
     }
 
     fn connect_machine(&mut self, ctx: &egui::Context, m: &MachineSummary, view_only: bool) {
@@ -1138,87 +1155,76 @@ impl ViewerApp {
 
     // -------------------------------------------------------------- top bar
 
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
-        egui::Panel::top("top")
-            .exact_size(50.0)
-            .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(14, 8)).stroke(Stroke::new(1.0, LINE)))
-            .show(ui, |ui| {
-                ui.horizontal_centered(|ui| {
-                    let (dot, text) = if self.demo {
-                        (AMBER, "Sample computers (demo)".to_string())
-                    } else if self.signed_in() {
-                        let who = self.overview.as_ref().map(|o| o.user_name.clone()).unwrap_or_default();
-                        let text = if who.is_empty() { self.cfg.server_url.clone() } else { format!("{} · {who}", self.cfg.server_url) };
-                        (if self.overview_err.is_some() { DANGER } else { OK }, text)
-                    } else {
-                        (MUTED, "Not connected".to_string())
-                    };
-                    // Right to left: "Sign out", then who is signed in where, then the rest.
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if self.signed_in() && !self.demo && ui.button("Sign out").clicked() {
-                            if let Some(api) = self.api() {
-                                std::thread::spawn(move || api.logout());
-                            }
-                            self.cfg.admin_token = None;
-                            self.overview = None;
-                            self.save_cfg();
-                        }
-                        chip(ui, dot, &text);
-                        ui.add_space(6.0);
-                        if self.demo && !self.opts.demo && self.opts.screenshot.is_none() && ui.button("Leave demo").clicked() {
-                            self.demo = false;
-                            self.overview = None;
-                            self.selected = None;
-                        }
-                        if self.signed_in() && !self.demo && ui.button("Refresh").clicked() {
-                            self.refresh(&ctx);
-                        }
-                        ui.add_space(6.0);
-                        if ui.button("Open link").clicked() {
-                            let l = self.link_input.clone();
-                            self.open_link(&ctx, &l);
-                        }
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(&mut self.link_input).hint_text("Paste a temporary link").desired_width(250.0),
-                        );
-                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            let l = self.link_input.clone();
-                            self.open_link(&ctx, &l);
-                        }
-                    });
-                });
-            });
+    /// Where and as whom this app is signed in, and "Sign out": the right end
+    /// of the status bar (call inside a right-to-left layout).
+    fn account_status(&mut self, ui: &mut egui::Ui) {
+        let small = |t: &str, c: Color32| RichText::new(t).color(c).size(12.0);
+        if self.demo {
+            if !self.opts.demo && self.opts.screenshot.is_none() && ui.add(egui::Link::new(small("Leave demo", ACCENT))).clicked() {
+                self.demo = false;
+                self.overview = None;
+                self.selected = None;
+            }
+            status_text(ui, AMBER, "Sample computers (demo)");
+            return;
+        }
+        if !self.signed_in() {
+            status_text(ui, MUTED, "Not signed in");
+            return;
+        }
+        if ui.add(egui::Link::new(small("Sign out", ACCENT))).clicked() {
+            if let Some(api) = self.api() {
+                std::thread::spawn(move || api.logout());
+            }
+            self.cfg.admin_token = None;
+            self.overview = None;
+            self.save_cfg();
+        }
+        let server = self.cfg.server_url.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/');
+        let who = self.overview.as_ref().map(|o| o.user_name.clone()).unwrap_or_default();
+        let version = self.overview.as_ref().map(|o| format!(" {}", o.server_version)).unwrap_or_default();
+        let text = if who.is_empty() { format!("{server}{version}") } else { format!("{server}{version} · {who}") };
+        let dot = if self.overview_err.is_some() { DANGER } else { OK };
+        let resp = status_text(ui, dot, &text);
+        if let Some(e) = &self.overview_err {
+            resp.on_hover_text(format!("{}: {e}", self.cfg.server_url));
+        }
     }
 
     /// "Farlink x.y.z · up to date · Check for updates" in the bottom bar.
-    fn update_status(&mut self, ui: &mut egui::Ui) {
+    /// The app's own update state, first in the status bar. Returns whether it showed anything.
+    fn update_status(&mut self, ui: &mut egui::Ui) -> bool {
         if !self.updater.started() {
-            return;
+            return false;
         }
+        // Only the first piece goes without the "·" in front.
+        let mut first = true;
+        let mut dot = |t: String| {
+            if std::mem::take(&mut first) { t.trim_start_matches("· ").to_string() } else { t }
+        };
         let st = self.updater.status();
         let small = |t: String, c: Color32| RichText::new(t).color(c).size(12.0);
         if st.checking {
-            ui.label(small("· checking for updates...".into(), MUTED));
+            ui.label(small(dot("· checking for updates...".into()), MUTED));
         } else if let Some(v) = &st.installed {
-            ui.label(small(format!("· updated to {v}"), ACCENT));
+            ui.label(small(dot(format!("· updated to {v}")), ACCENT));
             if ui.add(egui::Link::new(small("Restart".into(), ACCENT))).on_hover_text("Close Farlink and start the new version").clicked() {
                 restart_app(ui.ctx());
             }
         } else if st.installing {
-            ui.label(small("· installing the update...".into(), MUTED));
+            ui.label(small(dot("· installing the update...".into()), MUTED));
         } else if let Some((v, _)) = &st.deb {
             if !st.text.is_empty() {
-                ui.label(small(format!("· {}", st.text), AMBER));
+                ui.label(small(dot(format!("· {}", st.text)), AMBER));
             }
-            ui.label(small(format!("· {v} available"), ACCENT));
+            ui.label(small(dot(format!("· {v} available")), ACCENT));
             let tip = "Install the new Farlink package (asks for your password)";
             if ui.add(egui::Link::new(small("Install".into(), ACCENT))).on_hover_text(tip).clicked() {
                 self.updater.install_deb(ui.ctx());
             }
         } else {
             if !st.text.is_empty() {
-                ui.label(small(format!("· {}", st.text), if st.error { AMBER } else { MUTED }));
+                ui.label(small(dot(format!("· {}", st.text)), if st.error { AMBER } else { MUTED }));
             }
             let tip = match st.last_check {
                 Some(t) => format!("Last checked {} ago; checks every hour by itself", human_duration(t.elapsed().as_secs())),
@@ -1228,6 +1234,7 @@ impl ViewerApp {
                 self.updater.check_now();
             }
         }
+        true
     }
 
     // -------------------------------------------------------------- bottom
@@ -1239,22 +1246,20 @@ impl ViewerApp {
             .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(14, 4)).stroke(Stroke::new(1.0, LINE)))
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.label(RichText::new(format!("Farlink {}", crate::VERSION)).color(MUTED).size(12.0));
-                    self.update_status(ui);
+                    let shown = self.update_status(ui);
                     if let Some(o) = &self.overview {
-                        relay_status(ui, o);
+                        relay_status(ui, o, shown);
                     }
-                    ui.label(RichText::new(format!("· picture: {}", self.cfg.quality.summary())).color(MUTED).size(12.0));
-                    if let Some((t, at)) = &self.toast {
-                        if at.elapsed() < Duration::from_secs(5) {
-                            let t = t.clone();
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(RichText::new(t).color(AMBER).size(12.0));
-                            });
-                        } else {
-                            self.toast = None;
+                    if self.toast.as_ref().is_some_and(|(_, at)| at.elapsed() >= Duration::from_secs(5)) {
+                        self.toast = None;
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        self.account_status(ui);
+                        if let Some((t, _)) = &self.toast {
+                            ui.add_space(12.0);
+                            ui.label(RichText::new(t.clone()).color(AMBER).size(12.0));
                         }
-                    }
+                    });
                 });
             });
 
@@ -1302,7 +1307,8 @@ impl ViewerApp {
                             if !vo && mons > 0 && ui.button("Files").clicked() {
                                 s.open_files();
                             }
-                            if !s.closed.is_empty() && mons > 0 && ui.button("Show screens").clicked() {
+                            if (s.files_only || !s.closed.is_empty()) && mons > 0 && ui.button("Show screens").clicked() {
+                                s.files_only = false;
                                 s.closed.clear();
                                 s.builders.clear();
                             }
@@ -1335,8 +1341,7 @@ impl ViewerApp {
                 };
                 let q = self.search.to_lowercase();
                 let online = ov.machines.iter().filter(|m| m.online).count();
-                let title = if ov.role == "admin" { "COMPUTERS" } else { "MY COMPUTERS" };
-                ui.label(RichText::new(format!("{title} · {online} ONLINE OF {}", ov.machines.len())).size(11.0).color(MUTED));
+                ui.label(RichText::new(format!("{online} ONLINE OF {}", ov.machines.len())).size(11.0).color(MUTED));
                 // Helpers behind the published version that can be updated right now.
                 let outdated = ov.machines.iter().filter(|m| m.online && !m.up_to_date && !m.updating).count();
                 let mut update_all = false;
@@ -1575,7 +1580,15 @@ impl ViewerApp {
                 }
                 ui.add_space(12.0);
                 ui.separator();
-                ui.label(RichText::new("Got a temporary link? Paste it at the top right and press Open link.").color(MUTED));
+                ui.label(RichText::new("Got a temporary link? Paste it here:").color(MUTED));
+                ui.horizontal(|ui| {
+                    let resp = ui.add(egui::TextEdit::singleline(&mut self.link_input).hint_text("https://.../g/...").desired_width(300.0));
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if ui.button("Open link").clicked() || enter {
+                        let l = self.link_input.clone();
+                        self.open_link(&ctx, &l);
+                    }
+                });
                 if ui.button("Try with sample computers").clicked() {
                     self.demo = true;
                     self.overview = Some(sample_overview());
@@ -1602,8 +1615,11 @@ impl ViewerApp {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&m.name).size(24.0).strong());
-                    let (c, t) = if mv.online { (OK, "online") } else { (MUTED, "offline") };
-                    pill(ui, c, t);
+                    // Same dot as in the list: green online, grey offline.
+                    let (c, t) = if mv.online { (OK, "Online") } else { (Color32::from_rgb(89, 97, 109), "Offline") };
+                    let (r, resp) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+                    ui.painter().circle_filled(r.center(), 5.5, c);
+                    resp.on_hover_text(t);
                 });
                 let seen = if mv.online {
                     String::new()
@@ -1637,6 +1653,13 @@ impl ViewerApp {
                     }
                     if ui.add(egui::Button::new(RichText::new("View only").size(15.0)).min_size(Vec2::new(130.0, 34.0))).clicked() {
                         self.connect_machine(ctx, m, true);
+                    }
+                    if ui
+                        .add(egui::Button::new(RichText::new("Files").size(15.0)).min_size(Vec2::new(100.0, 34.0)))
+                        .on_hover_text("Copy files to and from this computer without opening its screens")
+                        .clicked()
+                    {
+                        self.files_machine(ctx, m);
                     }
                 });
             }
@@ -1934,7 +1957,7 @@ impl ViewerApp {
             }
             let Some(key) = s.key.clone() else { continue };
             for mon in &monitors {
-                if s.closed.contains(&mon.index) {
+                if s.files_only || s.closed.contains(&mon.index) {
                     continue;
                 }
                 let fp = monitor_fingerprint(mon);
@@ -1948,6 +1971,12 @@ impl ViewerApp {
                         if s.scale == ScaleMode::Original {
                             let size = original_window_size(mon, ctx.pixels_per_point(), Some(local), !s.controls_hidden);
                             (place.w, place.h) = (size.x, size.y);
+                        }
+                        // Full screen and maximised at once can't be left on GNOME:
+                        // open in full screen only and maximise when leaving it.
+                        if place.fullscreen && place.maximized {
+                            place.maximized = false;
+                            s.max_before_fullscreen.insert(mon.index);
                         }
                         ViewportBuilder::default()
                             .with_title(format!("{} - Screen {} ({}x{})", s.name, mon.index + 1, mon.width, mon.height))
@@ -1974,7 +2003,7 @@ impl ViewerApp {
             // Tell the helper which screens are actually visible here; it stops
             // capturing closed or minimised ones.
             let visible: Vec<u8> =
-                monitors.iter().map(|m| m.index).filter(|i| !s.closed.contains(i) && !s.minimized.contains(i)).collect();
+                monitors.iter().map(|m| m.index).filter(|i| !s.files_only && !s.closed.contains(i) && !s.minimized.contains(i)).collect();
             if s.last_watch.as_ref() != Some(&visible) {
                 s.handle.send(SessionMsg::Watch { monitors: visible.clone() });
                 s.last_watch = Some(visible);
@@ -1989,7 +2018,7 @@ impl ViewerApp {
                     s.files = None;
                 }
             }
-            if !monitors.is_empty() && monitors.iter().all(|m| s.closed.contains(&m.index)) && s.files.is_none() {
+            if (s.files_only || (!monitors.is_empty() && monitors.iter().all(|m| s.closed.contains(&m.index)))) && s.files.is_none() {
                 to_close.push(s.id);
             }
         }
@@ -2137,7 +2166,8 @@ impl Updater {
                             lock.lock().unwrap().deb = Some((v, path));
                             (String::new(), false, None)
                         }
-                        Ok(Checked::UpToDate) => ("up to date".to_string(), false, None),
+                        // Nothing to say when up to date (the link's hover tells when it last looked).
+                        Ok(Checked::UpToDate) => (String::new(), false, None),
                         Err(e) => {
                             log::warn!("update check: {e:#}");
                             ("could not check for updates".to_string(), true, None)
@@ -2289,8 +2319,12 @@ fn monitor_window(ui: &mut egui::Ui, s: &mut OpenSession, mon: &MonitorInfo, key
         let fullscreen = info.fullscreen.unwrap_or(false);
         let maximized = info.maximized.unwrap_or(false);
         let place = match layouts.get(key, fp) {
-            // Keep the normal size/position while full screen or maximised.
-            Some(old) if fullscreen || maximized => WindowPlace { fullscreen, maximized, ..old },
+            // Keep the normal size/position while full screen or maximised
+            // (and that it goes back to maximised after full screen).
+            Some(old) if fullscreen || maximized => {
+                let maximized = if fullscreen { s.max_before_fullscreen.contains(&mon.index) } else { maximized };
+                WindowPlace { fullscreen, maximized, ..old }
+            }
             _ => WindowPlace { x: outer.min.x, y: outer.min.y, w: inner.width(), h: inner.height(), fullscreen, maximized },
         };
         if layouts.set(key, fp, place) {
@@ -2407,14 +2441,11 @@ fn monitor_bar(ui: &mut egui::Ui, s: &mut OpenSession, mon: &MonitorInfo, view_o
             if !view_only && ui.button("Files").clicked() {
                 s.open_files();
             }
-            let fs = s.fullscreen.contains(&mon.index);
+            let (fs, maximized) = ctx.input(|i| (i.viewport().fullscreen.unwrap_or(false), i.viewport().maximized.unwrap_or(false)));
             if ui.button(if fs { "Exit full screen" } else { "Full screen" }).clicked() {
-                if fs {
-                    s.fullscreen.remove(&mon.index);
-                } else {
-                    s.fullscreen.insert(mon.index);
+                for cmd in fullscreen_commands(fs, maximized, mon.index, &mut s.max_before_fullscreen) {
+                    ctx.send_viewport_cmd(cmd);
                 }
-                ctx.send_viewport_cmd(ViewportCommand::Fullscreen(!fs));
             }
             if !view_only && ui.button("Ctrl+Alt+Del").clicked() {
                 s.handle.send(SessionMsg::Input { event: InputEvent::CtrlAltDel });
@@ -2429,7 +2460,7 @@ fn monitor_bar(ui: &mut egui::Ui, s: &mut OpenSession, mon: &MonitorInfo, view_o
             });
             // Every picture setting, in a popup that stays open while sliders move.
             let current = s.quality.matching_preset();
-            let button = ui.button(format!("{} ⏷", current.label())).on_hover_text("Picture quality");
+            let button = dropdown_button(ui, current.label()).on_hover_text("Picture quality");
             egui::Popup::menu(&button).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
                 quality_controls(ui, &mut s.quality);
             });
@@ -2447,6 +2478,16 @@ fn monitor_bar(ui: &mut egui::Ui, s: &mut OpenSession, mon: &MonitorInfo, view_o
             });
         });
     });
+}
+
+/// A button with a small down arrow (drawn: the font has no arrow glyph).
+fn dropdown_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let resp = ui.button(format!("{text}     "));
+    let c = Pos2::new(resp.rect.right() - 13.0, resp.rect.center().y);
+    let color = ui.style().interact(&resp).fg_stroke.color;
+    let tri = vec![c + Vec2::new(-4.0, -2.0), c + Vec2::new(4.0, -2.0), c + Vec2::new(0.0, 3.0)];
+    ui.painter().add(egui::Shape::convex_polygon(tri, color, Stroke::NONE));
+    resp
 }
 
 /// Picture settings of a connection (the quality popup of a screen window).
@@ -2490,6 +2531,26 @@ fn quality_controls(ui: &mut egui::Ui, q: &mut Quality) {
             .color(MUTED)
             .size(12.0),
     );
+}
+
+/// Commands for the "Full screen" button of a screen window that is now in
+/// full screen (`fs`) or maximised. GNOME ignores "leave full screen" for a
+/// window that is also maximised, so a maximised window is un-maximised first
+/// and maximised again when it leaves full screen.
+fn fullscreen_commands(fs: bool, maximized: bool, index: u8, max_before: &mut HashSet<u8>) -> Vec<ViewportCommand> {
+    if fs {
+        let mut cmds = vec![ViewportCommand::Fullscreen(false)];
+        if max_before.remove(&index) {
+            cmds.push(ViewportCommand::Maximized(true));
+        }
+        cmds
+    } else if maximized {
+        max_before.insert(index);
+        vec![ViewportCommand::Maximized(false), ViewportCommand::Fullscreen(true)]
+    } else {
+        max_before.remove(&index);
+        vec![ViewportCommand::Fullscreen(true)]
+    }
 }
 
 /// Height of a screen window's controls.
@@ -2682,7 +2743,6 @@ impl eframe::App for ViewerApp {
             self.screenshot_step(&ctx);
             return;
         }
-        self.top_bar(ui);
         self.bottom_bar(ui);
         if self.signed_in() || self.demo {
             self.machine_list(ui);
@@ -2697,20 +2757,15 @@ impl eframe::App for ViewerApp {
 
 // ------------------------------------------------------------------ widgets
 
-fn chip(ui: &mut egui::Ui, dot: Color32, text: &str) {
-    egui::Frame::new()
-        .fill(BG)
-        .stroke(Stroke::new(1.0, LINE))
-        .corner_radius(CornerRadius::same(12))
-        .inner_margin(Margin::symmetric(10, 3))
-        .show(ui, |ui| {
-            // Painted as one piece (dot first), so it reads the same inside right-to-left rows.
-            let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::proportional(12.5), MUTED);
-            let size = Vec2::new(16.0 + galley.size().x, galley.size().y.max(18.0));
-            let (r, _) = ui.allocate_exact_size(size, Sense::hover());
-            ui.painter().circle_filled(Pos2::new(r.min.x + 5.0, r.center().y), 4.0, dot);
-            ui.painter().galley(Pos2::new(r.min.x + 16.0, r.center().y - galley.size().y / 2.0), galley, MUTED);
-        });
+/// Small "● text" for the status bar, painted as one piece so it reads the
+/// same inside right-to-left rows.
+fn status_text(ui: &mut egui::Ui, dot: Color32, text: &str) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::proportional(12.0), MUTED);
+    let size = Vec2::new(14.0 + galley.size().x, galley.size().y.max(16.0));
+    let (r, resp) = ui.allocate_exact_size(size, Sense::hover());
+    ui.painter().circle_filled(Pos2::new(r.min.x + 4.0, r.center().y), 3.5, dot);
+    ui.painter().galley(Pos2::new(r.min.x + 14.0, r.center().y - galley.size().y / 2.0), galley, MUTED);
+    resp
 }
 
 fn status_dot(ui: &mut egui::Ui, c: Color32) {
@@ -2964,10 +3019,11 @@ fn paint_job(p: &egui::Painter, pos: Pos2, mut job: egui::text::LayoutJob, max_w
 
 /// Status bar: relay version, when it last looked for and installed an update
 /// (details on hover).
-fn relay_status(ui: &mut egui::Ui, o: &Overview) {
+fn relay_status(ui: &mut egui::Ui, o: &Overview, after_something: bool) {
     let u = &o.server_update;
     let ago = |t: u64| format!("{} ago", crate::util::human_duration(o.now.saturating_sub(t)));
-    let mut text = format!("· relay {}", o.server_version);
+    // The version itself is on the right, next to the relay's address.
+    let mut text = format!("{}relay", if after_something { "· " } else { "" });
     let mut color = MUTED;
     if u.checking {
         text.push_str(" · checking for updates…");
@@ -3110,6 +3166,16 @@ mod tests {
     fn original_size_window_without_controls_is_just_the_screen() {
         let mon = MonitorInfo { index: 0, name: String::new(), x: 0, y: 0, width: 1280, height: 720, primary: true };
         assert_eq!(original_window_size(&mon, 1.0, Some(Vec2::new(1920.0, 1080.0)), false), Vec2::new(1280.0, 720.0));
+    }
+
+    #[test]
+    fn maximised_windows_leave_full_screen_maximised() {
+        let mut max = HashSet::new();
+        assert_eq!(fullscreen_commands(false, true, 1, &mut max), vec![ViewportCommand::Maximized(false), ViewportCommand::Fullscreen(true)]);
+        assert_eq!(fullscreen_commands(true, false, 1, &mut max), vec![ViewportCommand::Fullscreen(false), ViewportCommand::Maximized(true)]);
+        assert!(max.is_empty());
+        assert_eq!(fullscreen_commands(false, false, 1, &mut max), vec![ViewportCommand::Fullscreen(true)]);
+        assert_eq!(fullscreen_commands(true, false, 1, &mut max), vec![ViewportCommand::Fullscreen(false)]);
     }
 
     #[test]
