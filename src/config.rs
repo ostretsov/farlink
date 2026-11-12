@@ -110,6 +110,10 @@ pub struct ViewerConfig {
     /// only the tray menu changes it.
     #[serde(default)]
     pub autostart_set_up: bool,
+    /// Screen windows show only the remote screen (the controls come back
+    /// while the mouse rests at the top edge).
+    #[serde(default)]
+    pub hide_controls: bool,
 }
 
 /// How a remote screen is drawn in its window.
@@ -154,6 +158,7 @@ impl Default for ViewerConfig {
             auto_update: true,
             scale_mode: ScaleMode::default(),
             autostart_set_up: false,
+            hide_controls: false,
         }
     }
 }
@@ -279,6 +284,15 @@ mod tests {
         let v: ViewerConfig = serde_json::from_str(r#"{"server_url":"https://x"}"#).unwrap();
         assert!(v.auto_update);
         assert_eq!(v.quality, Quality::default());
+    }
+
+    #[test]
+    fn hidden_controls_are_remembered() {
+        let v: ViewerConfig = serde_json::from_str(r#"{"server_url":"https://x"}"#).unwrap();
+        assert!(!v.hide_controls, "controls shown unless hidden before");
+        let v = ViewerConfig { hide_controls: true, ..ViewerConfig::default() };
+        let back: ViewerConfig = serde_json::from_str(&serde_json::to_string(&v).unwrap()).unwrap();
+        assert!(back.hide_controls);
     }
 
     #[test]

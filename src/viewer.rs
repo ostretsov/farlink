@@ -149,8 +149,15 @@ struct OpenSession {
     scale_changed: bool,
     /// Quality picked in one of this connection's windows: becomes the saved default.
     quality_changed: bool,
-    /// Scale mode each screen window was last drawn with (to resize on a switch).
-    applied_scale: HashMap<u8, ScaleMode>,
+    /// Scale mode and "controls shown" each screen window was last drawn with
+    /// (to resize on a switch).
+    applied_scale: HashMap<u8, (ScaleMode, bool)>,
+    /// Screen windows show only the picture (same for all of them).
+    controls_hidden: bool,
+    /// The user hid or showed the controls: remember it, apply to every window.
+    controls_changed: bool,
+    /// Hidden controls brought back by resting the mouse at the top edge.
+    reveal: HashMap<u8, Reveal>,
     /// Last "watching these screens" sent to the helper.
     last_watch: Option<Vec<u8>>,
     /// Open file browser window, if any.
@@ -910,6 +917,9 @@ impl ViewerApp {
             scale_changed: false,
             quality_changed: false,
             applied_scale: HashMap::new(),
+            controls_hidden: self.cfg.hide_controls,
+            controls_changed: false,
+            reveal: HashMap::new(),
             last_watch: None,
             files: None,
             focused: HashSet::new(),
@@ -1823,7 +1833,11 @@ impl ViewerApp {
         let mut to_close = Vec::new();
         let mut new_scale = None;
         let mut new_quality = None;
+        let mut new_hidden = None;
         for s in &mut self.sessions {
+            if std::mem::take(&mut s.controls_changed) {
+                new_hidden = Some(s.controls_hidden);
+            }
             if std::mem::take(&mut s.scale_changed) {
                 new_scale = Some(s.scale);
             }
@@ -1855,7 +1869,7 @@ impl ViewerApp {
                             default_place(mon.index as usize, monitors.len(), mon.width, mon.height, (local.x, local.y))
                         });
                         if s.scale == ScaleMode::Original {
-                            let size = original_window_size(mon, ctx.pixels_per_point(), Some(local));
+                            let size = original_window_size(mon, ctx.pixels_per_point(), Some(local), !s.controls_hidden);
                             (place.w, place.h) = (size.x, size.y);
                         }
                         ViewportBuilder::default()
@@ -1910,6 +1924,15 @@ impl ViewerApp {
         {
             self.cfg.quality = q;
             self.save_cfg();
+        }
+        if let Some(h) = new_hidden {
+            for s in &mut self.sessions {
+                s.controls_hidden = h;
+            }
+            if h != self.cfg.hide_controls {
+                self.cfg.hide_controls = h;
+                self.save_cfg();
+            }
         }
         if let Some(m) = new_scale
             && m != self.cfg.scale_mode
@@ -2176,13 +2199,14 @@ fn monitor_window(ui: &mut egui::Ui, s: &mut OpenSession, mon: &MonitorInfo, key
     let mut result = MonitorResult::Nothing;
     let info = ctx.input(|i| i.viewport().clone());
     let ppp = ctx.pixels_per_point();
-    let applied = s.applied_scale.insert(mon.index, s.scale);
-    if applied.is_some_and(|a| a != s.scale)
+    let bar = !s.controls_hidden;
+    let applied = s.applied_scale.insert(mon.index, (s.scale, bar));
+    if applied.is_some_and(|a| a != (s.scale, bar))
         && s.scale == ScaleMode::Original
         && !info.fullscreen.unwrap_or(false)
         && !info.maximized.unwrap_or(false)
     {
-        ctx.send_viewport_cmd(ViewportCommand::InnerSize(original_window_size(mon, ppp, info.monitor_size)));
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(original_window_size(mon, ppp, info.monitor_size, bar)));
     }
     if let (Some(outer), Some(inner)) = (info.outer_rect, info.inner_rect) {
         let fullscreen = info.fullscreen.unwrap_or(false);
@@ -2208,66 +2232,35 @@ fn monitor_window(ui: &mut egui::Ui, s: &mut OpenSession, mon: &MonitorInfo, key
         let sh = s.handle.shared.lock().unwrap();
         (sh.view_only, sh.view_locked, sh.fps, sh.kbps)
     };
-    egui::Panel::top("bar")
-        .exact_size(36.0)
-        .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(10, 5)))
-        .show(ui, |ui| {
-            ui.horizontal_centered(|ui| {
-                if let Some(v) = view_only_toggle(ui, view_only, locked) {
-                    s.handle.set_view_only(v);
-                }
-                ui.label(RichText::new(format!("{} · {}", s.name, mon.label())).strong());
-                ui.label(RichText::new(format!("{fps:.0} fps · {kbps:.0} KB/s")).color(MUTED).size(12.0));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("Disconnect").clicked() {
-                        result = MonitorResult::Disconnect;
-                    }
-                    if !view_only && ui.button("Files").clicked() {
-                        s.open_files();
-                    }
-                    let fs = s.fullscreen.contains(&mon.index);
-                    if ui.button(if fs { "Exit full screen" } else { "Full screen" }).clicked() {
-                        if fs {
-                            s.fullscreen.remove(&mon.index);
-                        } else {
-                            s.fullscreen.insert(mon.index);
-                        }
-                        ctx.send_viewport_cmd(ViewportCommand::Fullscreen(!fs));
-                    }
-                    if !view_only && ui.button("Ctrl+Alt+Del").clicked() {
-                        s.handle.send(SessionMsg::Input { event: InputEvent::CtrlAltDel });
-                    }
-                    let before = s.quality;
-                    egui::ComboBox::from_id_salt("colors").selected_text(s.quality.color.short_label()).width(110.0).show_ui(ui, |ui| {
-                        for c in ColorDepth::ALL {
-                            if ui.add(egui::Button::new(c.label()).selected(s.quality.color == c).frame(false)).clicked() {
-                                s.quality.color = c;
-                            }
-                        }
-                    });
-                    let current = s.quality.matching_preset();
-                    egui::ComboBox::from_id_salt("q").selected_text(current.label()).width(96.0).show_ui(ui, |ui| {
-                        for p in Preset::BUTTONS {
-                            if ui.add(egui::Button::new(p.label()).selected(current == p).frame(false)).on_hover_text(p.hint()).clicked() {
-                                s.quality = s.quality.with_preset(p);
-                            }
-                        }
-                    });
-                    if s.quality != before {
-                        s.handle.send(SessionMsg::Quality { quality: s.quality });
-                        s.quality_changed = true;
-                    }
-                    egui::ComboBox::from_id_salt("scale").selected_text(s.scale.label()).width(110.0).show_ui(ui, |ui| {
-                        for m in [ScaleMode::Original, ScaleMode::Fit] {
-                            if ui.add(egui::Button::new(m.label()).selected(s.scale == m).frame(false)).clicked() && s.scale != m {
-                                s.scale = m;
-                                s.scale_changed = true;
-                            }
-                        }
-                    });
+    let screen = ui.max_rect();
+    let overlay = if s.controls_hidden {
+        let r = s.reveal.entry(mon.index).or_default();
+        let now = Instant::now();
+        r.step(ctx.pointer_hover_pos().map(|p| p.y - screen.min.y), egui::Popup::is_any_open(&ctx), now);
+        if let Some(wait) = r.wait(now) {
+            ctx.request_repaint_after(wait);
+        }
+        r.shown.then(|| Rect::from_min_size(screen.min, Vec2::new(screen.width(), BAR_HEIGHT)))
+    } else {
+        s.reveal.remove(&mon.index);
+        None
+    };
+    if !s.controls_hidden {
+        egui::Panel::top("bar")
+            .exact_size(BAR_HEIGHT)
+            .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(10, 5)))
+            .show(ui, |ui| monitor_bar(ui, s, mon, view_only, locked, fps, kbps, &mut result));
+    } else if let Some(bar) = overlay {
+        egui::Area::new(egui::Id::unique(("farlink-bar", mon.index))).order(egui::Order::Foreground).fixed_pos(bar.min).show(&ctx, |ui| {
+            egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(10, 5)).show(ui, |ui| {
+                let size = Vec2::new(bar.width() - 20.0, BAR_HEIGHT - 10.0);
+                ui.allocate_ui_with_layout(size, Layout::left_to_right(Align::Center), |ui| {
+                    ui.set_min_size(size);
+                    monitor_bar(ui, s, mon, view_only, locked, fps, kbps, &mut result);
                 });
             });
         });
+    }
     egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::BLACK)).show(ui, |ui| {
         let avail = ui.available_rect_before_wrap();
         let Some((tex, _)) = s.textures.get(&mon.index) else {
@@ -2284,12 +2277,12 @@ fn monitor_window(ui: &mut egui::Ui, s: &mut OpenSession, mon: &MonitorInfo, key
             ScaleMode::Fit => {
                 let rect = fit_rect(avail, size.x, size.y);
                 let resp = ui.allocate_rect(avail, sense);
-                screen_picture(ui, s, mon, tex, rect, avail, resp.hovered(), view_only);
+                screen_picture(ui, s, mon, tex, rect, below(avail, overlay), resp.hovered(), view_only);
             }
             ScaleMode::Original if original.x <= avail.width() + 0.5 && original.y <= avail.height() + 0.5 => {
                 let rect = snap_rect(Rect::from_center_size(avail.center(), original), ppp);
                 let resp = ui.allocate_rect(avail, sense);
-                screen_picture(ui, s, mon, tex, rect, avail, resp.hovered(), view_only);
+                screen_picture(ui, s, mon, tex, rect, below(avail, overlay), resp.hovered(), view_only);
             }
             ScaleMode::Original => {
                 // Bigger than the window: scroll bars (not the wheel — that goes to
@@ -2301,7 +2294,7 @@ fn monitor_window(ui: &mut egui::Ui, s: &mut OpenSession, mon: &MonitorInfo, key
                     .show(ui, |ui| {
                         let (outer, resp) = ui.allocate_exact_size(original.max(ui.available_size()), sense);
                         let rect = snap_rect(Rect::from_center_size(outer.center(), original), ppp);
-                        let visible = ui.clip_rect();
+                        let visible = below(ui.clip_rect(), overlay);
                         screen_picture(ui, s, mon, tex, rect, visible, resp.hovered(), view_only);
                     });
             }
@@ -2310,10 +2303,129 @@ fn monitor_window(ui: &mut egui::Ui, s: &mut OpenSession, mon: &MonitorInfo, key
     result
 }
 
+/// The controls of a screen window (top bar, or shown over the picture
+/// while hidden).
+#[allow(clippy::too_many_arguments)]
+fn monitor_bar(ui: &mut egui::Ui, s: &mut OpenSession, mon: &MonitorInfo, view_only: bool, locked: bool, fps: f32, kbps: f32, result: &mut MonitorResult) {
+    let ctx = ui.ctx().clone();
+    ui.horizontal_centered(|ui| {
+        if let Some(v) = view_only_toggle(ui, view_only, locked) {
+            s.handle.set_view_only(v);
+        }
+        ui.label(RichText::new(format!("{} · {}", s.name, mon.label())).strong());
+        ui.label(RichText::new(format!("{fps:.0} fps · {kbps:.0} KB/s")).color(MUTED).size(12.0));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.button("Disconnect").clicked() {
+                *result = MonitorResult::Disconnect;
+            }
+            let (label, hint) = if s.controls_hidden {
+                ("Keep controls", "Keep these controls shown")
+            } else {
+                ("Hide controls", "Show only the remote screen. To get the controls back, rest the mouse at the top edge for a second")
+            };
+            if ui.button(label).on_hover_text(hint).clicked() {
+                s.controls_hidden = !s.controls_hidden;
+                s.controls_changed = true;
+            }
+            if !view_only && ui.button("Files").clicked() {
+                s.open_files();
+            }
+            let fs = s.fullscreen.contains(&mon.index);
+            if ui.button(if fs { "Exit full screen" } else { "Full screen" }).clicked() {
+                if fs {
+                    s.fullscreen.remove(&mon.index);
+                } else {
+                    s.fullscreen.insert(mon.index);
+                }
+                ctx.send_viewport_cmd(ViewportCommand::Fullscreen(!fs));
+            }
+            if !view_only && ui.button("Ctrl+Alt+Del").clicked() {
+                s.handle.send(SessionMsg::Input { event: InputEvent::CtrlAltDel });
+            }
+            let before = s.quality;
+            egui::ComboBox::from_id_salt("colors").selected_text(s.quality.color.short_label()).width(110.0).show_ui(ui, |ui| {
+                for c in ColorDepth::ALL {
+                    if ui.add(egui::Button::new(c.label()).selected(s.quality.color == c).frame(false)).clicked() {
+                        s.quality.color = c;
+                    }
+                }
+            });
+            let current = s.quality.matching_preset();
+            egui::ComboBox::from_id_salt("q").selected_text(current.label()).width(96.0).show_ui(ui, |ui| {
+                for p in Preset::BUTTONS {
+                    if ui.add(egui::Button::new(p.label()).selected(current == p).frame(false)).on_hover_text(p.hint()).clicked() {
+                        s.quality = s.quality.with_preset(p);
+                    }
+                }
+            });
+            if s.quality != before {
+                s.handle.send(SessionMsg::Quality { quality: s.quality });
+                s.quality_changed = true;
+            }
+            egui::ComboBox::from_id_salt("scale").selected_text(s.scale.label()).width(110.0).show_ui(ui, |ui| {
+                for m in [ScaleMode::Original, ScaleMode::Fit] {
+                    if ui.add(egui::Button::new(m.label()).selected(s.scale == m).frame(false)).clicked() && s.scale != m {
+                        s.scale = m;
+                        s.scale_changed = true;
+                    }
+                }
+            });
+        });
+    });
+}
+
+/// Height of a screen window's controls.
+const BAR_HEIGHT: f32 = 36.0;
+/// Hidden controls come back after the mouse rests this long...
+const REVEAL_AFTER: Duration = Duration::from_secs(1);
+/// ...this close to the top edge of the window (points).
+const REVEAL_EDGE: f32 = 4.0;
+
+/// Hidden controls of one screen window, brought back by resting the mouse
+/// at the top edge for [`REVEAL_AFTER`]; they go again when it moves away.
+#[derive(Default, Debug)]
+struct Reveal {
+    at_top_since: Option<Instant>,
+    shown: bool,
+}
+
+impl Reveal {
+    /// `y`: mouse height in the window (`None`: outside it); `popup`: a menu
+    /// of the controls is open (they stay while it is).
+    fn step(&mut self, y: Option<f32>, popup: bool, now: Instant) {
+        if self.shown {
+            if !popup && !y.is_some_and(|y| y <= BAR_HEIGHT + 12.0) {
+                *self = Reveal::default();
+            }
+        } else if y.is_some_and(|y| y <= REVEAL_EDGE) {
+            let since = *self.at_top_since.get_or_insert(now);
+            self.shown = now.duration_since(since) >= REVEAL_AFTER;
+        } else {
+            self.at_top_since = None;
+        }
+    }
+
+    /// How long until the controls are due to show (to look again then).
+    fn wait(&self, now: Instant) -> Option<Duration> {
+        let since = self.at_top_since.filter(|_| !self.shown)?;
+        Some(REVEAL_AFTER.saturating_sub(now.duration_since(since)) + Duration::from_millis(10))
+    }
+}
+
+/// The part of `visible` not covered by controls shown over the picture
+/// (clicks there are for the controls, not the remote computer).
+fn below(visible: Rect, overlay: Option<Rect>) -> Rect {
+    match overlay {
+        Some(bar) => Rect::from_min_max(Pos2::new(visible.min.x, visible.min.y.max(bar.max.y)), visible.max),
+        None => visible,
+    }
+}
+
 /// Window size (in points) showing a remote screen at its original size,
 /// limited to the local screen.
-fn original_window_size(mon: &MonitorInfo, ppp: f32, screen: Option<Vec2>) -> Vec2 {
-    let mut size = Vec2::new(mon.width.max(1) as f32 / ppp, mon.height.max(1) as f32 / ppp + 36.0); // + toolbar
+fn original_window_size(mon: &MonitorInfo, ppp: f32, screen: Option<Vec2>, bar: bool) -> Vec2 {
+    let bar = if bar { BAR_HEIGHT } else { 0.0 };
+    let mut size = Vec2::new(mon.width.max(1) as f32 / ppp, mon.height.max(1) as f32 / ppp + bar);
     if let Some(sc) = screen {
         size = size.min(Vec2::new(sc.x, sc.y - 60.0));
     }
@@ -2743,10 +2855,80 @@ mod tests {
     #[test]
     fn original_size_window_fits_the_screen() {
         let mon = MonitorInfo { index: 0, name: String::new(), x: 0, y: 0, width: 1280, height: 720, primary: true };
-        assert_eq!(original_window_size(&mon, 1.0, Some(Vec2::new(1920.0, 1080.0))), Vec2::new(1280.0, 756.0));
-        assert_eq!(original_window_size(&mon, 2.0, None), Vec2::new(640.0, 396.0));
+        assert_eq!(original_window_size(&mon, 1.0, Some(Vec2::new(1920.0, 1080.0)), true), Vec2::new(1280.0, 756.0));
+        assert_eq!(original_window_size(&mon, 2.0, None, true), Vec2::new(640.0, 396.0));
         let big = MonitorInfo { width: 3840, height: 2160, ..mon };
-        assert_eq!(original_window_size(&big, 1.0, Some(Vec2::new(1920.0, 1080.0))), Vec2::new(1920.0, 1020.0));
+        assert_eq!(original_window_size(&big, 1.0, Some(Vec2::new(1920.0, 1080.0)), true), Vec2::new(1920.0, 1020.0));
+    }
+
+    #[test]
+    fn original_size_window_without_controls_is_just_the_screen() {
+        let mon = MonitorInfo { index: 0, name: String::new(), x: 0, y: 0, width: 1280, height: 720, primary: true };
+        assert_eq!(original_window_size(&mon, 1.0, Some(Vec2::new(1920.0, 1080.0)), false), Vec2::new(1280.0, 720.0));
+    }
+
+    #[test]
+    fn hidden_controls_show_after_a_second_at_the_top_edge() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut r = Reveal::default();
+        r.step(Some(300.0), false, at(0));
+        assert!(!r.shown && r.wait(at(0)).is_none(), "nothing while the mouse is on the picture");
+        r.step(Some(1.0), false, at(100));
+        assert!(!r.shown);
+        assert_eq!(r.wait(at(600)), Some(Duration::from_millis(510)), "looks again when the second is up");
+        r.step(Some(2.0), false, at(1099));
+        assert!(!r.shown, "not before a whole second");
+        r.step(Some(0.0), false, at(1100));
+        assert!(r.shown);
+        assert!(r.wait(at(1100)).is_none());
+    }
+
+    #[test]
+    fn leaving_the_top_edge_restarts_the_wait() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut r = Reveal::default();
+        r.step(Some(0.0), false, at(0));
+        r.step(Some(50.0), false, at(900));
+        r.step(Some(0.0), false, at(1000));
+        assert!(!r.shown);
+        r.step(Some(0.0), false, at(1500));
+        assert!(!r.shown, "only 0.5 s since it came back");
+        r.step(None, false, at(1600));
+        r.step(Some(0.0), false, at(2700));
+        assert!(!r.shown, "outside the window counts as leaving");
+    }
+
+    #[test]
+    fn shown_controls_stay_while_used_and_go_when_the_mouse_leaves() {
+        let t0 = Instant::now();
+        let mut r = Reveal { at_top_since: Some(t0), shown: true };
+        r.step(Some(BAR_HEIGHT - 5.0), false, t0);
+        assert!(r.shown, "mouse on the controls");
+        r.step(Some(400.0), true, t0);
+        assert!(r.shown, "a menu of the controls is open");
+        r.step(Some(400.0), false, t0);
+        assert!(!r.shown && r.at_top_since.is_none());
+        r.step(None, false, t0);
+        assert!(!r.shown);
+    }
+
+    #[test]
+    fn clicks_under_shown_controls_are_not_for_the_remote() {
+        let visible = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        assert_eq!(below(visible, None), visible);
+        let bar = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, BAR_HEIGHT));
+        let cut = below(visible, Some(bar));
+        assert_eq!(cut, Rect::from_min_max(Pos2::new(0.0, BAR_HEIGHT), Pos2::new(800.0, 600.0)));
+        let press = egui::Event::PointerButton {
+            pos: Pos2::new(400.0, 10.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        };
+        let mut prev = egui::Modifiers::default();
+        assert!(map_events(&[press], visible, cut, 0, &mut prev, Default::default(), true).is_empty());
     }
 
     #[test]
