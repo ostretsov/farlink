@@ -729,6 +729,80 @@ async fn only_the_admin_renames_and_everyone_sees_the_new_name() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn notes_are_the_admins_and_heartbeats_bring_load_and_disks() {
+    let s = start_server().await;
+    let (base, admin) = (s.url.clone(), s.admin.clone());
+    let created: serde_json::Value = blocking(move || {
+        ureq::post(&format!("{base}/api/users"))
+            .header("Authorization", &format!("Bearer {admin}"))
+            .send_json(serde_json::json!({"name": "Anna", "login": "anna", "password": "anna-pass-1"}))
+            .unwrap()
+            .body_mut()
+            .read_json()
+            .unwrap()
+    })
+    .await;
+    let anna_token = created["install_url"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
+    let (mut agent, pc, _) = fake_host_with(&s, &anna_token, "ANNA-PC").await;
+    assert_eq!(s.overview().await.machines[0].stats, None, "no stats before the first heartbeat");
+
+    // The admin writes notes; they come back in the overview (the web admin reads the same).
+    let api = s.api();
+    let id = pc.clone();
+    blocking(move || api.set_notes(&id, "Kitchen\r\nprinter on USB\n\n").unwrap()).await;
+    assert_eq!(s.overview().await.machines[0].machine.notes, "Kitchen\nprinter on USB");
+
+    // Anna sees her computer but not the notes, and may not write them.
+    let url = s.url.clone();
+    let anna = blocking(move || farlink::net::Api::login(&url, "anna", "anna-pass-1").unwrap()).await;
+    let api = farlink::net::Api { server: s.url.clone(), token: anna };
+    let id = pc.clone();
+    let (mine, refused) = blocking(move || (api.overview().unwrap(), api.set_notes(&id, "mine").is_err())).await;
+    assert_eq!(mine.machines[0].machine.notes, "");
+    assert!(refused, "only the administrator writes notes");
+    let api = s.api();
+    let id = pc.clone();
+    let too_long = "x".repeat(farlink::grants::MAX_NOTES + 1);
+    assert!(blocking(move || api.set_notes(&id, &too_long).is_err()).await);
+
+    // A heartbeat with stats shows up for both of them.
+    let stats = farlink::sysstat::demo_stats();
+    send(&mut agent, &AgentMsg::Heartbeat { monitors: farlink::desktop::TestPattern::dual().monitors, stats: Some(stats.clone()) }).await;
+    let mut seen = None;
+    for _ in 0..50 {
+        seen = s.overview().await.machines[0].stats.clone();
+        if seen.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(seen, Some(stats.clone()));
+    let api = farlink::net::Api { server: s.url.clone(), token: mine_token(&s).await };
+    let theirs = blocking(move || api.overview().unwrap()).await;
+    assert_eq!(theirs.machines[0].stats, Some(stats));
+
+    // Offline: no load shown any more, notes stay.
+    drop(agent);
+    let mut gone = false;
+    for _ in 0..100 {
+        let m = s.overview().await.machines[0].clone();
+        if !m.online {
+            assert_eq!(m.stats, None);
+            assert_eq!(m.machine.notes, "Kitchen\nprinter on USB");
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(gone);
+}
+
+async fn mine_token(s: &TestServer) -> String {
+    let url = s.url.clone();
+    blocking(move || farlink::net::Api::login(&url, "anna", "anna-pass-1").unwrap()).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn view_only_can_be_switched_during_a_session_unless_the_link_forbids_it() {
     let s = start_server().await;
     let (mut agent, id, secret) = fake_host(&s).await;

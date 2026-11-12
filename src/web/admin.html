@@ -36,7 +36,7 @@
 
   <div class="card">
     <h2><span id="mtitle">Computers</span> <small id="mcount"></small><span class="spacer"></span><button id="updAll" class="small hidden" onclick="updateAll()"></button> <input id="filter" placeholder="Search" oninput="render()"></h2>
-    <table><thead><tr><th>Name</th><th>System</th><th>Screens</th><th class="admin-only">Belongs to</th><th>Version</th><th></th></tr></thead><tbody id="machines"></tbody></table>
+    <table><thead><tr><th>Name</th><th>System</th><th>Load and disks</th><th>Screens</th><th class="admin-only">Belongs to</th><th>Version</th><th></th></tr></thead><tbody id="machines"></tbody></table>
   </div>
 
   <div class="card admin-only">
@@ -61,6 +61,15 @@
     <table><tbody id="srvInfo"></tbody></table>
   </div>
 </main>
+
+<dialog id="notesDlg">
+  <form method="dialog" onsubmit="saveNotes(event)">
+    <h2 style="margin-top:0">Notes about <span id="nName"></span></h2>
+    <p class="muted">Only administrators see them; the Farlink app shows the same notes.</p>
+    <textarea id="nText" rows="7" maxlength="4000" placeholder="Where it is, who uses it, anything to remember…"></textarea>
+    <div class="row" style="margin-top:20px"><button class="primary">Save</button><button type="button" onclick="notesDlg.close()">Cancel</button></div>
+  </form>
+</dialog>
 
 <dialog id="grantDlg">
   <form method="dialog" onsubmit="createGrant(event)">

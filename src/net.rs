@@ -98,6 +98,15 @@ impl Api {
         Ok(())
     }
 
+    /// Replace the administrator's notes about a computer.
+    pub fn set_notes(&self, machine_id: &str, notes: &str) -> Result<()> {
+        ureq::post(&self.url(&format!("/api/machines/{}/notes", url_encode(machine_id))))
+            .header("Authorization", &self.auth())
+            .send_json(json!({ "notes": notes }))
+            .map_err(api_error)?;
+        Ok(())
+    }
+
     /// Make a computer's helper install the published version now
     /// (administrator only). Returns that version.
     pub fn update_machine(&self, machine_id: &str) -> Result<String> {

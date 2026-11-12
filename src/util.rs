@@ -162,7 +162,7 @@ pub fn published_file(app: &str, target: &str) -> Option<String> {
 /// Operating system label for the machine list.
 pub fn os_label() -> String {
     if cfg!(windows) {
-        "Windows".into()
+        crate::sysstat::os_version()
     } else if cfg!(target_os = "linux") {
         let pretty = std::fs::read_to_string("/etc/os-release")
             .ok()

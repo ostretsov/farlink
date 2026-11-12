@@ -30,7 +30,13 @@ pub struct Machine {
     /// Person (user id) this computer belongs to; only they and the admin see it.
     #[serde(default)]
     pub owner: Option<String>,
+    /// Administrator's notes about this computer (free text).
+    #[serde(default)]
+    pub notes: String,
 }
+
+/// Longest notes text for one computer, in characters.
+pub const MAX_NOTES: usize = 4000;
 
 /// A person with access to their own computers only.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -234,6 +240,7 @@ impl Store {
                 first_seen: now,
                 last_seen: now,
                 owner,
+                notes: String::new(),
             },
         );
         Ok((id, secret, name))
@@ -372,6 +379,16 @@ impl Store {
         Ok(())
     }
 
+    /// Replace the administrator's notes about a computer.
+    pub fn set_notes(&mut self, id: &str, notes: &str) -> Result<(), StoreError> {
+        let notes = notes.trim_end().replace("\r\n", "\n");
+        if notes.chars().count() > MAX_NOTES {
+            return Err(StoreError::InvalidRequest(format!("notes can be at most {MAX_NOTES} characters")));
+        }
+        self.machines.get_mut(id).ok_or(StoreError::UnknownMachine)?.notes = notes;
+        Ok(())
+    }
+
     /// Remove a machine and withdraw all its links. Returns withdrawn tokens.
     pub fn remove_machine(&mut self, id: &str) -> Result<Vec<String>, StoreError> {
         self.machines.remove(id).ok_or(StoreError::UnknownMachine)?;
@@ -476,6 +493,10 @@ mod tests {
         assert_eq!(s.register(Some("nope"), None, None, info("pc"), 0), Err(StoreError::BadEnrollToken));
         let (id, secret, name) = s.register(Some(&tok), None, None, info("pc"), 10).unwrap();
         assert_eq!(name, "pc");
+        assert!(s.set_notes(&id, "Reception\r\n").is_ok());
+        assert_eq!(s.machines[&id].notes, "Reception");
+        assert!(s.set_notes(&id, &"x".repeat(MAX_NOTES + 1)).is_err());
+        assert!(s.set_notes("nope", "x").is_err());
         let (id2, _, _) = s.register(None, Some(&id), Some(&secret), info("pc-renamed"), 20).unwrap();
         assert_eq!(id, id2);
         assert_eq!(s.machines[&id].hostname, "pc-renamed");

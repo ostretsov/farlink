@@ -45,6 +45,8 @@ struct AgentConn {
     tx: mpsc::UnboundedSender<AgentMsg>,
     conn: String,
     version: String,
+    /// Load, memory and disks from the latest heartbeat (memory only).
+    stats: Option<crate::sysstat::SystemStats>,
 }
 
 struct Pending {
@@ -419,6 +421,7 @@ pub fn router(relay: Shared) -> Router {
         .route("/api/logout", post(api_logout))
         .route("/api/overview", get(api_overview))
         .route("/api/machines/{id}/rename", post(api_rename))
+        .route("/api/machines/{id}/notes", post(api_notes))
         .route("/api/machines/{id}", delete(api_remove_machine))
         .route("/api/machines/{id}/owner", post(api_set_owner))
         .route("/api/machines/{id}/preview", get(api_preview))
@@ -780,6 +783,9 @@ pub struct MachineView {
     /// Why the last update of this helper failed.
     #[serde(default)]
     pub update_error: Option<String>,
+    /// CPU, memory and disks while online (helpers from 0.1.9 on).
+    #[serde(default)]
+    pub stats: Option<crate::sysstat::SystemStats>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -793,6 +799,9 @@ pub struct MachineSummary {
     pub last_seen: u64,
     #[serde(default)]
     pub owner: Option<String>,
+    /// Administrator's notes (empty for people).
+    #[serde(default)]
+    pub notes: String,
 }
 
 impl From<&Machine> for MachineSummary {
@@ -806,6 +815,7 @@ impl From<&Machine> for MachineSummary {
             monitors: m.monitors.clone(),
             last_seen: m.last_seen,
             owner: m.owner.clone(),
+            notes: m.notes.clone(),
         }
     }
 }
@@ -864,6 +874,8 @@ pub fn overview_for(r: &Relay, who: &Who) -> Overview {
     let mut o = overview(r);
     if let Who::User(uid) = who {
         o.machines.retain(|m| m.machine.owner.as_deref() == Some(uid.as_str()));
+        // Notes are the administrator's own.
+        o.machines.iter_mut().for_each(|m| m.machine.notes.clear());
         let mine: Vec<String> = o.machines.iter().map(|m| m.machine.id.clone()).collect();
         o.sessions.retain(|s| s["machine_id"].as_str().is_some_and(|id| mine.iter().any(|m| m == id)));
         o.grants.clear();
@@ -898,6 +910,7 @@ pub fn overview(r: &Relay) -> Overview {
                     owner_name: m.owner.as_ref().and_then(|o| s.users.get(o)).map(|u| u.name.clone()),
                     updating,
                     update_error,
+                    stats: if online { r.agents.lock().unwrap().get(&m.id).and_then(|a| a.stats.clone()) } else { None },
                 }
             })
             .collect();
@@ -1030,6 +1043,21 @@ async fn api_rename(State(r): State<Shared>, headers: HeaderMap, Path(id): Path<
         return unauthorized();
     }
     match r.with_store(|s| s.rename_machine(&id, &req.name)) {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(e) => bad(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct NotesReq {
+    notes: String,
+}
+
+async fn api_notes(State(r): State<Shared>, headers: HeaderMap, Path(id): Path<String>, Json(req): Json<NotesReq>) -> Response {
+    if !is_admin(&r, &headers) {
+        return unauthorized();
+    }
+    match r.with_store(|s| s.set_notes(&id, &req.notes)) {
         Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(e) => bad(e),
     }
@@ -1195,7 +1223,7 @@ async fn agent_loop(r: Shared, socket: WebSocket) {
     }
     let (tx, mut rx) = mpsc::unbounded_channel();
     let conn = random_token(8);
-    if let Some(old) = r.agents.lock().unwrap().insert(id.clone(), AgentConn { tx: tx.clone(), conn: conn.clone(), version: version.clone() }) {
+    if let Some(old) = r.agents.lock().unwrap().insert(id.clone(), AgentConn { tx: tx.clone(), conn: conn.clone(), version: version.clone(), stats: None }) {
         drop(old); // an older connection of the same machine; it will notice and stop
     }
     log::info!("'{name}' online ({version})");
@@ -1224,7 +1252,12 @@ async fn agent_loop(r: Shared, socket: WebSocket) {
                 Some(Ok(Message::Text(t))) => match serde_json::from_str::<AgentMsg>(t.as_str()) {
                     Ok(AgentMsg::Preview { req, shots }) => r.preview_arrived(&id, req, shots),
                     Ok(AgentMsg::UpdateFailed { version, error }) => r.update_failed(&id, version, error),
-                    Ok(AgentMsg::Heartbeat { monitors }) => {
+                    Ok(AgentMsg::Heartbeat { monitors, stats }) => {
+                        if stats.is_some()
+                            && let Some(a) = r.agents.lock().unwrap().get_mut(&id).filter(|a| a.conn == conn)
+                        {
+                            a.stats = stats;
+                        }
                         let changed = r.read_store(|s| s.machines.get(&id).is_some_and(|m| m.monitors != monitors));
                         if changed {
                             r.with_store(|s| if let Some(m) = s.machines.get_mut(&id) { m.monitors = monitors; m.last_seen = now_secs(); });

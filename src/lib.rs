@@ -24,6 +24,7 @@ pub mod proto;
 pub mod quality;
 pub mod server;
 pub mod server_update;
+pub mod sysstat;
 pub mod tls;
 pub mod tray;
 pub mod update;

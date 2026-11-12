@@ -11,7 +11,7 @@ use crate::server::{MachineSummary, MachineView, Overview};
 use crate::tray::{Tray, TrayEvent, TrayStatus};
 use crate::util::{human_duration, normalize_server_url, now_secs};
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, FontId, Layout, Margin, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2,
+    self, Align, Color32, CornerRadius, FontId, Layout, Margin, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2,
     ViewportBuilder, ViewportCommand, ViewportId,
 };
 use std::collections::{HashMap, HashSet};
@@ -565,6 +565,13 @@ struct PreviewState {
 
 type PreviewResult = (String, u64, Vec<(u8, Frame)>);
 
+struct NotesEdit {
+    machine_id: String,
+    text: String,
+    /// The text as last saved / received from the relay.
+    saved: String,
+}
+
 struct Renaming {
     machine_id: String,
     text: String,
@@ -602,6 +609,9 @@ pub struct ViewerApp {
     job_grant: Option<Job<String>>,
     job_revoke: Option<Job<()>>,
     job_rename: Option<Job<()>>,
+    job_notes: Option<Job<()>>,
+    /// Notes being edited in the details pane (kept while not yet saved).
+    notes_edit: Option<NotesEdit>,
     /// "Update" / "Update all" of helpers: what to tell the administrator.
     job_update: Option<Job<String>>,
     renaming: Option<Renaming>,
@@ -649,6 +659,7 @@ pub fn sample_overview() -> Overview {
             monitors: mons,
             last_seen: now - seen,
             owner: None,
+            notes: String::new(),
         },
         online,
         sessions: 0,
@@ -656,7 +667,10 @@ pub fn sample_overview() -> Overview {
         owner_name: None,
         updating: false,
         update_error: None,
+        stats: online.then(crate::sysstat::demo_stats),
     };
+    const G: u64 = 1 << 30;
+    let disk = |name: &str, total: u64, free: u64| crate::sysstat::DiskStat { name: name.into(), total: total * G, free: free * G };
     let mut anna = m("demo-anna", "Anna's laptop", "ANNA-NB", "Windows 11 Home", vec![mon(0, 0, 1920, 1080)], true, 0);
     anna.machine.owner = Some("demo-user-anna".into());
     anna.owner_name = Some("Anna".into());
@@ -664,9 +678,20 @@ pub fn sample_overview() -> Overview {
     let mut srv = m("demo-srv", "Accounting server", "ACC-SRV16", "Windows Server 2016", vec![mon(0, 0, 1920, 1080)], true, 0);
     srv.machine.version = "0.0.9".into();
     srv.up_to_date = false;
+    srv.machine.notes = "Backups run at 02:00, do not restart at night.\nUPS in the server room.".into();
+    if let Some(s) = srv.stats.as_mut() {
+        s.cpu = 94.0;
+        s.mem_used = 15 * G;
+        s.disks = vec![disk("C:", 120, 7), disk("D:", 2000, 860)];
+    }
+    let mut office = m("demo-office", "Office PC", "OFFICE-PC", "Windows 11 Pro 23H2 (build 22631)", vec![mon(0, 0, 1600, 900), mon(1, 1600, 1280, 1024)], true, 0);
+    office.machine.notes = "Reception, printer on USB".into();
+    if let Some(s) = office.stats.as_mut() {
+        s.disks = vec![disk("C:", 476, 212)];
+    }
     Overview {
         machines: vec![
-            m("demo-office", "Office PC", "OFFICE-PC", "Windows 11 Pro", vec![mon(0, 0, 1600, 900), mon(1, 1600, 1280, 1024)], true, 0),
+            office,
             srv,
             m(
                 "demo-ubuntu",
@@ -734,6 +759,8 @@ impl ViewerApp {
             job_grant: None,
             job_revoke: None,
             job_rename: None,
+            job_notes: None,
+            notes_edit: None,
             job_update: None,
             renaming: None,
             last_refresh: None,
@@ -1021,6 +1048,13 @@ impl ViewerApp {
             }
             self.refresh(ctx);
         }
+        if let Some(r) = take_job(&mut self.job_notes) {
+            match r {
+                Ok(()) => self.toast("Notes saved"),
+                Err(e) => self.toast(format!("Saving notes failed: {e}")),
+            }
+            self.refresh(ctx);
+        }
         if let Some(r) = take_job(&mut self.job_update) {
             match r {
                 Ok(text) => self.toast(text),
@@ -1110,8 +1144,6 @@ impl ViewerApp {
             .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(14, 8)).stroke(Stroke::new(1.0, LINE)))
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
-                    logo(ui);
-                    ui.add_space(10.0);
                     let (dot, text) = if self.demo {
                         (AMBER, "Sample computers (demo)".to_string())
                     } else if self.signed_in() {
@@ -1318,7 +1350,8 @@ impl ViewerApp {
                 let can_rename = ov.role == "admin";
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     for m in ov.machines.iter().filter(|m| {
-                        q.is_empty() || format!("{} {} {}", m.machine.name, m.machine.hostname, m.machine.os).to_lowercase().contains(&q)
+                        q.is_empty()
+                            || format!("{} {} {} {}", m.machine.name, m.machine.hostname, m.machine.os, m.machine.notes).to_lowercase().contains(&q)
                     }) {
                         let selected = self.selected.as_deref() == Some(m.machine.id.as_str());
                         let in_session = self.sessions.iter().any(|s| s.machine_id.as_deref() == Some(m.machine.id.as_str()));
@@ -1571,14 +1604,26 @@ impl ViewerApp {
         });
         ui.add_space(12.0);
         ui.horizontal(|ui| {
-            ui.add_enabled_ui(mv.online, |ui| {
-                if primary_button(ui, "Control").clicked() {
-                    self.connect_machine(ctx, m, false);
+            // An open connection to this computer: one "Disconnect" instead of
+            // the two connect buttons (mode is switched in the bottom bar).
+            if let Some(idx) = self.sessions.iter().position(|s| s.machine_id.as_deref() == Some(m.id.as_str())) {
+                let b = egui::Button::new(RichText::new("Disconnect").size(15.0).strong().color(Color32::from_rgb(40, 8, 8)))
+                    .fill(DANGER)
+                    .min_size(Vec2::new(130.0, 34.0));
+                if ui.add(b).clicked() {
+                    self.sessions.remove(idx);
+                    ctx.request_repaint();
                 }
-                if ui.add(egui::Button::new(RichText::new("View only").size(15.0)).min_size(Vec2::new(130.0, 34.0))).clicked() {
-                    self.connect_machine(ctx, m, true);
-                }
-            });
+            } else {
+                ui.add_enabled_ui(mv.online, |ui| {
+                    if primary_button(ui, "Control").clicked() {
+                        self.connect_machine(ctx, m, false);
+                    }
+                    if ui.add(egui::Button::new(RichText::new("View only").size(15.0)).min_size(Vec2::new(130.0, 34.0))).clicked() {
+                        self.connect_machine(ctx, m, true);
+                    }
+                });
+            }
             let is_admin = self.overview.as_ref().is_none_or(|o| o.role == "admin");
             if is_admin
                 && ui.add(egui::Button::new(RichText::new("Temporary link...").size(15.0)).min_size(Vec2::new(160.0, 34.0))).clicked()
@@ -1596,8 +1641,20 @@ impl ViewerApp {
             self.grant_card(ctx, ui, m);
         }
 
+        if let Some(s) = mv.stats.as_ref().filter(|_| mv.online) {
+            ui.add_space(14.0);
+            stats_card(ui, s);
+        }
+        if self.overview.as_ref().is_some_and(|o| o.role == "admin") {
+            ui.add_space(14.0);
+            self.notes_card(ctx, ui, m);
+        }
+
         ui.add_space(14.0);
-        self.screens_card(ui, m);
+        // Double-clicking the screens picture does what "Control" does.
+        if self.screens_card(ui, m, mv.online) {
+            self.connect_machine(ctx, m, false);
+        }
         ui.add_space(14.0);
         self.quality_card(ui);
     }
@@ -1671,7 +1728,64 @@ impl ViewerApp {
         });
     }
 
-    fn screens_card(&mut self, ui: &mut egui::Ui, m: &MachineSummary) {
+    /// The administrator's notes about a computer, saved on the relay (the web
+    /// admin shows and edits the same text). Unsaved edits are kept; otherwise
+    /// the text follows the relay.
+    fn notes_card(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, m: &MachineSummary) {
+        let e = match &mut self.notes_edit {
+            Some(e) if e.machine_id == m.id => e,
+            slot => slot.insert(NotesEdit { machine_id: m.id.clone(), text: m.notes.clone(), saved: m.notes.clone() }),
+        };
+        if e.text == e.saved && m.notes != e.saved {
+            e.text = m.notes.clone();
+            e.saved = m.notes.clone();
+        }
+        let mut save = false;
+        let mut revert = false;
+        let dirty = e.text != e.saved;
+        card(ui, f32::INFINITY, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Notes").size(16.0).strong());
+                ui.label(RichText::new("only for administrators · also in the web admin").color(MUTED));
+            });
+            ui.add_space(6.0);
+            ui.add(
+                egui::TextEdit::multiline(&mut e.text)
+                    .hint_text("Where it is, who uses it, anything to remember...")
+                    .desired_rows(3)
+                    .char_limit(crate::grants::MAX_NOTES)
+                    .desired_width(f32::INFINITY),
+            );
+            if dirty {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    save = ui.add_enabled(self.job_notes.is_none(), egui::Button::new("Save notes")).clicked();
+                    revert = ui.button("Cancel").clicked();
+                });
+            }
+        });
+        if revert {
+            e.text = e.saved.clone();
+        }
+        if save {
+            let text = e.text.trim_end().to_string();
+            e.text = text.clone();
+            e.saved = text.clone();
+            if let Some(mv) = self.overview.as_mut().and_then(|o| o.machines.iter_mut().find(|x| x.machine.id == m.id)) {
+                mv.machine.notes = text.clone();
+            }
+            if !self.demo
+                && let Some(api) = self.api()
+            {
+                let id = m.id.clone();
+                self.job_notes = Some(spawn_job(ctx, move || api.set_notes(&id, &text)));
+            }
+        }
+    }
+
+    /// Returns true when the picture was double-clicked to connect (online, no open connection).
+    fn screens_card(&mut self, ui: &mut egui::Ui, m: &MachineSummary, online: bool) -> bool {
+        let mut connect = false;
         let session_idx = self.sessions.iter().position(|s| s.machine_id.as_deref() == Some(m.id.as_str()));
         let monitors = session_idx
             .map(|i| self.sessions[i].handle.shared.lock().unwrap().monitors.clone())
@@ -1706,7 +1820,13 @@ impl ViewerApp {
             let (vx, vy, vw, vh) = crate::desktop::virtual_bounds(&monitors);
             let avail_w = ui.available_width().min(760.0);
             let scale = (avail_w / vw as f32).min(260.0 / vh as f32);
-            let (area, _) = ui.allocate_exact_size(Vec2::new(avail_w, vh as f32 * scale + 8.0), Sense::hover());
+            let can_connect = online && session_idx.is_none();
+            let sense = if can_connect { Sense::click() } else { Sense::hover() };
+            let (area, resp) = ui.allocate_exact_size(Vec2::new(avail_w, vh as f32 * scale + 8.0), sense);
+            if can_connect {
+                connect = resp.double_clicked();
+                resp.on_hover_text("Double-click to control this computer");
+            }
             let painter = ui.painter_at(area);
             let off = Vec2::new((avail_w - vw as f32 * scale) / 2.0, 4.0);
             for mon in &monitors {
@@ -1760,6 +1880,7 @@ impl ViewerApp {
                 self.layouts_dirty = Some(Instant::now());
             }
         });
+        connect
     }
 
     fn quality_card(&mut self, ui: &mut egui::Ui) {
@@ -2577,15 +2698,6 @@ impl eframe::App for ViewerApp {
 
 // ------------------------------------------------------------------ widgets
 
-fn logo(ui: &mut egui::Ui) {
-    let (r, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
-    let p = ui.painter();
-    p.rect_filled(r, CornerRadius::same(6), Color32::from_rgb(42, 127, 214));
-    p.rect_filled(Rect::from_min_max(r.min, r.center() + Vec2::new(4.0, 4.0)), CornerRadius::same(5), ACCENT);
-    p.rect_stroke(r.shrink(6.0), CornerRadius::same(2), Stroke::new(2.0, Color32::WHITE), StrokeKind::Inside);
-    ui.label(RichText::new("Farlink").size(18.0).strong());
-}
-
 fn chip(ui: &mut egui::Ui, dot: Color32, text: &str) {
     egui::Frame::new()
         .fill(BG)
@@ -2688,8 +2800,14 @@ fn paint_os_glyph(p: &egui::Painter, r: Rect, os: &str) {
     }
 }
 
+/// One computer in the list: name, OS, load and disks while online, and
+/// the first line of the administrator's notes.
 fn machine_row(ui: &mut egui::Ui, m: &MachineView, selected: bool, in_session: bool, now: u64) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 54.0), Sense::click());
+    let stats = m.stats.as_ref().filter(|_| m.online);
+    let notes = m.machine.notes.lines().map(str::trim).find(|l| !l.is_empty());
+    let extra = stats.map_or(0, |s| 1 + usize::from(!s.disks.is_empty())) + usize::from(notes.is_some());
+    let height = 54.0 + 17.0 * extra as f32;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
     let p = ui.painter();
     let fill = if selected {
         Color32::from_rgb(31, 50, 52)
@@ -2705,15 +2823,51 @@ fn machine_row(ui: &mut egui::Ui, m: &MachineView, selected: bool, in_session: b
     }
     paint_os_glyph(p, Rect::from_min_size(rect.min + Vec2::new(10.0, 11.0), Vec2::splat(32.0)), &m.machine.os);
     let name_color = if m.online { TEXT } else { MUTED };
-    p.text(rect.min + Vec2::new(52.0, 18.0), Align2::LEFT_CENTER, &m.machine.name, FontId::proportional(14.5), name_color);
+    let text_w = rect.width() - 52.0 - 40.0;
+    let x = rect.min.x + 52.0;
+    one_line(p, Pos2::new(x, rect.min.y + 18.0), &m.machine.name, 14.5, name_color, text_w);
     let screens = m.machine.monitors.len();
     let owner = m.owner_name.as_ref().map(|o| format!("{o} · ")).unwrap_or_default();
     let sub = if m.online {
-        format!("{owner}{} · {} screen{}", short_os(&m.machine.os), screens, if screens == 1 { "" } else { "s" })
+        format!("{owner}{} · {} screen{}", m.machine.os, screens, if screens == 1 { "" } else { "s" })
     } else {
-        format!("offline · {} ago", human_duration(now.saturating_sub(m.machine.last_seen)))
+        format!("offline · {} ago · {}", human_duration(now.saturating_sub(m.machine.last_seen)), m.machine.os)
     };
-    p.text(rect.min + Vec2::new(52.0, 37.0), Align2::LEFT_CENTER, sub, FontId::proportional(12.0), MUTED);
+    one_line(p, Pos2::new(x, rect.min.y + 37.0), &sub, 12.0, MUTED, rect.max.x - x - 10.0);
+    let mut y = rect.min.y + 54.0;
+    if let Some(s) = stats {
+        let mut job = egui::text::LayoutJob::default();
+        let font = FontId::proportional(12.0);
+        let mut part = |text: String, color: Color32| {
+            job.append(&text, 0.0, egui::TextFormat::simple(font.clone(), color));
+        };
+        part(format!("CPU {:.0}%", s.cpu), load_color(s.cpu));
+        part("  ·  ".into(), MUTED);
+        let mem = if s.mem_total > 0 { s.mem_used as f32 * 100.0 / s.mem_total as f32 } else { 0.0 };
+        part(format!("RAM {} of {}", crate::sysstat::human_bytes(s.mem_used), crate::sysstat::human_bytes(s.mem_total)), load_color(mem));
+        paint_job(p, Pos2::new(x, y), job, rect.max.x - x - 10.0);
+        y += 17.0;
+        if !s.disks.is_empty() {
+            let mut job = egui::text::LayoutJob::default();
+            for (i, d) in s.disks.iter().enumerate() {
+                if i > 0 {
+                    job.append("  ·  ", 0.0, egui::TextFormat::simple(font.clone(), MUTED));
+                }
+                let used = 100.0 - d.free as f32 * 100.0 / d.total.max(1) as f32;
+                let text = format!("{} {} free", d.name, crate::sysstat::human_bytes(d.free));
+                job.append(&text, 0.0, egui::TextFormat::simple(font.clone(), load_color(used)));
+            }
+            paint_job(p, Pos2::new(x, y), job, rect.max.x - x - 10.0);
+            y += 17.0;
+        }
+    }
+    if let Some(n) = notes {
+        let job = egui::text::LayoutJob::single_section(
+            n.to_string(),
+            egui::TextFormat { font_id: FontId::proportional(12.0), color: AMBER.linear_multiply(0.85), italics: true, ..Default::default() },
+        );
+        paint_job(p, Pos2::new(x, y), job, rect.max.x - x - 10.0);
+    }
     let dot = if in_session {
         ACCENT
     } else if m.online {
@@ -2721,20 +2875,90 @@ fn machine_row(ui: &mut egui::Ui, m: &MachineView, selected: bool, in_session: b
     } else {
         Color32::from_rgb(89, 97, 109)
     };
-    p.circle_filled(Pos2::new(rect.max.x - 14.0, rect.center().y), 4.5, dot);
+    let mid = rect.min.y + 27.0;
+    p.circle_filled(Pos2::new(rect.max.x - 14.0, mid), 4.5, dot);
     if !m.up_to_date {
         // Small "arrow up": this helper is older than the published version.
-        let c = Pos2::new(rect.max.x - 30.0, rect.center().y);
+        let c = Pos2::new(rect.max.x - 30.0, mid);
         let color = if m.update_error.is_some() { DANGER } else { AMBER };
         let tri = vec![c + Vec2::new(0.0, -5.0), c + Vec2::new(5.0, 2.0), c + Vec2::new(-5.0, 2.0)];
         p.add(egui::Shape::convex_polygon(tri, color, Stroke::NONE));
         p.rect_filled(Rect::from_center_size(c + Vec2::new(0.0, 4.0), Vec2::new(3.0, 4.0)), CornerRadius::ZERO, color);
     }
+    let resp = match stats {
+        Some(s) if !s.disks.is_empty() => resp.on_hover_text(disk_details(s)),
+        _ => resp,
+    };
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-fn short_os(os: &str) -> String {
-    os.split_whitespace().take(3).collect::<Vec<_>>().join(" ")
+/// CPU, memory and every disk of an online computer.
+fn stats_card(ui: &mut egui::Ui, s: &crate::sysstat::SystemStats) {
+    use crate::sysstat::human_bytes;
+    card(ui, f32::INFINITY, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("System").size(16.0).strong());
+            ui.label(RichText::new("updated every 30 s").color(MUTED));
+        });
+        ui.add_space(6.0);
+        let mem = s.mem_used as f32 * 100.0 / s.mem_total.max(1) as f32;
+        let mut rows = vec![
+            (format!("CPU · {} cores", s.cores), s.cpu, format!("{:.0}% busy", s.cpu)),
+            ("Memory".to_string(), mem, format!("{} of {} used", human_bytes(s.mem_used), human_bytes(s.mem_total))),
+        ];
+        for d in &s.disks {
+            let used = 100.0 - d.free as f32 * 100.0 / d.total.max(1) as f32;
+            rows.push((format!("Disk {}", d.name), used, format!("{} free of {}", human_bytes(d.free), human_bytes(d.total))));
+        }
+        egui::Grid::new("stats").num_columns(3).spacing(Vec2::new(14.0, 6.0)).show(ui, |ui| {
+            for (name, pct, text) in rows {
+                ui.label(name);
+                let color = match load_color(pct) {
+                    MUTED => ACCENT,
+                    c => c,
+                };
+                ui.add(egui::ProgressBar::new(pct / 100.0).desired_width(220.0).desired_height(8.0).fill(color));
+                ui.label(RichText::new(text).color(MUTED));
+                ui.end_row();
+            }
+        });
+    });
+}
+
+/// Normal below 75 %, amber up to 90 %, red above.
+fn load_color(percent: f32) -> Color32 {
+    if percent >= 90.0 {
+        DANGER
+    } else if percent >= 75.0 {
+        AMBER
+    } else {
+        MUTED
+    }
+}
+
+/// "C:  7.0 GB free of 120 GB (94% used)", one disk per line.
+fn disk_details(s: &crate::sysstat::SystemStats) -> String {
+    use crate::sysstat::human_bytes;
+    s.disks
+        .iter()
+        .map(|d| {
+            let used = 100 - (d.free * 100 / d.total.max(1));
+            format!("{}  {} free of {} ({used}% used)", d.name, human_bytes(d.free), human_bytes(d.total))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Paint text on one line, cut with "…" when wider than `max_w`; `pos` is the left centre.
+fn one_line(p: &egui::Painter, pos: Pos2, text: &str, size: f32, color: Color32, max_w: f32) {
+    paint_job(p, pos, egui::text::LayoutJob::simple_singleline(text.to_string(), FontId::proportional(size), color), max_w);
+}
+
+fn paint_job(p: &egui::Painter, pos: Pos2, mut job: egui::text::LayoutJob, max_w: f32) {
+    job.wrap = egui::text::TextWrapping::truncate_at_width(max_w.max(10.0));
+    let galley = p.layout_job(job);
+    let at = Pos2::new(pos.x, pos.y - galley.size().y / 2.0);
+    p.galley(at, galley, TEXT);
 }
 
 /// Status bar: relay version, when it last looked for and installed an update

@@ -93,8 +93,10 @@ async fn agent_connection(
     let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<AgentMsg>();
     std::thread::Builder::new().name("preview".into()).spawn(move || preview_worker(demo, preview_rx, reply_tx))?;
 
+    // The first heartbeat goes right away, so the relay has the computer's
+    // load and disks as soon as it is online.
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
-    heartbeat.tick().await;
+    let sampler = Arc::new(std::sync::Mutex::new(crate::sysstat::Sampler::default()));
     loop {
         tokio::select! {
             reply = reply_rx.recv() => {
@@ -161,7 +163,13 @@ async fn agent_connection(
                 }
             }
             _ = heartbeat.tick() => {
-                let hb = AgentMsg::Heartbeat { monitors: monitors.clone() };
+                let sampler = sampler.clone();
+                let stats = tokio::task::spawn_blocking(move || {
+                    if demo { crate::sysstat::demo_stats() } else { sampler.lock().unwrap().sample() }
+                })
+                .await
+                .ok();
+                let hb = AgentMsg::Heartbeat { monitors: monitors.clone(), stats };
                 sink.send(Message::Text(serde_json::to_string(&hb)?.into())).await?;
                 if !opts.no_update && last_update_check.elapsed() > UPDATE_CHECK {
                     *last_update_check = Instant::now();

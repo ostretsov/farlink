@@ -225,8 +225,13 @@ pub enum AgentMsg {
     /// host -> relay: installing an update did not work (a successful update
     /// restarts the helper, which then registers with its new version).
     UpdateFailed { version: String, error: String },
-    /// host -> relay: monitors changed / still alive.
-    Heartbeat { monitors: Vec<MonitorInfo> },
+    /// host -> relay: monitors changed / still alive, with CPU, memory and
+    /// disks (older helpers send no `stats`).
+    Heartbeat {
+        monitors: Vec<MonitorInfo>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stats: Option<crate::sysstat::SystemStats>,
+    },
     /// relay -> host: send small pictures of every screen (the preview of a
     /// computer selected in the list).
     PreviewRequest { req: u32 },

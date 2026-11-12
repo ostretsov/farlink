@@ -1280,6 +1280,7 @@ dependencies = [
  "image",
  "jpeg-encoder",
  "ksni",
+ "libc",
  "log",
  "png",
  "rand 0.10.3",

@@ -78,7 +78,7 @@ function render() {
   renderServer(admin);
   $('installUrl').textContent = data.install_url;
   const q = $('filter').value.toLowerCase();
-  const ms = data.machines.filter((m) => !q || (m.name + m.hostname + m.os + (m.owner_name || '')).toLowerCase().includes(q));
+  const ms = data.machines.filter((m) => !q || (m.name + m.hostname + m.os + (m.owner_name || '') + (m.notes || '')).toLowerCase().includes(q));
   const outdated = data.machines.filter((m) => m.online && !m.up_to_date && !m.updating).length;
   $('updAll').classList.toggle('hidden', !admin || !outdated);
   $('updAll').textContent = 'Update ' + outdated + ' out of date';
@@ -87,15 +87,16 @@ function render() {
   $('machines').innerHTML = ms.map((m) => `<tr ${admin ? `oncontextmenu="rowMenu(event, '${m.id}')" title="Right-click for more"` : ''}>
     <td><span class="dot ${m.online ? 'on' : ''}"></span><b>${esc(m.name)}</b>
       ${m.sessions ? '<span class="tag ctrl">in use</span>' : ''}
-      <div class="muted">${m.online ? 'online' : 'seen ' + ago(data.now - m.last_seen)} · ${esc(m.hostname)}</div></td>
-    <td>${esc(m.os)}</td><td>${screens(m.monitors)}</td>
+      <div class="muted">${m.online ? 'online' : 'seen ' + ago(data.now - m.last_seen)} · ${esc(m.hostname)}</div>
+      ${m.notes ? `<div class="notes">${esc(m.notes)}</div>` : ''}</td>
+    <td>${esc(m.os)}</td><td>${loadCell(m)}</td><td>${screens(m.monitors)}</td>
     ${admin ? `<td>${ownerSelect(m)}</td>` : ''}
     <td>${versionCell(m, admin)}</td>
     <td style="text-align:right;white-space:nowrap">
       <a class="btn small primary" href="/view/${m.id}" target="_blank" ${m.online ? '' : 'style="opacity:.5"'}>Control</a>
       <a class="btn small" href="/view/${m.id}?view_only=1" target="_blank">View</a>
       ${admin ? `<button class="small more" title="More" onclick="rowMenu(event, '${m.id}')">⋯</button>` : ''}</td></tr>`).join('')
-    || `<tr><td colspan="6" class="muted">${admin ? 'No computers yet. Open the install link above on a computer to add it.' : 'No computers yet. Ask the administrator for your personal install link.'}</td></tr>`;
+    || `<tr><td colspan="7" class="muted">${admin ? 'No computers yet. Open the install link above on a computer to add it.' : 'No computers yet. Ask the administrator for your personal install link.'}</td></tr>`;
 
   if (!admin) return;
 
@@ -125,6 +126,26 @@ function render() {
     <td>${s.view_only ? '<span class="tag view">view</span>' : '<span class="tag ctrl">control</span>'}</td>
     <td style="text-align:right"><button class="small danger" onclick="endSession('${s.id}')">End</button></td></tr>`).join('')
     || '<tr><td colspan="4" class="muted">Nobody is connected.</td></tr>';
+}
+
+// CPU, memory and disks of an online computer (helpers that report them).
+function bytes(n) {
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (n >= 100 || i === 0 ? n.toFixed(0) : n.toFixed(1)) + ' ' + u[i];
+}
+function level(pct) { return pct >= 90 ? 'bad' : pct >= 75 ? 'warn' : ''; }
+function loadCell(m) {
+  const s = m.online && m.stats;
+  if (!s) return '<span class="muted">—</span>';
+  const mem = s.mem_total ? s.mem_used * 100 / s.mem_total : 0;
+  const disks = s.disks.map((d) => {
+    const used = 100 - d.free * 100 / (d.total || 1);
+    return `<span class="${level(used)}" title="${bytes(d.free)} free of ${bytes(d.total)}">${esc(d.name)} ${bytes(d.free)} free</span>`;
+  }).join(' · ');
+  return `<div class="load"><span class="${level(s.cpu)}">CPU ${Math.round(s.cpu)}%</span> ·
+    <span class="${level(mem)}">RAM ${bytes(s.mem_used)} / ${bytes(s.mem_total)}</span>${disks ? '<br>' + disks : ''}</div>`;
 }
 
 // Helper version on a computer, how its update goes, and "Update" (administrator).
@@ -256,6 +277,21 @@ async function rename(id) {
     try { await api('POST', '/api/machines/' + id + '/rename', { name: n.trim() }); toast('Renamed'); refresh(); } catch (e) { toast(e.message); }
   }
 }
+let notesMachine = null;
+function openNotes(id) {
+  const m = data.machines.find((x) => x.id === id);
+  notesMachine = id;
+  $('nName').textContent = m.name;
+  $('nText').value = m.notes || '';
+  $('notesDlg').showModal();
+}
+async function saveNotes(e) {
+  e.preventDefault();
+  try {
+    await api('POST', '/api/machines/' + notesMachine + '/notes', { notes: $('nText').value });
+    $('notesDlg').close(); toast('Notes saved'); refresh();
+  } catch (err) { toast(err.message); }
+}
 // "⋯" / right-click menu on a computer row (administrator only).
 function closeMenu() { document.querySelectorAll('.ctxmenu').forEach((el) => el.remove()); }
 function rowMenu(ev, id) {
@@ -267,6 +303,7 @@ function rowMenu(ev, id) {
   const items = [
     ['Temporary link…', () => openGrant(id)],
     ['Rename…', () => rename(id)],
+    ['Notes…', () => openNotes(id)],
     ['Remove…', () => removeMachine(id), 'danger'],
   ];
   for (const [label, fn, cls] of items) {

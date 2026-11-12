@@ -21,7 +21,7 @@ button:hover, .btn:hover { border-color: var(--accent); }
 button.primary, .btn.primary { background: var(--accent); color: #062019; border-color: var(--accent); font-weight: 600; }
 button.danger { color: var(--danger); }
 button.small { padding: 5px 11px; font-size: 16px; }
-input, select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 10px; padding: 9px 12.5px; font: inherit; }
+input, select, textarea { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 10px; padding: 9px 12.5px; font: inherit; }
 input:focus, select:focus { outline: none; border-color: var(--accent); }
 table { width: 100%; border-collapse: collapse; }
 th { text-align: left; color: var(--muted); font-weight: 500; font-size: 15px; text-transform: uppercase; letter-spacing: .6px; padding: 7.5px 10px; border-bottom: 1px solid var(--line); }
@@ -80,3 +80,7 @@ td select { padding: 5px 10px; }
 .tag.switch:hover { border-color: currentColor; }
 button.more { padding: 5px 10px; font-weight: 700; letter-spacing: 1px; }
 .ctxmenu button.danger { color: var(--danger); }
+textarea { width: 100%; resize: vertical; box-sizing: border-box; }
+.notes { color: var(--accent2); font-style: italic; white-space: pre-line; max-width: 420px; }
+.load { font-size: 14px; line-height: 1.5; white-space: nowrap; }
+.load .warn { color: var(--accent2); } .load .bad { color: var(--danger); }
