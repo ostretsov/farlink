@@ -1,7 +1,7 @@
 //! Desktop viewer (egui): machine list, details, quality, temporary links and
 //! one native window per remote monitor, reopened where it was left.
 
-use crate::config::{ScaleMode, ViewerConfig, load_json, save_json, viewer_dir};
+use crate::config::{FilesSide, ScaleMode, ViewerConfig, load_json, save_json, viewer_dir};
 use crate::layout::{LayoutStore, WindowPlace, default_place};
 use crate::codec::Frame;
 use crate::net::{Api, ConnState, SessionHandle, Target, TransferState, decode_preview, demo_preview, parse_link};
@@ -178,6 +178,10 @@ struct OpenSession {
     /// ends when the file browser is closed. "Show screens" turns it into a
     /// normal connection.
     files_only: bool,
+    /// What the file browser remembers (from the settings; kept up to date
+    /// while it is open): this computer's side and the remote computer's.
+    files_local: FilesSide,
+    files_remote: FilesSide,
 }
 
 /// Two-pane file browser: this computer on the left, the remote one on the right.
@@ -188,22 +192,99 @@ pub struct FilesView {
     local_sel: Option<crate::proto::FsEntry>,
     remote_sel: Option<crate::proto::FsEntry>,
     new_folder: String,
-    show_hidden: bool,
+    local_hidden: bool,
+    remote_hidden: bool,
+    remote_start: RemoteStart,
+}
+
+/// Where the remote side of the file browser begins: the folder remembered
+/// for that computer, or (if it is gone, or nothing is remembered) its
+/// primary disk, found in the list of its drives.
+#[derive(Debug, Clone, PartialEq)]
+enum RemoteStart {
+    /// Asked for the remembered folder; waiting to see if it still exists.
+    Remembered(String),
+    /// Asked for the drives; waiting to pick the primary one.
+    Drives,
+    /// Started: where the person goes from here is remembered.
+    Done,
+}
+
+/// The folder on this computer the file browser starts in: the remembered
+/// one if it still exists, else the home folder, else the root.
+fn local_start(remembered: Option<&str>) -> String {
+    let is_dir = |p: &str| !p.is_empty() && std::path::Path::new(p).is_dir();
+    if let Some(p) = remembered.filter(|p| is_dir(p)) {
+        return p.to_string();
+    }
+    if let Some(h) = dirs::home_dir().map(|h| h.display().to_string()).filter(|h| is_dir(h)) {
+        return h;
+    }
+    // "" lists the drives on Windows; elsewhere there is one root.
+    if cfg!(windows) { String::new() } else { "/".to_string() }
+}
+
+/// The primary disk among a computer's starting places: `C:` on Windows
+/// (else its first drive), `/` elsewhere.
+fn primary_disk(roots: &[crate::proto::FsEntry]) -> Option<String> {
+    let drive = |p: &str| p.len() >= 2 && p.as_bytes()[1] == b':' && p.as_bytes()[0].is_ascii_alphabetic();
+    roots
+        .iter()
+        .find(|e| e.path.to_ascii_uppercase().starts_with("C:"))
+        .or_else(|| roots.iter().find(|e| drive(&e.path)))
+        .or_else(|| roots.iter().find(|e| e.path == "/"))
+        .or(roots.first())
+        .map(|e| e.path.clone())
 }
 
 impl FilesView {
-    fn new() -> FilesView {
-        let start = dirs::home_dir().map(|h| h.display().to_string()).unwrap_or_default();
+    /// `local` / `remote`: what is remembered about this computer's side
+    /// and about the remote computer's.
+    fn new(local: &FilesSide, remote: &FilesSide) -> FilesView {
         let mut v = FilesView {
-            local_dir: start,
+            local_dir: local_start(Some(local.dir.as_str())),
             local: Default::default(),
             local_sel: None,
             remote_sel: None,
             new_folder: String::new(),
-            show_hidden: false,
+            local_hidden: local.show_hidden,
+            remote_hidden: remote.show_hidden,
+            remote_start: if remote.dir.is_empty() { RemoteStart::Drives } else { RemoteStart::Remembered(remote.dir.clone()) },
         };
         v.reload_local();
         v
+    }
+
+    /// The first thing to ask the remote computer for.
+    fn first_remote_path(&self) -> &str {
+        match &self.remote_start {
+            RemoteStart::Remembered(p) => p,
+            _ => "",
+        }
+    }
+
+    /// Follow the start-up steps as listings arrive. Returns a folder to ask for next.
+    fn remote_start_step(&mut self, remote: &crate::net::RemoteDir) -> Option<String> {
+        if remote.loading {
+            return None;
+        }
+        match &self.remote_start {
+            RemoteStart::Remembered(p) if remote.path == *p => {
+                if remote.error.is_some() {
+                    // The remembered folder is gone: the primary disk instead.
+                    self.remote_start = RemoteStart::Drives;
+                    Some(String::new())
+                } else {
+                    self.remote_start = RemoteStart::Done;
+                    None
+                }
+            }
+            RemoteStart::Drives if remote.path.is_empty() => {
+                self.remote_start = RemoteStart::Done;
+                primary_disk(&remote.entries)
+            }
+            _ => None,
+        }
     }
 
     fn reload_local(&mut self) {
@@ -263,8 +344,13 @@ fn file_pane(
             ui.spacing_mut().item_spacing.y = 1.0;
             for e in dir.entries.iter().filter(|e| show_hidden || !e.name.starts_with('.')) {
                 let selected = sel.is_some_and(|s| s.path == e.path);
-                let text = if e.is_dir { format!("[folder]  {}", e.name) } else { format!("{}    {}", e.name, format_size(e.size)) };
-                let resp = ui.add(egui::Button::new(RichText::new(text).color(if e.is_dir { ACCENT } else { TEXT })).selected(selected).frame(selected).min_size(Vec2::new(ui.available_width(), 20.0)));
+                // Room at the left for the folder icon (files line up with folder names).
+                const PAD: &str = "          ";
+                let text = if e.is_dir { format!("{PAD}{}", e.name) } else { format!("{PAD}{}    {}", e.name, format_size(e.size)) };
+                let resp = ui.add(egui::Button::new(RichText::new(text).color(TEXT)).selected(selected).frame(selected).min_size(Vec2::new(ui.available_width(), 20.0)));
+                if e.is_dir {
+                    paint_folder(ui.painter(), Pos2::new(resp.rect.left() + 6.0, resp.rect.center().y));
+                }
                 if resp.double_clicked() && e.is_dir {
                     action = Some(PaneAction::Open(e.path.clone()));
                 } else if resp.clicked() {
@@ -277,6 +363,16 @@ fn file_pane(
         });
     });
     action
+}
+
+/// A small yellow folder; `at` is the middle of its left edge.
+fn paint_folder(p: &egui::Painter, at: Pos2) {
+    let back = Color32::from_rgb(214, 158, 46);
+    let front = Color32::from_rgb(246, 196, 83);
+    // The tab at the top left, then the body in front of it.
+    p.rect_filled(Rect::from_min_size(at + Vec2::new(0.0, -6.5), Vec2::new(7.0, 4.0)), CornerRadius::same(1), back);
+    p.rect_filled(Rect::from_min_size(at + Vec2::new(0.0, -4.5), Vec2::new(16.0, 11.0)), CornerRadius::same(2), back);
+    p.rect_filled(Rect::from_min_size(at + Vec2::new(0.0, -2.5), Vec2::new(16.0, 9.0)), CornerRadius::same(2), front);
 }
 
 /// Contents of the file browser window. Returns true when it should close.
@@ -297,29 +393,37 @@ fn files_window(ui: &mut egui::Ui, s: &mut OpenSession) -> bool {
         }
         (sh.remote_dir.clone(), sh.transfers.clone())
     };
+    if let Some(next) = fv.remote_start_step(&remote) {
+        s.handle.list_remote(&next);
+    }
     egui::Panel::top("files-bar").frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(12, 8))).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            let up_ok = fv.local_sel.as_ref().is_some_and(|e| !e.is_dir) && !remote.path.is_empty();
-            if ui.add_enabled(up_ok, egui::Button::new(RichText::new("Upload  ->").strong())).on_hover_text("Copy the selected file to the remote folder").clicked()
-                && let Some(e) = &fv.local_sel
-            {
-                s.handle.upload(PathBuf::from(&e.path), remote.path.clone());
-            }
-            let down_ok = fv.remote_sel.as_ref().is_some_and(|e| !e.is_dir) && !fv.local_dir.is_empty();
-            if ui.add_enabled(down_ok, egui::Button::new(RichText::new("<-  Download").strong())).on_hover_text("Copy the selected remote file here").clicked()
-                && let Some(e) = &fv.remote_sel
-            {
-                s.handle.download(e, PathBuf::from(&fv.local_dir));
-            }
-            ui.separator();
-            ui.add(egui::TextEdit::singleline(&mut fv.new_folder).hint_text("New remote folder name").desired_width(180.0));
-            let name_ok = crate::files::safe_name(&fv.new_folder).is_some() && !remote.path.is_empty();
-            ui.checkbox(&mut fv.show_hidden, "Show hidden files");
-            if ui.add_enabled(name_ok, egui::Button::new("Create folder")).clicked() {
-                let p = PathBuf::from(&remote.path).join(fv.new_folder.trim());
-                s.handle.mkdir_remote(&p.display().to_string());
-                fv.new_folder.clear();
-            }
+        // Two halves, like the two sides below: this computer, the remote one.
+        ui.columns(2, |cols| {
+            cols[0].horizontal(|ui| {
+                let up_ok = fv.local_sel.as_ref().is_some_and(|e| !e.is_dir) && !remote.path.is_empty();
+                if ui.add_enabled(up_ok, egui::Button::new(RichText::new("Upload  ->").strong())).on_hover_text("Copy the selected file to the remote folder").clicked()
+                    && let Some(e) = &fv.local_sel
+                {
+                    s.handle.upload(PathBuf::from(&e.path), remote.path.clone());
+                }
+                ui.checkbox(&mut fv.local_hidden, "Show hidden files");
+            });
+            cols[1].horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut fv.new_folder).hint_text("New remote folder name").desired_width(180.0));
+                let name_ok = crate::files::safe_name(&fv.new_folder).is_some() && !remote.path.is_empty();
+                if ui.add_enabled(name_ok, egui::Button::new("Create folder")).clicked() {
+                    let p = PathBuf::from(&remote.path).join(fv.new_folder.trim());
+                    s.handle.mkdir_remote(&p.display().to_string());
+                    fv.new_folder.clear();
+                }
+                ui.checkbox(&mut fv.remote_hidden, "Show hidden files");
+                let down_ok = fv.remote_sel.as_ref().is_some_and(|e| !e.is_dir) && !fv.local_dir.is_empty();
+                if ui.add_enabled(down_ok, egui::Button::new(RichText::new("<-  Download").strong())).on_hover_text("Copy the selected remote file here").clicked()
+                    && let Some(e) = &fv.remote_sel
+                {
+                    s.handle.download(e, PathBuf::from(&fv.local_dir));
+                }
+            });
         });
     });
     egui::Panel::bottom("transfers").frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(12, 8))).show(ui, |ui| {
@@ -348,7 +452,7 @@ fn files_window(ui: &mut egui::Ui, s: &mut OpenSession) -> bool {
     });
     egui::CentralPanel::default().frame(egui::Frame::new().fill(BG).inner_margin(Margin::same(12))).show(ui, |ui| {
         ui.columns(2, |cols| {
-            if let Some(a) = file_pane(&mut cols[0], "local", "This computer", &fv.local, fv.local_sel.as_ref(), fv.show_hidden) {
+            if let Some(a) = file_pane(&mut cols[0], "local", "This computer", &fv.local, fv.local_sel.as_ref(), fv.local_hidden) {
                 match a {
                     PaneAction::Open(p) => {
                         fv.local_dir = p;
@@ -358,7 +462,7 @@ fn files_window(ui: &mut egui::Ui, s: &mut OpenSession) -> bool {
                 }
             }
             let title = format!("Remote: {}", s.name);
-            if let Some(a) = file_pane(&mut cols[1], "remote", &title, &remote, fv.remote_sel.as_ref(), fv.show_hidden) {
+            if let Some(a) = file_pane(&mut cols[1], "remote", &title, &remote, fv.remote_sel.as_ref(), fv.remote_hidden) {
                 match a {
                     PaneAction::Open(p) => {
                         fv.remote_sel = None;
@@ -381,9 +485,33 @@ fn files_window(ui: &mut egui::Ui, s: &mut OpenSession) -> bool {
 impl OpenSession {
     fn open_files(&mut self) {
         if self.files.is_none() {
-            self.files = Some(FilesView::new());
-            self.handle.list_remote("");
+            let fv = FilesView::new(&self.files_local, &self.files_remote);
+            self.handle.list_remote(fv.first_remote_path());
+            self.files = Some(fv);
         }
+    }
+
+    /// Take note of where the open file browser is now and what it shows.
+    /// Returns (this computer's side changed, the remote side changed).
+    fn note_files(&mut self) -> (bool, bool) {
+        let Some(fv) = self.files.as_ref() else { return (false, false) };
+        let mut local = FilesSide { dir: self.files_local.dir.clone(), show_hidden: fv.local_hidden };
+        if !fv.local_dir.is_empty() {
+            local.dir.clone_from(&fv.local_dir);
+        }
+        let mut remote = FilesSide { dir: self.files_remote.dir.clone(), show_hidden: fv.remote_hidden };
+        {
+            // The remote folder counts once the start-up steps are over and it could be read.
+            let sh = self.handle.shared.lock().unwrap();
+            let r = &sh.remote_dir;
+            if fv.remote_start == RemoteStart::Done && !r.loading && r.error.is_none() && !r.path.is_empty() {
+                remote.dir.clone_from(&r.path);
+            }
+        }
+        let changed = (local != self.files_local, remote != self.files_remote);
+        self.files_local = local;
+        self.files_remote = remote;
+        changed
     }
 }
 
@@ -937,6 +1065,7 @@ impl ViewerApp {
         }
         let c = ctx.clone();
         let handle = SessionHandle::start(target, self.cfg.quality, view_only, Arc::new(move || c.request_repaint()));
+        let remembered_remote = machine_id.as_ref().and_then(|id| self.cfg.files_remote.get(id).cloned()).unwrap_or_default();
         self.sessions.push(OpenSession {
             id: self.next_session,
             handle,
@@ -965,6 +1094,8 @@ impl ViewerApp {
             pointer_textures: HashMap::new(),
             remote_pointer: None,
             files_only: false,
+            files_local: self.cfg.files_local.clone(),
+            files_remote: remembered_remote,
         });
         self.next_session += 1;
     }
@@ -1936,6 +2067,7 @@ impl ViewerApp {
         let mut new_scale = None;
         let mut new_quality = None;
         let mut new_hidden = None;
+        let mut files_moved = false;
         for s in &mut self.sessions {
             if std::mem::take(&mut s.controls_changed) {
                 new_hidden = Some(s.controls_hidden);
@@ -2016,9 +2148,23 @@ impl ViewerApp {
                     .with_title(format!("{} - Files", s.name))
                     .with_inner_size([980.0, 620.0])
                     .with_min_inner_size([640.0, 360.0]);
-                if ctx.show_viewport_immediate(vid, builder, |ui, _| files_window(ui, s)) {
+                let closed = ctx.show_viewport_immediate(vid, builder, |ui, _| files_window(ui, s));
+                // Remember where the browser is, here and on that computer.
+                let (local_changed, remote_changed) = s.note_files();
+                if local_changed {
+                    self.cfg.files_local.clone_from(&s.files_local);
+                    files_moved = true;
+                }
+                if remote_changed && let Some(key) = &s.key {
+                    self.cfg.files_remote.insert(key.clone(), s.files_remote.clone());
+                    files_moved = true;
+                }
+                if closed {
                     s.files = None;
                 }
+            } else {
+                // Another connection's browser may have moved on since.
+                s.files_local.clone_from(&self.cfg.files_local);
             }
             if (s.files_only || (!monitors.is_empty() && monitors.iter().all(|m| s.closed.contains(&m.index)))) && s.files.is_none() {
                 to_close.push(s.id);
@@ -2026,6 +2172,9 @@ impl ViewerApp {
         }
         if !to_close.is_empty() {
             self.sessions.retain(|s| !to_close.contains(&s.id));
+        }
+        if files_moved {
+            self.save_cfg();
         }
         if let Some(q) = new_quality
             && q != self.cfg.quality
@@ -3177,6 +3326,54 @@ mod tests {
     fn original_size_window_without_controls_is_just_the_screen() {
         let mon = MonitorInfo { index: 0, name: String::new(), x: 0, y: 0, width: 1280, height: 720, primary: true };
         assert_eq!(original_window_size(&mon, 1.0, Some(Vec2::new(1920.0, 1080.0)), false), Vec2::new(1280.0, 720.0));
+    }
+
+    #[test]
+    fn the_file_browser_starts_where_it_was_or_somewhere_sensible() {
+        use crate::net::RemoteDir;
+        use crate::proto::FsEntry;
+        let entry = |p: &str| FsEntry { name: p.into(), path: p.into(), is_dir: true, size: 0, modified: 0 };
+        // This computer: the remembered folder while it exists, else home (or the root).
+        let tmp = std::env::temp_dir().display().to_string();
+        assert_eq!(local_start(Some(&tmp)), tmp);
+        let fallback = local_start(Some("/no/such/folder/anywhere"));
+        assert_eq!(fallback, local_start(None));
+        assert!(fallback.is_empty() || std::path::Path::new(&fallback).is_dir());
+
+        // The primary disk: C: on Windows (else the first drive), / elsewhere.
+        assert_eq!(primary_disk(&[entry("A:\\"), entry("C:\\"), entry("D:\\")]).as_deref(), Some("C:\\"));
+        assert_eq!(primary_disk(&[entry("D:\\"), entry("E:\\")]).as_deref(), Some("D:\\"));
+        assert_eq!(primary_disk(&[entry("/home/anna"), entry("/")]).as_deref(), Some("/"));
+        assert_eq!(primary_disk(&[]), None);
+
+        let listing = |path: &str, entries: Vec<FsEntry>, error: Option<&str>| RemoteDir {
+            path: path.into(),
+            parent: None,
+            entries,
+            error: error.map(str::to_string),
+            loading: false,
+        };
+        // Nothing remembered: the drives are asked for, then the primary disk.
+        let side = |dir: &str| FilesSide { dir: dir.into(), show_hidden: true };
+        let mut fv = FilesView::new(&FilesSide::default(), &FilesSide::default());
+        assert!(!fv.local_hidden && !fv.remote_hidden);
+        assert_eq!(fv.first_remote_path(), "");
+        assert_eq!(fv.remote_start_step(&RemoteDir { loading: true, ..Default::default() }), None, "still waiting");
+        assert_eq!(fv.remote_start_step(&listing("", vec![entry("C:\\"), entry("D:\\")], None)).as_deref(), Some("C:\\"));
+        assert_eq!(fv.remote_start, RemoteStart::Done);
+        assert_eq!(fv.remote_start_step(&listing("", vec![entry("C:\\")], None)), None, "going to the drives later stays there");
+
+        // A remembered folder that still exists is simply opened.
+        let mut fv = FilesView::new(&FilesSide::default(), &side("D:\\Work"));
+        assert!(fv.remote_hidden && !fv.local_hidden, "hidden files are remembered per side");
+        assert_eq!(fv.first_remote_path(), "D:\\Work");
+        assert_eq!(fv.remote_start_step(&listing("D:\\Work", vec![], None)), None);
+        assert_eq!(fv.remote_start, RemoteStart::Done);
+
+        // One that is gone: drives, then the primary disk.
+        let mut fv = FilesView::new(&FilesSide::default(), &side("D:\\Gone"));
+        assert_eq!(fv.remote_start_step(&listing("D:\\Gone", vec![], Some("not found"))).as_deref(), Some(""));
+        assert_eq!(fv.remote_start_step(&listing("", vec![entry("C:\\")], None)).as_deref(), Some("C:\\"));
     }
 
     #[test]

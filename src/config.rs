@@ -114,6 +114,23 @@ pub struct ViewerConfig {
     /// while the mouse rests at the top edge).
     #[serde(default)]
     pub hide_controls: bool,
+    /// File browser, this computer's side: the folder it was last in and
+    /// whether hidden files are shown.
+    #[serde(default)]
+    pub files_local: FilesSide,
+    /// File browser, per remote computer (by machine id): the same.
+    #[serde(default)]
+    pub files_remote: std::collections::BTreeMap<String, FilesSide>,
+}
+
+/// What the file browser remembers about one side.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesSide {
+    /// Last folder ("" = none yet).
+    #[serde(default)]
+    pub dir: String,
+    #[serde(default)]
+    pub show_hidden: bool,
 }
 
 /// How a remote screen is drawn in its window.
@@ -159,6 +176,8 @@ impl Default for ViewerConfig {
             scale_mode: ScaleMode::default(),
             autostart_set_up: false,
             hide_controls: false,
+            files_local: Default::default(),
+            files_remote: Default::default(),
         }
     }
 }
