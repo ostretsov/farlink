@@ -1266,7 +1266,7 @@ dependencies = [
 
 [[package]]
 name = "farlink"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "arboard",
