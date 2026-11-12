@@ -2568,7 +2568,15 @@ const REVEAL_EDGE_MIN: f32 = 4.0;
 struct Reveal {
     at_top_since: Option<Instant>,
     shown: bool,
+    /// Last mouse height seen in the window.
+    last_y: Option<f32>,
+    /// The mouse left through the top: it is on the window's title bar
+    /// (the app sees no mouse there), which counts as the top edge.
+    on_title: bool,
 }
+
+/// Leaving the window this close to its top means going onto the title bar (points).
+const TITLE_EXIT: f32 = 60.0;
 
 impl Reveal {
     /// `y`: mouse height in the window (`None`: outside it); `height`: the
@@ -2576,11 +2584,16 @@ impl Reveal {
     /// while it is).
     fn step(&mut self, y: Option<f32>, height: f32, popup: bool, now: Instant) {
         let edge = (height * REVEAL_EDGE).max(REVEAL_EDGE_MIN);
+        match y {
+            Some(_) => self.on_title = false,
+            None => self.on_title |= self.last_y.is_some_and(|l| l <= TITLE_EXIT),
+        }
+        self.last_y = y;
         if self.shown {
-            if !popup && !y.is_some_and(|y| y <= BAR_HEIGHT + 12.0) {
+            if !popup && !self.on_title && !y.is_some_and(|y| y <= BAR_HEIGHT + 12.0) {
                 *self = Reveal::default();
             }
-        } else if y.is_some_and(|y| y <= edge) {
+        } else if self.on_title || y.is_some_and(|y| y <= edge) {
             let since = *self.at_top_since.get_or_insert(now);
             self.shown = now.duration_since(since) >= REVEAL_AFTER;
         } else {
@@ -3219,16 +3232,40 @@ mod tests {
         assert!(!r.shown);
         r.step(Some(0.0), H, false, at(1500));
         assert!(!r.shown, "only 0.5 s since it came back");
+        r.step(Some(300.0), H, false, at(1550));
         r.step(None, H, false, at(1600));
         r.step(Some(0.0), H, false, at(2700));
-        assert!(!r.shown, "outside the window counts as leaving");
+        assert!(!r.shown, "leaving the window elsewhere counts as leaving");
+    }
+
+    #[test]
+    fn the_title_bar_counts_as_the_top_edge() {
+        const H: f32 = 1000.0;
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut r = Reveal::default();
+        r.step(Some(200.0), H, false, at(0));
+        r.step(Some(40.0), H, false, at(10));
+        r.step(None, H, false, at(20)); // left through the top: on the title bar
+        assert!(!r.shown && r.wait(at(20)).is_some());
+        r.step(None, H, false, at(1020));
+        assert!(r.shown, "a second on the title bar");
+        r.step(None, H, false, at(3000));
+        assert!(r.shown, "stays while the mouse is on the title bar");
+        r.step(Some(20.0), H, false, at(3100));
+        assert!(r.shown, "back onto the controls");
+        r.step(Some(500.0), H, false, at(3200));
+        assert!(!r.shown, "gone once the mouse is on the picture");
+        r.step(None, H, false, at(3300));
+        r.step(None, H, false, at(5000));
+        assert!(!r.shown, "left from the middle of the picture: not the title bar");
     }
 
     #[test]
     fn shown_controls_stay_while_used_and_go_when_the_mouse_leaves() {
         const H: f32 = 1000.0;
         let t0 = Instant::now();
-        let mut r = Reveal { at_top_since: Some(t0), shown: true };
+        let mut r = Reveal { at_top_since: Some(t0), shown: true, ..Default::default() };
         r.step(Some(BAR_HEIGHT - 5.0), H, false, t0);
         assert!(r.shown, "mouse on the controls");
         r.step(Some(400.0), H, true, t0);
