@@ -84,7 +84,7 @@ jobs:
           targets: x86_64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-linux
+          key: release-linux-ubuntu22  # not the 24.04 cache: its build scripts need a newer glibc
       - run: make linux
       - uses: actions/upload-artifact@v4
         with:
@@ -107,7 +107,7 @@ jobs:
           targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-linux-arm64
+          key: release-linux-arm64-ubuntu22  # as above
       - run: make linux-arm64
       - uses: actions/upload-artifact@v4
         with:
