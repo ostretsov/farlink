@@ -93,7 +93,7 @@ cargo run --bin farlink-host -- run --demo --verbose --server http://127.0.0.1:8
 ## CI/CD
 
 `.github/workflows/build.yml` (this folder is meant to be the root of the GitHub repo): tests on every
-push/PR (Linux + Windows); release builds for Linux x86_64, Linux ARM64, Windows x86_64 only on tags and
+push/PR (Linux + Windows); release builds for Linux x86_64, Linux ARM64 (on Ubuntu 22.04 runners, so the programs need only glibc 2.35; `packaging/deb.sh` refuses newer), Windows x86_64 only on tags and
 manual "Run workflow" (so pushing main + tag together doesn't build twice); pushing a tag
 `vX.Y.Z` (must equal `version` in `Cargo.toml`) creates a GitHub Release with the programs, the ready
 `farlink-X.Y.Z.tar.gz` (dist layout) and `SHA256SUMS.txt`.

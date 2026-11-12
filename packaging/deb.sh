@@ -18,6 +18,14 @@ done
 
 # Oldest glibc the program works with = newest symbol version it uses.
 glibc=$(readelf -V "$bin" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+# Refuse a program that needs a newer glibc than we support (Ubuntu 22.04):
+# dpkg would leave it half-installed there and apt would then refuse to
+# install anything else until it is removed. Build on Ubuntu 22.04.
+max_glibc=${FARLINK_MAX_GLIBC:-2.35}
+if [ "$(printf '%s\n%s\n' "$glibc" "$max_glibc" | sort -V | tail -1)" != "$max_glibc" ]; then
+  echo "error: $bin needs glibc $glibc, newer than $max_glibc (Ubuntu 22.04); build it on an older system" >&2
+  exit 1
+fi
 size=$(du -sk "$root/usr" | cut -f1)
 mkdir -p "$root/DEBIAN"
 cat > "$root/DEBIAN/control" <<CONTROL

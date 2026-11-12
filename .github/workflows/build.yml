@@ -76,7 +76,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     name: Build Linux x86_64
     needs: test-linux
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04  # oldest glibc (2.35) = runs on Ubuntu 22.04+; see packaging/deb.sh
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -99,7 +99,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     name: Build Linux ARM64
     needs: test-linux
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-22.04-arm  # oldest glibc (2.35), as above
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
