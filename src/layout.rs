@@ -76,6 +76,16 @@ impl LayoutStore {
         self.machines.remove(machine).is_some()
     }
 
+    /// Forget where one monitor's window goes (it opens side by side again).
+    pub fn forget_monitor(&mut self, machine: &str, monitor: &str) -> bool {
+        let Some(m) = self.machines.get_mut(machine) else { return false };
+        let removed = m.remove(monitor).is_some();
+        if m.is_empty() {
+            self.machines.remove(machine);
+        }
+        removed
+    }
+
     pub fn count(&self, machine: &str) -> usize {
         self.machines.get(machine).map_or(0, |m| m.len())
     }
@@ -147,6 +157,14 @@ mod tests {
         s.set("m", "a", place(1.0));
         assert!(s.forget("m"));
         assert!(!s.forget("m"));
+        let p = default_place(0, 1, 1920, 1080, (1920.0, 1080.0));
+        s.set("m", "a", p);
+        s.set("m", "b", p);
+        assert!(s.forget_monitor("m", "a"));
+        assert!(!s.forget_monitor("m", "a"));
+        assert_eq!(s.count("m"), 1);
+        assert!(s.forget_monitor("m", "b"));
+        assert!(s.machines.is_empty());
         assert_eq!(s.count("m"), 0);
     }
 

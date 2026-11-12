@@ -567,6 +567,7 @@ type PreviewResult = (String, u64, Vec<(u8, Frame)>);
 
 struct NotesEdit {
     machine_id: String,
+    name: String,
     text: String,
     /// The text as last saved / received from the relay.
     saved: String,
@@ -610,7 +611,7 @@ pub struct ViewerApp {
     job_revoke: Option<Job<()>>,
     job_rename: Option<Job<()>>,
     job_notes: Option<Job<()>>,
-    /// Notes being edited in the details pane (kept while not yet saved).
+    /// The open "Notes" window (from the list's right-click menu).
     notes_edit: Option<NotesEdit>,
     /// "Update" / "Update all" of helpers: what to tell the administrator.
     job_update: Option<Job<String>>,
@@ -1153,7 +1154,7 @@ impl ViewerApp {
                     } else {
                         (MUTED, "Not connected".to_string())
                     };
-                    chip(ui, dot, &text);
+                    // Right to left: "Sign out", then who is signed in where, then the rest.
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if self.signed_in() && !self.demo && ui.button("Sign out").clicked() {
                             if let Some(api) = self.api() {
@@ -1163,6 +1164,8 @@ impl ViewerApp {
                             self.overview = None;
                             self.save_cfg();
                         }
+                        chip(ui, dot, &text);
+                        ui.add_space(6.0);
                         if self.demo && !self.opts.demo && self.opts.screenshot.is_none() && ui.button("Leave demo").clicked() {
                             self.demo = false;
                             self.overview = None;
@@ -1317,7 +1320,7 @@ impl ViewerApp {
 
     fn machine_list(&mut self, ui: &mut egui::Ui) {
         egui::Panel::left("machines")
-            .exact_size(300.0)
+            .exact_size(450.0)
             .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::same(12)).stroke(Stroke::new(1.0, LINE)))
             .show(ui, |ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Search computers").desired_width(f32::INFINITY));
@@ -1347,6 +1350,7 @@ impl ViewerApp {
                 ui.add_space(2.0);
                 let mut clicked = None;
                 let mut rename_start: Option<(String, String)> = None;
+                let mut notes_start: Option<NotesEdit> = None;
                 let can_rename = ov.role == "admin";
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     for m in ov.machines.iter().filter(|m| {
@@ -1373,6 +1377,15 @@ impl ViewerApp {
                                     rename_start = Some((m.machine.id.clone(), m.machine.name.clone()));
                                     ui.close();
                                 }
+                                if ui.button("Notes...").clicked() {
+                                    notes_start = Some(NotesEdit {
+                                        machine_id: m.machine.id.clone(),
+                                        name: m.machine.name.clone(),
+                                        text: m.machine.notes.clone(),
+                                        saved: m.machine.notes.clone(),
+                                    });
+                                    ui.close();
+                                }
                             });
                         }
                     }
@@ -1388,6 +1401,9 @@ impl ViewerApp {
                         self.grant = GrantForm::default();
                     }
                     self.selected = Some(id);
+                }
+                if notes_start.is_some() {
+                    self.notes_edit = notes_start;
                 }
                 if let Some((id, name)) = rename_start {
                     self.renaming = Some(Renaming { machine_id: id, text: name, focus: true });
@@ -1641,22 +1657,16 @@ impl ViewerApp {
             self.grant_card(ctx, ui, m);
         }
 
-        if let Some(s) = mv.stats.as_ref().filter(|_| mv.online) {
-            ui.add_space(14.0);
-            stats_card(ui, s);
-        }
-        if self.overview.as_ref().is_some_and(|o| o.role == "admin") {
-            ui.add_space(14.0);
-            self.notes_card(ctx, ui, m);
-        }
-
         ui.add_space(14.0);
         // Double-clicking the screens picture does what "Control" does.
         if self.screens_card(ui, m, mv.online) {
             self.connect_machine(ctx, m, false);
         }
-        ui.add_space(14.0);
-        self.quality_card(ui);
+
+        if let Some(s) = mv.stats.as_ref().filter(|_| mv.online) {
+            ui.add_space(14.0);
+            stats_card(ui, s);
+        }
     }
 
     fn grant_card(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, m: &MachineSummary) {
@@ -1728,58 +1738,72 @@ impl ViewerApp {
         });
     }
 
-    /// The administrator's notes about a computer, saved on the relay (the web
-    /// admin shows and edits the same text). Unsaved edits are kept; otherwise
-    /// the text follows the relay.
-    fn notes_card(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, m: &MachineSummary) {
-        let e = match &mut self.notes_edit {
-            Some(e) if e.machine_id == m.id => e,
-            slot => slot.insert(NotesEdit { machine_id: m.id.clone(), text: m.notes.clone(), saved: m.notes.clone() }),
+    /// The administrator's notes about a computer in their own window (from
+    /// the list's right-click menu), saved on the relay: the web admin shows
+    /// and edits the same text. While nothing is typed the text follows the relay.
+    fn notes_window(&mut self, ctx: &egui::Context) {
+        let Some(e) = self.notes_edit.as_mut() else { return };
+        let current = self.overview.as_ref().and_then(|o| o.machines.iter().find(|m| m.machine.id == e.machine_id));
+        let Some(current) = current else {
+            self.notes_edit = None; // the computer was removed
+            return;
         };
-        if e.text == e.saved && m.notes != e.saved {
-            e.text = m.notes.clone();
-            e.saved = m.notes.clone();
+        e.name = current.machine.name.clone();
+        if e.text == e.saved && current.machine.notes != e.saved {
+            e.text = current.machine.notes.clone();
+            e.saved = current.machine.notes.clone();
         }
-        let mut save = false;
-        let mut revert = false;
-        let dirty = e.text != e.saved;
-        card(ui, f32::INFINITY, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Notes").size(16.0).strong());
-                ui.label(RichText::new("only for administrators · also in the web admin").color(MUTED));
-            });
-            ui.add_space(6.0);
-            ui.add(
-                egui::TextEdit::multiline(&mut e.text)
-                    .hint_text("Where it is, who uses it, anything to remember...")
-                    .desired_rows(3)
-                    .char_limit(crate::grants::MAX_NOTES)
-                    .desired_width(f32::INFINITY),
-            );
-            if dirty {
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    save = ui.add_enabled(self.job_notes.is_none(), egui::Button::new("Save notes")).clicked();
-                    revert = ui.button("Cancel").clicked();
-                });
+        let saving = self.job_notes.is_some();
+        let (mut save, mut close) = (false, false);
+        let vid = ViewportId::from_hash_of(("farlink-notes", &e.machine_id));
+        let builder = ViewportBuilder::default()
+            .with_title(format!("{} - Notes", e.name))
+            .with_inner_size([520.0, 360.0])
+            .with_min_inner_size([360.0, 240.0]);
+        ctx.show_viewport_immediate(vid, builder, |ui, _| {
+            if ui.ctx().input(|i| i.viewport().close_requested()) {
+                close = true;
             }
+            egui::CentralPanel::default().frame(egui::Frame::new().fill(BG).inner_margin(Margin::same(16))).show(ui, |ui| {
+                ui.label(RichText::new(format!("Notes about {}", e.name)).size(17.0).strong());
+                ui.label(RichText::new("Only administrators see them. The web admin shows the same notes.").color(MUTED));
+                ui.add_space(8.0);
+                let dirty = e.text != e.saved;
+                egui::Panel::bottom("notes-buttons").frame(egui::Frame::new().inner_margin(Margin::symmetric(0, 8))).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let b = egui::Button::new(RichText::new("Save").strong().color(Color32::from_rgb(6, 32, 25))).fill(ACCENT);
+                        if ui.add_enabled(dirty && !saving, b).clicked() {
+                            save = true;
+                        }
+                        if ui.button(if dirty { "Cancel" } else { "Close" }).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.add_sized(
+                        ui.available_size(),
+                        egui::TextEdit::multiline(&mut e.text)
+                            .hint_text("Where it is, who uses it, anything to remember...")
+                            .char_limit(crate::grants::MAX_NOTES),
+                    );
+                });
+            });
         });
-        if revert {
-            e.text = e.saved.clone();
-        }
         if save {
+            let id = e.machine_id.clone();
             let text = e.text.trim_end().to_string();
-            e.text = text.clone();
-            e.saved = text.clone();
-            if let Some(mv) = self.overview.as_mut().and_then(|o| o.machines.iter_mut().find(|x| x.machine.id == m.id)) {
+            self.notes_edit = None;
+            if let Some(mv) = self.overview.as_mut().and_then(|o| o.machines.iter_mut().find(|x| x.machine.id == id)) {
                 mv.machine.notes = text.clone();
             }
             if !self.demo
                 && let Some(api) = self.api()
             {
-                let id = m.id.clone();
                 self.job_notes = Some(spawn_job(ctx, move || api.set_notes(&id, &text)));
             }
+        } else if close {
+            self.notes_edit = None;
         }
     }
 
@@ -1795,19 +1819,9 @@ impl ViewerApp {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Screens").size(16.0).strong());
                 ui.label(RichText::new(format!("{} on this computer · each opens in its own window", monitors.len())).color(MUTED));
-                if let Some(p) = self.preview.as_ref().filter(|p| p.machine_id == m.id) {
+                if let Some(e) = self.preview.as_ref().filter(|p| p.machine_id == m.id).and_then(|p| p.error.as_ref()) {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let text = match (&p.error, p.textures.is_empty()) {
-                            (Some(e), _) => RichText::new(format!("Preview: {e}")).color(AMBER),
-                            (None, true) => RichText::new("Loading preview...").color(MUTED),
-                            (None, false) => RichText::new(format!(
-                                "Preview, every {} s · taken {} ago",
-                                PREVIEW_EVERY.as_secs(),
-                                human_duration(now_secs().saturating_sub(p.taken))
-                            ))
-                            .color(MUTED),
-                        };
-                        ui.label(text.size(12.5));
+                        ui.label(RichText::new(format!("Preview: {e}")).color(AMBER).size(12.5));
                     });
                 }
             });
@@ -1821,12 +1835,9 @@ impl ViewerApp {
             let avail_w = ui.available_width().min(760.0);
             let scale = (avail_w / vw as f32).min(260.0 / vh as f32);
             let can_connect = online && session_idx.is_none();
-            let sense = if can_connect { Sense::click() } else { Sense::hover() };
-            let (area, resp) = ui.allocate_exact_size(Vec2::new(avail_w, vh as f32 * scale + 8.0), sense);
-            if can_connect {
-                connect = resp.double_clicked();
-                resp.on_hover_text("Double-click to control this computer");
-            }
+            let (area, _) = ui.allocate_exact_size(Vec2::new(avail_w, vh as f32 * scale + 8.0), Sense::hover());
+            let key = m.id.clone();
+            let mut forget: Option<String> = None;
             let painter = ui.painter_at(area);
             let off = Vec2::new((avail_w - vw as f32 * scale) / 2.0, 4.0);
             for mon in &monitors {
@@ -1856,97 +1867,39 @@ impl ViewerApp {
                     Color32::from_black_alpha(180),
                 );
                 painter.galley(lp, galley, TEXT);
-            }
-            ui.add_space(6.0);
-            let key = m.id.clone();
-            for mon in &monitors {
+                // Double-click: connect with control. Right-click: where its window opens.
+                let resp = ui.interact(r, ui.scope_id().with(("screen-preview", mon.index)), Sense::click());
+                if can_connect && resp.double_clicked() {
+                    connect = true;
+                }
+                let resp = if can_connect { resp.on_hover_text("Double-click to control this computer") } else { resp };
                 let fp = monitor_fingerprint(mon);
-                let text = match self.layouts.get(&key, &fp) {
-                    Some(p) => format!(
-                        "Screen {} window: remembered at {:.0}, {:.0} · {:.0}×{:.0}{}",
-                        mon.index + 1,
-                        p.x,
-                        p.y,
-                        p.w,
-                        p.h,
-                        if p.fullscreen { " · full screen" } else { "" }
-                    ),
-                    None => format!("Screen {} window: not placed yet, opens side by side", mon.index + 1),
-                };
-                ui.label(RichText::new(text).color(MUTED));
+                let place = self.layouts.get(&key, &fp);
+                resp.context_menu(|ui| {
+                    let text = match place {
+                        Some(p) => format!(
+                            "Window remembered at {:.0}, {:.0} · {:.0}×{:.0}{}",
+                            p.x,
+                            p.y,
+                            p.w,
+                            p.h,
+                            if p.fullscreen { " · full screen" } else { "" }
+                        ),
+                        None => "Window not placed yet: opens side by side".to_string(),
+                    };
+                    ui.label(RichText::new(text).color(MUTED).size(12.0));
+                    if ui.add_enabled(place.is_some(), egui::Button::new("Forget window position")).clicked() {
+                        forget = Some(fp.clone());
+                        ui.close();
+                    }
+                });
             }
-            if self.layouts.count(&key) > 0 && ui.button("Forget window positions").clicked() {
-                self.layouts.forget(&key);
+            if let Some(fp) = forget {
+                self.layouts.forget_monitor(&key, &fp);
                 self.layouts_dirty = Some(Instant::now());
             }
         });
         connect
-    }
-
-    fn quality_card(&mut self, ui: &mut egui::Ui) {
-        let before = self.cfg.quality;
-        card(ui, f32::INFINITY, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Picture quality").size(16.0).strong());
-                ui.label(RichText::new("changes apply right away, also to open connections").color(MUTED));
-            });
-            ui.add_space(4.0);
-            let current = self.cfg.quality.matching_preset();
-            ui.horizontal(|ui| {
-                for p in Preset::BUTTONS {
-                    let b = egui::Button::new(RichText::new(p.label()).size(14.0)).selected(current == p).min_size(Vec2::new(96.0, 30.0));
-                    if ui.add(b).on_hover_text(p.hint()).clicked() {
-                        self.cfg.quality = self.cfg.quality.with_preset(p);
-                    }
-                }
-                ui.label(RichText::new(current.hint()).color(MUTED));
-            });
-            ui.add_space(6.0);
-            let q = &mut self.cfg.quality;
-            egui::Grid::new("quality").num_columns(2).spacing([18.0, 8.0]).show(ui, |ui| {
-                ui.label("Picture size");
-                ui.add(egui::Slider::new(&mut q.scale_pct, 25..=100).suffix(" %"));
-                ui.end_row();
-                ui.label("Pictures per second");
-                ui.add(egui::Slider::new(&mut q.max_fps, 1..=30));
-                ui.end_row();
-                ui.label("Compression");
-                ui.horizontal(|ui| {
-                    for c in Codec::ALL {
-                        ui.radio_value(&mut q.codec, c, c.label());
-                    }
-                });
-                ui.end_row();
-                if q.codec != Codec::Png {
-                    ui.label(if q.codec == Codec::Auto { "Photo quality" } else { "JPEG quality" });
-                    ui.add(egui::Slider::new(&mut q.jpeg_quality, 10..=95));
-                    ui.end_row();
-                }
-                ui.label("Colours");
-                egui::ComboBox::from_id_salt("colors").selected_text(q.color.label()).width(220.0).show_ui(ui, |ui| {
-                    for c in ColorDepth::ALL {
-                        ui.selectable_value(&mut q.color, c, c.label());
-                    }
-                });
-                ui.end_row();
-            });
-            ui.label(
-                RichText::new(
-                    "Auto sends text and windows lossless and photos/video as JPEG, then sharpens them once they stop moving. \
-                     Fewer colours and a smaller picture use less internet.",
-                )
-                    .color(MUTED)
-                    .size(12.0),
-            );
-        });
-        if self.cfg.quality != before {
-            self.save_cfg();
-            let q = self.cfg.quality;
-            for s in &mut self.sessions {
-                s.quality = q;
-                s.handle.send(SessionMsg::Quality { quality: q });
-            }
-        }
     }
 
     // -------------------------------------------------------------- monitor windows
@@ -2360,7 +2313,7 @@ fn monitor_window(ui: &mut egui::Ui, s: &mut OpenSession, mon: &MonitorInfo, key
     let overlay = if s.controls_hidden {
         let r = s.reveal.entry(mon.index).or_default();
         let now = Instant::now();
-        r.step(ctx.pointer_hover_pos().map(|p| p.y - screen.min.y), egui::Popup::is_any_open(&ctx), now);
+        r.step(ctx.pointer_hover_pos().map(|p| p.y - screen.min.y), screen.height(), egui::Popup::is_any_open(&ctx), now);
         if let Some(wait) = r.wait(now) {
             ctx.request_repaint_after(wait);
         }
@@ -2445,7 +2398,7 @@ fn monitor_bar(ui: &mut egui::Ui, s: &mut OpenSession, mon: &MonitorInfo, view_o
             let (label, hint) = if s.controls_hidden {
                 ("Keep controls", "Keep these controls shown")
             } else {
-                ("Hide controls", "Show only the remote screen. To get the controls back, rest the mouse at the top edge for a second")
+                ("Hide controls", "Show only the remote screen. To get the controls back, rest the mouse near the top edge for a second")
             };
             if ui.button(label).on_hover_text(hint).clicked() {
                 s.controls_hidden = !s.controls_hidden;
@@ -2474,13 +2427,11 @@ fn monitor_bar(ui: &mut egui::Ui, s: &mut OpenSession, mon: &MonitorInfo, view_o
                     }
                 }
             });
+            // Every picture setting, in a popup that stays open while sliders move.
             let current = s.quality.matching_preset();
-            egui::ComboBox::from_id_salt("q").selected_text(current.label()).width(96.0).show_ui(ui, |ui| {
-                for p in Preset::BUTTONS {
-                    if ui.add(egui::Button::new(p.label()).selected(current == p).frame(false)).on_hover_text(p.hint()).clicked() {
-                        s.quality = s.quality.with_preset(p);
-                    }
-                }
+            let button = ui.button(format!("{} ⏷", current.label())).on_hover_text("Picture quality");
+            egui::Popup::menu(&button).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                quality_controls(ui, &mut s.quality);
             });
             if s.quality != before {
                 s.handle.send(SessionMsg::Quality { quality: s.quality });
@@ -2498,12 +2449,57 @@ fn monitor_bar(ui: &mut egui::Ui, s: &mut OpenSession, mon: &MonitorInfo, view_o
     });
 }
 
+/// Picture settings of a connection (the quality popup of a screen window).
+fn quality_controls(ui: &mut egui::Ui, q: &mut Quality) {
+    ui.set_min_width(380.0);
+    ui.label(RichText::new("Picture quality").strong());
+    ui.label(RichText::new("Changes apply right away and are remembered for next time.").color(MUTED).size(12.0));
+    ui.add_space(4.0);
+    let current = q.matching_preset();
+    ui.horizontal(|ui| {
+        for p in Preset::BUTTONS {
+            if ui.add(egui::Button::new(p.label()).selected(current == p)).on_hover_text(p.hint()).clicked() {
+                *q = q.with_preset(p);
+            }
+        }
+    });
+    ui.label(RichText::new(q.matching_preset().hint()).color(MUTED).size(12.0));
+    ui.add_space(6.0);
+    egui::Grid::new("quality").num_columns(2).spacing([14.0, 8.0]).show(ui, |ui| {
+        ui.label("Picture size");
+        ui.add(egui::Slider::new(&mut q.scale_pct, 25..=100).suffix(" %"));
+        ui.end_row();
+        ui.label("Pictures per second");
+        ui.add(egui::Slider::new(&mut q.max_fps, 1..=30));
+        ui.end_row();
+        ui.label("Compression");
+        ui.horizontal(|ui| {
+            for c in Codec::ALL {
+                ui.radio_value(&mut q.codec, c, c.label());
+            }
+        });
+        ui.end_row();
+        if q.codec != Codec::Png {
+            ui.label(if q.codec == Codec::Auto { "Photo quality" } else { "JPEG quality" });
+            ui.add(egui::Slider::new(&mut q.jpeg_quality, 10..=95));
+            ui.end_row();
+        }
+    });
+    ui.label(
+        RichText::new("Auto sends text and windows lossless and photos/video as JPEG, then sharpens them once they stop moving.")
+            .color(MUTED)
+            .size(12.0),
+    );
+}
+
 /// Height of a screen window's controls.
 const BAR_HEIGHT: f32 = 36.0;
 /// Hidden controls come back after the mouse rests this long...
 const REVEAL_AFTER: Duration = Duration::from_secs(1);
-/// ...this close to the top edge of the window (points).
-const REVEAL_EDGE: f32 = 4.0;
+/// ...in the top part of the window this big (share of its height)...
+const REVEAL_EDGE: f32 = 0.03;
+/// ...but never thinner than this (points).
+const REVEAL_EDGE_MIN: f32 = 4.0;
 
 /// Hidden controls of one screen window, brought back by resting the mouse
 /// at the top edge for [`REVEAL_AFTER`]; they go again when it moves away.
@@ -2514,14 +2510,16 @@ struct Reveal {
 }
 
 impl Reveal {
-    /// `y`: mouse height in the window (`None`: outside it); `popup`: a menu
-    /// of the controls is open (they stay while it is).
-    fn step(&mut self, y: Option<f32>, popup: bool, now: Instant) {
+    /// `y`: mouse height in the window (`None`: outside it); `height`: the
+    /// window's height; `popup`: a menu of the controls is open (they stay
+    /// while it is).
+    fn step(&mut self, y: Option<f32>, height: f32, popup: bool, now: Instant) {
+        let edge = (height * REVEAL_EDGE).max(REVEAL_EDGE_MIN);
         if self.shown {
             if !popup && !y.is_some_and(|y| y <= BAR_HEIGHT + 12.0) {
                 *self = Reveal::default();
             }
-        } else if y.is_some_and(|y| y <= REVEAL_EDGE) {
+        } else if y.is_some_and(|y| y <= edge) {
             let since = *self.at_top_since.get_or_insert(now);
             self.shown = now.duration_since(since) >= REVEAL_AFTER;
         } else {
@@ -2691,6 +2689,7 @@ impl eframe::App for ViewerApp {
         }
         self.central(ui);
         self.rename_dialog(&ctx);
+        self.notes_window(&ctx);
         self.monitor_windows(&ctx);
         self.screenshot_step(&ctx);
     }
@@ -2705,10 +2704,12 @@ fn chip(ui: &mut egui::Ui, dot: Color32, text: &str) {
         .corner_radius(CornerRadius::same(12))
         .inner_margin(Margin::symmetric(10, 3))
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                status_dot(ui, dot);
-                ui.label(RichText::new(text).size(12.5).color(MUTED));
-            });
+            // Painted as one piece (dot first), so it reads the same inside right-to-left rows.
+            let galley = ui.painter().layout_no_wrap(text.to_string(), FontId::proportional(12.5), MUTED);
+            let size = Vec2::new(16.0 + galley.size().x, galley.size().y.max(18.0));
+            let (r, _) = ui.allocate_exact_size(size, Sense::hover());
+            ui.painter().circle_filled(Pos2::new(r.min.x + 5.0, r.center().y), 4.0, dot);
+            ui.painter().galley(Pos2::new(r.min.x + 16.0, r.center().y - galley.size().y / 2.0), galley, MUTED);
         });
 }
 
@@ -3113,48 +3114,62 @@ mod tests {
 
     #[test]
     fn hidden_controls_show_after_a_second_at_the_top_edge() {
+        const H: f32 = 1000.0;
         let t0 = Instant::now();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
         let mut r = Reveal::default();
-        r.step(Some(300.0), false, at(0));
+        r.step(Some(300.0), H, false, at(0));
         assert!(!r.shown && r.wait(at(0)).is_none(), "nothing while the mouse is on the picture");
-        r.step(Some(1.0), false, at(100));
+        r.step(Some(1.0), H, false, at(100));
         assert!(!r.shown);
         assert_eq!(r.wait(at(600)), Some(Duration::from_millis(510)), "looks again when the second is up");
-        r.step(Some(2.0), false, at(1099));
+        r.step(Some(2.0), H, false, at(1099));
         assert!(!r.shown, "not before a whole second");
-        r.step(Some(0.0), false, at(1100));
+        r.step(Some(0.0), H, false, at(1100));
         assert!(r.shown);
         assert!(r.wait(at(1100)).is_none());
+
+        // The edge is 3 % of the window's height (30 of 1000), at least 4 points.
+        let mut r = Reveal::default();
+        r.step(Some(31.0), H, false, at(0));
+        assert!(r.at_top_since.is_none(), "below the edge");
+        r.step(Some(29.0), H, false, at(0));
+        r.step(Some(29.0), H, false, at(1000));
+        assert!(r.shown);
+        let mut r = Reveal::default();
+        r.step(Some(3.5), 50.0, false, at(0));
+        assert!(r.at_top_since.is_some(), "small windows keep 4 points");
     }
 
     #[test]
     fn leaving_the_top_edge_restarts_the_wait() {
+        const H: f32 = 1000.0;
         let t0 = Instant::now();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
         let mut r = Reveal::default();
-        r.step(Some(0.0), false, at(0));
-        r.step(Some(50.0), false, at(900));
-        r.step(Some(0.0), false, at(1000));
+        r.step(Some(0.0), H, false, at(0));
+        r.step(Some(50.0), H, false, at(900));
+        r.step(Some(0.0), H, false, at(1000));
         assert!(!r.shown);
-        r.step(Some(0.0), false, at(1500));
+        r.step(Some(0.0), H, false, at(1500));
         assert!(!r.shown, "only 0.5 s since it came back");
-        r.step(None, false, at(1600));
-        r.step(Some(0.0), false, at(2700));
+        r.step(None, H, false, at(1600));
+        r.step(Some(0.0), H, false, at(2700));
         assert!(!r.shown, "outside the window counts as leaving");
     }
 
     #[test]
     fn shown_controls_stay_while_used_and_go_when_the_mouse_leaves() {
+        const H: f32 = 1000.0;
         let t0 = Instant::now();
         let mut r = Reveal { at_top_since: Some(t0), shown: true };
-        r.step(Some(BAR_HEIGHT - 5.0), false, t0);
+        r.step(Some(BAR_HEIGHT - 5.0), H, false, t0);
         assert!(r.shown, "mouse on the controls");
-        r.step(Some(400.0), true, t0);
+        r.step(Some(400.0), H, true, t0);
         assert!(r.shown, "a menu of the controls is open");
-        r.step(Some(400.0), false, t0);
+        r.step(Some(400.0), H, false, t0);
         assert!(!r.shown && r.at_top_since.is_none());
-        r.step(None, false, t0);
+        r.step(None, H, false, t0);
         assert!(!r.shown);
     }
 

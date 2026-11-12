@@ -30,7 +30,7 @@ arboard = { version = "3.7.0", default-features = false }
 argon2 = "0.6.0"
 axum = { version = "0.8.9", features = ["ws"] }
 dirs = "7.0.0"
-eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "x11", "wayland", "clipboard"] }
 env_logger = "0.11.11"
 futures-util = "0.3.34"
 hex = "0.4.3"
