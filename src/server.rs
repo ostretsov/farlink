@@ -35,6 +35,7 @@ const VIEWER_HTML: &str = include_str!("web/viewer.html");
 const INSTALL_HTML: &str = include_str!("web/install.html");
 const MESSAGE_HTML: &str = include_str!("web/message.html");
 const APP_CSS: &str = include_str!("web/app.css");
+const ICON_SVG: &str = include_str!("web/icon.svg");
 const ADMIN_JS: &str = include_str!("web/admin.js");
 const VIEWER_JS: &str = include_str!("web/viewer.js");
 
@@ -404,6 +405,7 @@ pub fn router(relay: Shared) -> Router {
     Router::new()
         .route("/", get(admin_page))
         .route("/assets/app.css", get(|| async { ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], APP_CSS) }))
+        .route("/assets/icon.svg", get(|| async { ([(header::CONTENT_TYPE, "image/svg+xml"), (header::CACHE_CONTROL, "public, max-age=86400")], ICON_SVG) }))
         .route("/assets/admin.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], ADMIN_JS) }))
         .route("/assets/viewer.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], VIEWER_JS) }))
         .route("/view/{machine}", get(admin_viewer_page))

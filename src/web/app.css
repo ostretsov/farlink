@@ -9,7 +9,7 @@ body { margin: 0; background: var(--bg); color: var(--text); font-size: 17.5px; 
 a { color: var(--accent); }
 header.top { display: flex; align-items: center; gap: 17.5px; padding: 15px 27.5px; background: var(--panel); border-bottom: 1px solid var(--line); }
 .logo { display: flex; align-items: center; gap: 12.5px; font-weight: 700; letter-spacing: .4px; font-size: 20px; }
-.logo i { width: 27.5px; height: 27.5px; border-radius: 7.5px; background: linear-gradient(135deg, var(--accent), #2a7fd6); display: inline-block; }
+.logo i { width: 27.5px; height: 27.5px; background: url(/assets/icon.svg) center / contain no-repeat; display: inline-block; }
 .spacer { flex: 1; }
 main { max-width: 1475px; margin: 0 auto; padding: 27.5px; display: grid; gap: 22.5px; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px 22.5px; }

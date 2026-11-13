@@ -48,7 +48,7 @@ Data flow: host keeps a control WebSocket `/ws/agent` to the relay → a viewer 
 | `keygrab.rs` | Alt+Tab for the remote computer: while Alt is held in a focused screen window (control, mouse on the picture) `AltGrab` grabs the keyboard on that window (X11 only) and forwards keys itself (`Forward`) until Alt is let go; the browser uses Keyboard Lock in full screen (Chrome/Edge). Real-X test: `cargo test -- --ignored x11_alt_tab` | Keyboard shortcuts the local desktop would take |
 | `util.rs`, `version.rs` | Small helpers, CLI `Args`, version compare, `published_file` (app → file in `releases/<target>/`; `DEB_APP` = `farlink.deb`, Linux only) | — |
 | `packaging/` | Desktop app `.deb`: `deb.sh` (dpkg-deb; glibc minimum read from the binary), `farlink.desktop` (`StartupWMClass=farlink` = the viewport `app_id`), `icons/` (PNGs from `make icons`) | Linux package |
-| `web/` | Browser UI embedded with `include_str!`: `admin.html/js` (web admin + person view), `viewer.html/js` (in-browser viewer + files panel), `install.html`, `message.html`, `app.css` | Web UI (plain JS, no build step) |
+| `web/` | Browser UI embedded with `include_str!`: `admin.html/js` (web admin + person view), `viewer.html/js` (in-browser viewer + files panel), `install.html`, `message.html`, `app.css`, `icon.svg` (header logo + favicon at `/assets/icon.svg`; same shapes/colours as `tray/icon.rs`, keep them in step) | Web UI (plain JS, no build step) |
 
 Tests: unit tests live at the bottom of each module; `tests/end_to_end.rs` starts a real relay on a
 random port with real/fake hosts and viewers (people access, links, files, view-only switching, clipboard,
