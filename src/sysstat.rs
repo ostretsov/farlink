@@ -39,13 +39,7 @@ impl Sampler {
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
         let now = cpu_times();
-        let cpu = match (self.prev, now) {
-            (Some((idle0, total0)), Some((idle1, total1))) if total1 > total0 => {
-                let busy = (total1 - total0).saturating_sub(idle1.saturating_sub(idle0));
-                (busy as f64 * 100.0 / (total1 - total0) as f64) as f32
-            }
-            _ => 0.0,
-        };
+        let cpu = busy_between(self.prev, now).unwrap_or(0.0);
         self.prev = now.or(self.prev);
         let (mem_total, mem_used) = memory().unwrap_or((0, 0));
         SystemStats {
@@ -55,6 +49,34 @@ impl Sampler {
             mem_used,
             disks: disks(),
         }
+    }
+}
+
+/// CPU use in % between two `(idle, total)` counter readings.
+fn busy_between(prev: Option<(u64, u64)>, now: Option<(u64, u64)>) -> Option<f32> {
+    match (prev, now) {
+        (Some((idle0, total0)), Some((idle1, total1))) if total1 > total0 => {
+            let busy = (total1 - total0).saturating_sub(idle1.saturating_sub(idle0));
+            Some((busy as f64 * 100.0 / (total1 - total0) as f64).clamp(0.0, 100.0) as f32)
+        }
+        _ => None,
+    }
+}
+
+/// Just the CPU part of [`Sampler`], cheap enough to ask every few seconds
+/// (the host's screen thread uses it to decide how hard to compress).
+#[derive(Default)]
+pub struct CpuLoad {
+    prev: Option<(u64, u64)>,
+}
+
+impl CpuLoad {
+    /// CPU use in % since the previous call; `None` the first time.
+    pub fn busy(&mut self) -> Option<f32> {
+        let now = cpu_times();
+        let busy = busy_between(self.prev, now);
+        self.prev = now.or(self.prev);
+        busy
     }
 }
 
@@ -262,6 +284,27 @@ pub fn os_version() -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::busy_between;
+
+    #[test]
+    fn busy_share_between_two_readings() {
+        // 100 ticks passed, 25 of them idle: 75 % busy.
+        assert_eq!(busy_between(Some((1000, 4000)), Some((1025, 4100))), Some(75.0));
+        assert_eq!(busy_between(None, Some((1, 2))), None, "first reading");
+        assert_eq!(busy_between(Some((5, 10)), Some((5, 10))), None, "no time passed");
+        assert_eq!(busy_between(Some((0, 0)), Some((500, 100))), Some(0.0), "odd counters stay in range");
+    }
+
+    #[test]
+    fn cpu_load_reads_this_machine() {
+        let mut l = super::CpuLoad::default();
+        assert_eq!(l.busy(), None);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if let Some(b) = l.busy() {
+            assert!((0.0..=100.0).contains(&b));
+        }
+    }
+
     use super::*;
 
     #[test]

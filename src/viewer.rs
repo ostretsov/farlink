@@ -74,6 +74,9 @@ pub fn run(opts: ViewerOptions) -> eframe::Result<()> {
     eframe::run_native("Farlink", native, Box::new(move |cc| Ok(Box::new(ViewerApp::new(&cc.egui_ctx, opts)))))
 }
 
+/// How much bigger than egui's own size all text in the app is drawn.
+const TEXT_SCALE: f32 = 1.2;
+
 fn style(ctx: &egui::Context) {
     let mut v = egui::Visuals::dark();
     v.panel_fill = PANEL;
@@ -95,6 +98,13 @@ fn style(ctx: &egui::Context) {
         w.corner_radius = CornerRadius::same(7);
     }
     ctx.set_visuals(v);
+    // All text 20% bigger: scaling the fonts themselves also covers every
+    // hard-coded `.size(..)` / `FontId`, and leaves the remote picture alone.
+    let mut fonts = egui::FontDefinitions::default();
+    for data in fonts.font_data.values_mut() {
+        Arc::make_mut(data).tweak.scale *= TEXT_SCALE;
+    }
+    ctx.set_fonts(fonts);
     ctx.global_style_mut(|s| {
         s.spacing.item_spacing = Vec2::new(8.0, 7.0);
         s.spacing.button_padding = Vec2::new(11.0, 5.0);
@@ -320,6 +330,7 @@ fn file_pane(
     dir: &crate::net::RemoteDir,
     sel: Option<&crate::proto::FsEntry>,
     show_hidden: bool,
+    bar: impl FnOnce(&mut egui::Ui),
 ) -> Option<PaneAction> {
     let mut action = None;
     ui.label(RichText::new(title).strong().size(15.0));
@@ -327,27 +338,76 @@ fn file_pane(
         if ui.add_enabled(dir.parent.is_some(), egui::Button::new("Up")).clicked() {
             action = Some(PaneAction::Open(dir.parent.clone().unwrap_or_default()));
         }
-        if ui.button("Refresh").clicked() {
-            action = Some(PaneAction::Open(dir.path.clone()));
-        }
-        let shown = if dir.path.is_empty() { "Starting places".to_string() } else { dir.path.clone() };
-        ui.label(RichText::new(shown).monospace().color(MUTED));
+        // Refresh at the right border (a spinner there while loading); the path
+        // fills the space between and is cut short when it does not fit.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let btn = ui.add(egui::Button::new("").min_size(Vec2::splat(24.0))).on_hover_text("Refresh this folder");
+            let icon = Rect::from_center_size(btn.rect.center(), Vec2::splat(14.0));
+            if dir.loading {
+                egui::Spinner::new().paint_at(ui, icon);
+            } else {
+                paint_refresh(ui.painter(), icon, if btn.hovered() { TEXT } else { MUTED });
+            }
+            if btn.clicked() {
+                action = Some(PaneAction::Open(dir.path.clone()));
+            }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                // Clicking the path turns it into a text box (all selected): type or
+                // paste a folder and press Enter to go there, Esc or click away to cancel.
+                let edit_id = ui.make_persistent_id((id, "path-edit"));
+                let te_id = edit_id.with("box");
+                let editing: Option<(String, bool)> = ui.data(|d| d.get_temp(edit_id));
+                if let Some((mut text, fresh)) = editing {
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut text)
+                            .id(te_id)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_width(f32::INFINITY),
+                    );
+                    if fresh {
+                        r.request_focus();
+                        if let Some(mut st) = egui::text_edit::TextEditState::load(ui.ctx(), te_id) {
+                            st.cursor.set_char_range(Some(egui::text::CCursorRange::select_all_str(&text)));
+                            st.store(ui.ctx(), te_id);
+                        }
+                    }
+                    if r.lost_focus() || (!fresh && !r.has_focus()) {
+                        if ui.input(|i| i.key_pressed(egui::Key::Enter)) && !text.trim().is_empty() {
+                            action = Some(PaneAction::Open(text.trim().to_string()));
+                        }
+                        ui.data_mut(|d| d.remove::<(String, bool)>(edit_id));
+                    } else {
+                        ui.data_mut(|d| d.insert_temp(edit_id, (text, false)));
+                    }
+                } else {
+                    let shown = if dir.path.is_empty() { "Starting places".to_string() } else { dir.path.clone() };
+                    let r = ui
+                        .add(egui::Label::new(RichText::new(shown).monospace().color(MUTED)).truncate().sense(egui::Sense::click()))
+                        .on_hover_cursor(egui::CursorIcon::Text)
+                        .on_hover_text("Click to type or copy a path");
+                    if r.clicked() {
+                        ui.data_mut(|d| d.insert_temp(edit_id, (dir.path.clone(), true)));
+                    }
+                }
+            });
+        });
     });
     if let Some(e) = &dir.error {
         ui.label(RichText::new(e).color(DANGER));
     }
-    if dir.loading {
-        ui.add(egui::Spinner::new());
-    }
+    // Upload/Download and the other actions for this side, right above the list.
+    ui.add_space(2.0);
+    bar(ui);
+    ui.add_space(2.0);
     egui::Frame::new().fill(BG).stroke(Stroke::new(1.0, LINE)).corner_radius(CornerRadius::same(6)).inner_margin(Margin::same(4)).show(ui, |ui| {
         egui::ScrollArea::vertical().id_salt(id).auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
             for e in dir.entries.iter().filter(|e| show_hidden || !e.name.starts_with('.')) {
                 let selected = sel.is_some_and(|s| s.path == e.path);
                 // Room at the left for the folder icon (files line up with folder names).
-                const PAD: &str = "          ";
+                const PAD: &str = "     ";
                 let text = if e.is_dir { format!("{PAD}{}", e.name) } else { format!("{PAD}{}    {}", e.name, format_size(e.size)) };
-                let resp = ui.add(egui::Button::new(RichText::new(text).color(TEXT)).selected(selected).frame(selected).min_size(Vec2::new(ui.available_width(), 20.0)));
+                let resp = ui.add(egui::Button::selectable(selected, RichText::new(text).color(TEXT)).min_size(Vec2::new(ui.available_width(), 20.0)));
                 if e.is_dir {
                     paint_folder(ui.painter(), Pos2::new(resp.rect.left() + 6.0, resp.rect.center().y));
                 }
@@ -375,6 +435,31 @@ fn paint_folder(p: &egui::Painter, at: Pos2) {
     p.rect_filled(Rect::from_min_size(at + Vec2::new(0.0, -2.5), Vec2::new(16.0, 9.0)), CornerRadius::same(2), front);
 }
 
+/// A short arrow centred on `c`, pointing right (`dir` 1.0) or left (-1.0).
+fn paint_arrow(p: &egui::Painter, c: Pos2, dir: f32, color: Color32) {
+    let stroke = Stroke::new(1.8, color);
+    p.line_segment([c - Vec2::new(6.0 * dir, 0.0), c + Vec2::new(4.0 * dir, 0.0)], stroke);
+    let tip = c + Vec2::new(7.0 * dir, 0.0);
+    p.add(egui::Shape::convex_polygon(vec![tip, tip - Vec2::new(5.5 * dir, 4.5), tip - Vec2::new(5.5 * dir, -4.5)], color, Stroke::NONE));
+}
+
+/// A circular arrow (the refresh icon) inside `r`.
+fn paint_refresh(p: &egui::Painter, r: Rect, color: Color32) {
+    let c = r.center();
+    let rad = r.width() * 0.4;
+    // Open circle from about 2 o'clock round to 10 o'clock, clockwise.
+    let (a0, a1) = (-0.15 * std::f32::consts::PI, 1.35 * std::f32::consts::PI);
+    let at = |a: f32| c + rad * Vec2::new(a.cos(), a.sin());
+    let pts: Vec<Pos2> = (0..=24).map(|i| at(a0 + (a1 - a0) * i as f32 / 24.0)).collect();
+    p.add(egui::Shape::line(pts, Stroke::new(1.6, color)));
+    // Arrow head at the start, pointing back along the circle (anticlockwise tangent).
+    let tip = at(a0);
+    let back = Vec2::new(a0.sin(), -a0.cos()); // direction the head points
+    let side = Vec2::new(-back.y, back.x);
+    let s = rad * 1.1;
+    p.add(egui::Shape::convex_polygon(vec![tip + back * s * 0.55, tip - back * s * 0.2 + side * s * 0.5, tip - back * s * 0.2 - side * s * 0.5], color, Stroke::NONE));
+}
+
 /// Contents of the file browser window. Returns true when it should close.
 fn files_window(ui: &mut egui::Ui, s: &mut OpenSession) -> bool {
     let ctx = ui.ctx().clone();
@@ -396,41 +481,8 @@ fn files_window(ui: &mut egui::Ui, s: &mut OpenSession) -> bool {
     if let Some(next) = fv.remote_start_step(&remote) {
         s.handle.list_remote(&next);
     }
-    egui::Panel::top("files-bar").frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(12, 8))).show(ui, |ui| {
-        // Two halves, like the two sides below: this computer, the remote one.
-        ui.columns(2, |cols| {
-            cols[0].horizontal(|ui| {
-                let up_ok = fv.local_sel.as_ref().is_some_and(|e| !e.is_dir) && !remote.path.is_empty();
-                if ui.add_enabled(up_ok, egui::Button::new(RichText::new("Upload  ->").strong())).on_hover_text("Copy the selected file to the remote folder").clicked()
-                    && let Some(e) = &fv.local_sel
-                {
-                    s.handle.upload(PathBuf::from(&e.path), remote.path.clone());
-                }
-                ui.checkbox(&mut fv.local_hidden, "Show hidden files");
-            });
-            cols[1].horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut fv.new_folder).hint_text("New remote folder name").desired_width(180.0));
-                let name_ok = crate::files::safe_name(&fv.new_folder).is_some() && !remote.path.is_empty();
-                if ui.add_enabled(name_ok, egui::Button::new("Create folder")).clicked() {
-                    let p = PathBuf::from(&remote.path).join(fv.new_folder.trim());
-                    s.handle.mkdir_remote(&p.display().to_string());
-                    fv.new_folder.clear();
-                }
-                ui.checkbox(&mut fv.remote_hidden, "Show hidden files");
-                let down_ok = fv.remote_sel.as_ref().is_some_and(|e| !e.is_dir) && !fv.local_dir.is_empty();
-                if ui.add_enabled(down_ok, egui::Button::new(RichText::new("<-  Download").strong())).on_hover_text("Copy the selected remote file here").clicked()
-                    && let Some(e) = &fv.remote_sel
-                {
-                    s.handle.download(e, PathBuf::from(&fv.local_dir));
-                }
-            });
-        });
-    });
     egui::Panel::bottom("transfers").frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(12, 8))).show(ui, |ui| {
         ui.label(RichText::new("TRANSFERS").size(11.0).color(MUTED));
-        if transfers.is_empty() {
-            ui.label(RichText::new("Select a file and press Upload or Download. Files are never overwritten.").color(MUTED));
-        }
         for t in transfers.iter().rev().take(5) {
             ui.horizontal(|ui| {
                 ui.label(if t.upload { "Upload" } else { "Download" });
@@ -452,7 +504,21 @@ fn files_window(ui: &mut egui::Ui, s: &mut OpenSession) -> bool {
     });
     egui::CentralPanel::default().frame(egui::Frame::new().fill(BG).inner_margin(Margin::same(12))).show(ui, |ui| {
         ui.columns(2, |cols| {
-            if let Some(a) = file_pane(&mut cols[0], "local", "This computer", &fv.local, fv.local_sel.as_ref(), fv.local_hidden) {
+            let local_hidden = fv.local_hidden;
+            let local_bar = |ui: &mut egui::Ui| {
+                ui.horizontal(|ui| {
+                let up_ok = fv.local_sel.as_ref().is_some_and(|e| !e.is_dir) && !remote.path.is_empty();
+                let r = ui.add_enabled(up_ok, egui::Button::new(RichText::new("Upload      ").strong())).on_hover_text("Copy the selected file to the remote folder");
+                paint_arrow(ui.painter(), Pos2::new(r.rect.right() - 17.0, r.rect.center().y), 1.0, if up_ok { TEXT } else { MUTED });
+                if r.clicked()
+                    && let Some(e) = &fv.local_sel
+                {
+                    s.handle.upload(PathBuf::from(&e.path), remote.path.clone());
+                }
+                ui.checkbox(&mut fv.local_hidden, "Show hidden files");
+                });
+            };
+            if let Some(a) = file_pane(&mut cols[0], "local", "This computer", &fv.local, fv.local_sel.as_ref(), local_hidden, local_bar) {
                 match a {
                     PaneAction::Open(p) => {
                         fv.local_dir = p;
@@ -462,7 +528,30 @@ fn files_window(ui: &mut egui::Ui, s: &mut OpenSession) -> bool {
                 }
             }
             let title = format!("Remote: {}", s.name);
-            if let Some(a) = file_pane(&mut cols[1], "remote", &title, &remote, fv.remote_sel.as_ref(), fv.remote_hidden) {
+            // Right-aligned, so laid out from the right: Download first, the name box last.
+            let remote_hidden = fv.remote_hidden;
+            let remote_bar = |ui: &mut egui::Ui| {
+                let row = Vec2::new(ui.available_width(), ui.spacing().interact_size.y);
+                ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let down_ok = fv.remote_sel.as_ref().is_some_and(|e| !e.is_dir) && !fv.local_dir.is_empty();
+                let r = ui.add_enabled(down_ok, egui::Button::new(RichText::new("      Download").strong())).on_hover_text("Copy the selected remote file here");
+                paint_arrow(ui.painter(), Pos2::new(r.rect.left() + 17.0, r.rect.center().y), -1.0, if down_ok { TEXT } else { MUTED });
+                if r.clicked()
+                    && let Some(e) = &fv.remote_sel
+                {
+                    s.handle.download(e, PathBuf::from(&fv.local_dir));
+                }
+                ui.checkbox(&mut fv.remote_hidden, "Show hidden files");
+                let name_ok = crate::files::safe_name(&fv.new_folder).is_some() && !remote.path.is_empty();
+                if ui.add_enabled(name_ok, egui::Button::new("Create folder")).clicked() {
+                    let p = PathBuf::from(&remote.path).join(fv.new_folder.trim());
+                    s.handle.mkdir_remote(&p.display().to_string());
+                    fv.new_folder.clear();
+                }
+                ui.add(egui::TextEdit::singleline(&mut fv.new_folder).hint_text("New folder name").desired_width(180.0));
+                });
+            };
+            if let Some(a) = file_pane(&mut cols[1], "remote", &title, &remote, fv.remote_sel.as_ref(), remote_hidden, remote_bar) {
                 match a {
                     PaneAction::Open(p) => {
                         fv.remote_sel = None;
@@ -2146,7 +2235,7 @@ impl ViewerApp {
                 let vid = ViewportId::from_hash_of(("farlink-files", s.id));
                 let builder = ViewportBuilder::default()
                     .with_title(format!("{} - Files", s.name))
-                    .with_inner_size([980.0, 620.0])
+                    .with_inner_size([1274.0, 620.0])
                     .with_min_inner_size([640.0, 360.0]);
                 let closed = ctx.show_viewport_immediate(vid, builder, |ui, _| files_window(ui, s));
                 // Remember where the browser is, here and on that computer.
@@ -3216,6 +3305,154 @@ fn relay_details(o: &Overview) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- file browser pane, driven through egui with real pointer/key events
+
+    const PANE_W: f32 = 500.0;
+
+    fn sample_dir(loading: bool) -> crate::net::RemoteDir {
+        let entry = |n: &str, dir: bool| crate::proto::FsEntry { name: n.into(), path: format!("C:\\Users\\Me\\{n}"), is_dir: dir, size: 7, modified: 0 };
+        crate::net::RemoteDir {
+            path: "C:\\Users\\Me".into(),
+            parent: Some("C:\\Users".into()),
+            entries: vec![entry("Documents", true), entry("notes.txt", false)],
+            error: None,
+            loading,
+        }
+    }
+
+    struct Pane {
+        ctx: egui::Context,
+        dir: crate::net::RemoteDir,
+        sel: Option<crate::proto::FsEntry>,
+        /// Where the extra bar (Upload/Download row) was put, last frame.
+        bar_at: Option<Rect>,
+    }
+
+    impl Pane {
+        fn new(dir: crate::net::RemoteDir) -> Self {
+            Pane { ctx: egui::Context::default(), dir, sel: None, bar_at: None }
+        }
+
+        /// One frame; returns the pane's action and what was drawn.
+        fn frame(&mut self, events: Vec<egui::Event>) -> (Option<PaneAction>, Vec<egui::epaint::ClippedShape>) {
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(PANE_W, 300.0))), events, ..Default::default() };
+            let (mut action, mut bar_at) = (None, None);
+            let mut out = self.ctx.run_ui(raw, |ui| {
+                let bar = |ui: &mut egui::Ui| bar_at = Some(ui.label("BAR").rect);
+                action = file_pane(ui, "remote", "Remote", &self.dir, self.sel.as_ref(), true, bar);
+            });
+            out.textures_delta.clear();
+            self.bar_at = bar_at;
+            (action, out.shapes)
+        }
+
+        fn click(&mut self, p: Pos2) -> Option<PaneAction> {
+            use egui::{Event, Modifiers, PointerButton};
+            self.frame(vec![Event::PointerMoved(p)]);
+            self.frame(vec![Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE }]);
+            let (a, _) = self.frame(vec![Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }]);
+            a
+        }
+
+        fn key(&mut self, key: egui::Key) -> Option<PaneAction> {
+            self.frame(vec![egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }]).0
+        }
+
+        fn text_pos(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<Pos2> {
+            shapes.iter().find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text().contains(needle) => Some(t.pos),
+                _ => None,
+            })
+        }
+
+        /// Middle of the drawn path text.
+        fn path_at(&mut self) -> Pos2 {
+            let (_, shapes) = self.frame(vec![]);
+            Self::text_pos(&shapes, "Users").expect("path shown") + Vec2::new(30.0, 8.0)
+        }
+    }
+
+    #[test]
+    fn clicking_the_path_lets_you_type_a_folder() {
+        let mut p = Pane::new(sample_dir(false));
+        let at = p.path_at();
+        assert!(p.click(at).is_none());
+        p.frame(vec![]);
+        // The whole path is selected, so typing replaces it.
+        p.frame(vec![egui::Event::Text("D:\\Work".into())]);
+        match p.key(egui::Key::Enter) {
+            Some(PaneAction::Open(path)) => assert_eq!(path, "D:\\Work"),
+            _ => panic!("Enter should open the typed folder"),
+        }
+        // Back to a plain path afterwards.
+        p.frame(vec![]);
+        assert!(Pane::text_pos(&p.frame(vec![]).1, "Users").is_some());
+    }
+
+    #[test]
+    fn escape_leaves_the_path_alone() {
+        let mut p = Pane::new(sample_dir(false));
+        let at = p.path_at();
+        p.click(at);
+        p.frame(vec![]);
+        p.frame(vec![egui::Event::Text("nowhere".into())]);
+        assert!(p.key(egui::Key::Escape).is_none());
+        assert!(p.key(egui::Key::Enter).is_none(), "editing has ended");
+    }
+
+    #[test]
+    fn refresh_button_sits_at_the_right_border_and_reloads() {
+        let mut p = Pane::new(sample_dir(false));
+        let at = p.path_at();
+        match p.click(Pos2::new(PANE_W - 14.0, at.y)) {
+            Some(PaneAction::Open(path)) => assert_eq!(path, "C:\\Users\\Me"),
+            _ => panic!("the button at the right border refreshes the folder"),
+        }
+        // While loading, the same place still works (it shows a spinner).
+        let mut p = Pane::new(sample_dir(true));
+        assert!(matches!(p.click(Pos2::new(PANE_W - 14.0, at.y)), Some(PaneAction::Open(_))));
+    }
+
+    #[test]
+    fn selecting_a_row_does_not_move_its_name() {
+        let mut p = Pane::new(sample_dir(false));
+        let before = Pane::text_pos(&p.frame(vec![]).1, "Documents").unwrap();
+        p.sel = Some(p.dir.entries[0].clone());
+        let after = Pane::text_pos(&p.frame(vec![]).1, "Documents").unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn action_bar_is_between_the_path_and_the_list() {
+        let mut p = Pane::new(sample_dir(false));
+        let (_, shapes) = p.frame(vec![]);
+        let bar = p.bar_at.expect("bar drawn");
+        let path = Pane::text_pos(&shapes, "Users").unwrap();
+        let first = Pane::text_pos(&shapes, "Documents").unwrap();
+        assert!(path.y < bar.top() && bar.bottom() < first.y, "path {path:?}, bar {bar:?}, list {first:?}");
+    }
+
+    #[test]
+    fn text_is_drawn_a_fifth_bigger() {
+        let height = |styled: bool| {
+            let ctx = egui::Context::default();
+            if styled {
+                style(&ctx);
+            }
+            let mut h = 0.0;
+            for _ in 0..2 {
+                // Fonts take effect from the next frame.
+                let mut out = ctx.run_ui(Default::default(), |ui| {
+                    h = ui.painter().layout_no_wrap("Hg".into(), FontId::proportional(20.0), TEXT).size().y;
+                });
+                out.textures_delta.clear();
+            }
+            h
+        };
+        let ratio = height(true) / height(false);
+        assert!((ratio - TEXT_SCALE).abs() < 0.05, "ratio {ratio}");
+    }
 
     fn rect() -> Rect {
         Rect::from_min_size(Pos2::new(100.0, 50.0), Vec2::new(200.0, 100.0))

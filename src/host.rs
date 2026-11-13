@@ -402,6 +402,7 @@ pub fn run_screen(
     let mut idle = IdleTracker::new(Instant::now());
     let mut seq: u32 = 0;
     let mut flow = FlowControl::new(Instant::now());
+    let mut spare = SpareCpu::new(Instant::now());
     let mut last_monitor_check = Instant::now();
     let mut errors = 0u32;
     // When to look at the screen next. Until then the thread waits for
@@ -612,7 +613,7 @@ pub fn run_screen(
                 prev_raw[i] = Some(frame);
                 prepared
             };
-            encoders[i].tight = flow.far();
+            encoders[i].tight = flow.far() || spare.check(now);
             if optimised {
                 learner.observe(&prepared, start);
                 if learner.palette().is_none() {
@@ -645,6 +646,47 @@ pub fn run_screen(
         let regular = idle.interval(&quality, now);
         let interval = look_interval(regular, last_input.map(|t| now.duration_since(t)), Some(now.duration_since(start)));
         next_look = next_after(start, interval, &pointer);
+    }
+}
+
+/// Is the computer mostly idle? Then lossless parts are compressed harder
+/// for every viewer, not just far ones: smaller pictures for CPU nobody uses.
+/// Measured every [`Self::EVERY`]; on below [`Self::ON_BELOW`] % busy, off
+/// again only above [`Self::OFF_ABOVE`] %, so the extra work our own
+/// compression adds does not switch it straight back off.
+struct SpareCpu {
+    load: crate::sysstat::CpuLoad,
+    cores: usize,
+    next: Instant,
+    spare: bool,
+}
+
+impl SpareCpu {
+    const EVERY: Duration = Duration::from_secs(2);
+    const ON_BELOW: f32 = 40.0;
+    const OFF_ABOVE: f32 = 70.0;
+    /// Fewer cores than this: always quick compression (parts are encoded in parallel).
+    const MIN_CORES: usize = 4;
+
+    fn new(now: Instant) -> Self {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let mut load = crate::sysstat::CpuLoad::default();
+        load.busy(); // first reading
+        SpareCpu { load, cores, next: now + Self::EVERY, spare: false }
+    }
+
+    fn check(&mut self, now: Instant) -> bool {
+        if now >= self.next {
+            self.next = now + Self::EVERY;
+            if let Some(busy) = self.load.busy() {
+                self.spare = Self::decide(self.spare, busy, self.cores);
+            }
+        }
+        self.spare
+    }
+
+    fn decide(spare: bool, busy: f32, cores: usize) -> bool {
+        cores >= Self::MIN_CORES && if spare { busy <= Self::OFF_ABOVE } else { busy < Self::ON_BELOW }
     }
 }
 
@@ -1115,6 +1157,16 @@ pub mod service {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn spare_cpu_switches_with_a_gap() {
+        let d = SpareCpu::decide;
+        assert!(d(false, 10.0, 8), "idle machine: compress harder");
+        assert!(!d(false, 50.0, 8), "half busy: stay quick");
+        assert!(d(true, 60.0, 8), "already on: our own work does not switch it off");
+        assert!(!d(true, 80.0, 8), "busy: back to quick");
+        assert!(!d(false, 5.0, 2), "two cores: always quick");
+    }
+
     use super::*;
     use crate::proto::TileHeader;
     use crate::quality::Preset;
