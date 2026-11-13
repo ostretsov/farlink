@@ -168,6 +168,8 @@ pub struct TestPattern {
     pub received: Vec<InputEvent>,
     /// Draw the pointer into pictures (off when the viewer draws it).
     pub pointer_in_picture: bool,
+    /// Pings being shown: centre (virtual-desktop pixels), radius, start.
+    pub pings: Vec<(i32, i32, u32, std::time::Instant)>,
 }
 
 impl TestPattern {
@@ -182,7 +184,7 @@ impl TestPattern {
                 m
             })
             .collect();
-        TestPattern { monitors, tick: 0, pointer: (100, 100), received: Vec::new(), pointer_in_picture: true }
+        TestPattern { monitors, tick: 0, pointer: (100, 100), received: Vec::new(), pointer_in_picture: true, pings: Vec::new() }
     }
 
     pub fn dual() -> TestPattern {
@@ -244,7 +246,12 @@ impl Desktop for TestPattern {
 
     fn capture(&mut self, mon: &MonitorInfo) -> Result<Frame> {
         self.tick = self.tick.wrapping_add(1);
-        Ok(TestPattern::render(mon, self.tick, self.pointer_in_picture.then_some(self.pointer)))
+        let mut f = TestPattern::render(mon, self.tick, self.pointer_in_picture.then_some(self.pointer));
+        self.pings.retain(|p| p.3.elapsed() < crate::ping::DURATION);
+        for &(x, y, r, start) in &self.pings {
+            crate::ping::draw_into(&mut f, x - mon.x, y - mon.y, r, crate::ping::progress(start.elapsed()));
+        }
+        Ok(f)
     }
 
     fn set_pointer_in_picture(&mut self, on: bool) {
@@ -266,6 +273,11 @@ impl Desktop for TestPattern {
                     self.pointer = p;
                 }
             }
+            InputEvent::Ping { mon, x, y } => {
+                if let Some((px, py, r)) = crate::ping::place(monitors, *mon, *x, *y) {
+                    self.pings.push((px, py, r, std::time::Instant::now()));
+                }
+            }
             _ => {}
         }
         self.received.push(ev.clone());
@@ -276,6 +288,36 @@ impl Desktop for TestPattern {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn demo_desktop_draws_pings_on_the_right_screen_until_they_end() {
+        let mut t = TestPattern::dual();
+        let mons = t.monitors().unwrap();
+        let plain = t.capture(&mons[1]).unwrap();
+        t.input(&mons, &InputEvent::Ping { mon: 1, x: 0.25, y: 0.5 }).unwrap();
+        assert_eq!(t.pings.len(), 1);
+        let (cx, cy) = (320, 512);
+        let with = t.capture(&mons[1]).unwrap();
+        let c = with.pixel(cx, cy);
+        assert!(c[0] > 200 && c[1] < 120 && c[2] < 120, "red dot at the spot, got {c:?}");
+        assert_ne!(c, plain.pixel(cx, cy));
+        let other = t.capture(&mons[0]).unwrap();
+        assert_eq!(other.rgba, TestPattern::render(&mons[0], t.tick, Some(t.pointer)).rgba, "other screen untouched");
+        // Over: removed, picture back to normal.
+        t.pings[0].3 = std::time::Instant::now() - crate::ping::DURATION;
+        let after = t.capture(&mons[1]).unwrap();
+        assert!(t.pings.is_empty());
+        assert_eq!(after.pixel(cx, cy), plain.pixel(cx, cy));
+    }
+
+    #[test]
+    fn pings_off_every_screen_are_ignored() {
+        let mut t = TestPattern::dual();
+        let mons = t.monitors().unwrap();
+        t.input(&mons, &InputEvent::Ping { mon: 9, x: 0.5, y: 0.5 }).unwrap();
+        assert!(t.pings.is_empty());
+        assert_eq!(t.received.len(), 1, "still recorded as received");
+    }
 
     #[test]
     fn absolute_positions_span_both_monitors() {

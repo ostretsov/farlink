@@ -1528,6 +1528,9 @@ mod tests {
         assert!(viewer_message_allowed(&quality, true));
         assert!(!viewer_message_allowed("not json", false));
         assert!(!viewer_message_allowed(r#"{"t":"closed","reason":"x"}"#, false), "viewer can't fake relay messages");
+        let ping = r#"{"t":"input","event":{"k":"ping","mon":0,"x":0.5,"y":0.5}}"#;
+        assert!(!viewer_message_allowed(ping, true), "view-only can't ping");
+        assert!(viewer_message_allowed(ping, false));
     }
 
     #[test]

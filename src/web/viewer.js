@@ -194,8 +194,16 @@
       if (first) requestAnimationFrame(() => { input({ k: 'mouse_move', mon, x: pending.x, y: pending.y }); pending = null; });
     });
     const btn = (b) => (b === 0 ? 'left' : b === 1 ? 'middle' : 'right');
-    canvas.addEventListener('mousedown', (e) => { canvas.focus(); const p = pos(canvas, e); input({ k: 'mouse_button', mon, x: p.x, y: p.y, button: btn(e.button), down: true }); e.preventDefault(); });
-    canvas.addEventListener('mouseup', (e) => { const p = pos(canvas, e); input({ k: 'mouse_button', mon, x: p.x, y: p.y, button: btn(e.button), down: false }); e.preventDefault(); });
+    // Ctrl+Shift+left click: show the remote person this spot (a "ping") instead of clicking.
+    const ping = (e) => e.button === 0 && e.ctrlKey && e.shiftKey && !e.altKey;
+    canvas.addEventListener('mousedown', (e) => {
+      canvas.focus();
+      const p = pos(canvas, e);
+      if (ping(e)) input({ k: 'ping', mon, x: p.x, y: p.y });
+      else input({ k: 'mouse_button', mon, x: p.x, y: p.y, button: btn(e.button), down: true });
+      e.preventDefault();
+    });
+    canvas.addEventListener('mouseup', (e) => { if (ping(e)) return e.preventDefault(); const p = pos(canvas, e); input({ k: 'mouse_button', mon, x: p.x, y: p.y, button: btn(e.button), down: false }); e.preventDefault(); });
     canvas.addEventListener('contextmenu', (e) => e.preventDefault());
     canvas.addEventListener('wheel', (e) => {
       e.preventDefault();

@@ -320,6 +320,11 @@ impl Desktop for X11Desktop {
                     self.named_key(k, d)?;
                 }
             }
+            InputEvent::Ping { mon, x, y } => {
+                if let Some((px, py, r)) = crate::ping::place(monitors, *mon, *x, *y) {
+                    crate::ping::show(px, py, r);
+                }
+            }
         }
         self.conn.flush()?;
         Ok(())

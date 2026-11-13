@@ -381,10 +381,18 @@ fn file_pane(
                     }
                 } else {
                     let shown = if dir.path.is_empty() { "Starting places".to_string() } else { dir.path.clone() };
-                    let r = ui
-                        .add(egui::Label::new(RichText::new(shown).monospace().color(MUTED)).truncate().sense(egui::Sense::click()))
-                        .on_hover_cursor(egui::CursorIcon::Text)
-                        .on_hover_text("Click to type or copy a path");
+                    // The whole space up to the refresh icon is clickable. A path too
+                    // long for it keeps its end (the folder you are in): "…/b/c".
+                    let size = Vec2::new(ui.available_width(), ui.spacing().interact_size.y);
+                    let (rect, r) = ui.allocate_exact_size(size, egui::Sense::click());
+                    let font = egui::TextStyle::Monospace.resolve(ui.style());
+                    let width = |t: &str| ui.painter().layout_no_wrap(t.to_string(), font.clone(), MUTED).size().x;
+                    let fitted = tail_that_fits(&shown, rect.width() - 4.0, width);
+                    let galley = ui.painter().layout_no_wrap(fitted.clone(), font.clone(), MUTED);
+                    let at = Pos2::new(rect.left() + 2.0, rect.center().y - galley.size().y / 2.0);
+                    ui.painter_at(rect).galley(at, galley, MUTED);
+                    let hint = if fitted == shown { "Click to type or copy a path".to_string() } else { format!("{shown}\nClick to type or copy a path") };
+                    let r = r.on_hover_cursor(egui::CursorIcon::Text).on_hover_text(hint);
                     if r.clicked() {
                         ui.data_mut(|d| d.insert_temp(edit_id, (dir.path.clone(), true)));
                     }
@@ -435,6 +443,22 @@ fn paint_folder(p: &egui::Painter, at: Pos2) {
     p.rect_filled(Rect::from_min_size(at + Vec2::new(0.0, -2.5), Vec2::new(16.0, 9.0)), CornerRadius::same(2), front);
 }
 
+/// `text`, or as much of its end as fits in `max` (measured by `width`),
+/// starting with "…".
+fn tail_that_fits(text: &str, max: f32, width: impl Fn(&str) -> f32) -> String {
+    if width(text) <= max {
+        return text.to_string();
+    }
+    let starts: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    // Fewest characters dropped from the front that make it fit (binary search).
+    let (mut lo, mut hi) = (1, starts.len());
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if width(&format!("…{}", &text[starts[mid]..])) <= max { hi = mid } else { lo = mid + 1 }
+    }
+    if hi >= starts.len() { "…".to_string() } else { format!("…{}", &text[starts[hi]..]) }
+}
+
 /// A short arrow centred on `c`, pointing right (`dir` 1.0) or left (-1.0).
 fn paint_arrow(p: &egui::Painter, c: Pos2, dir: f32, color: Color32) {
     let stroke = Stroke::new(1.8, color);
@@ -481,27 +505,29 @@ fn files_window(ui: &mut egui::Ui, s: &mut OpenSession) -> bool {
     if let Some(next) = fv.remote_start_step(&remote) {
         s.handle.list_remote(&next);
     }
-    egui::Panel::bottom("transfers").frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(12, 8))).show(ui, |ui| {
-        ui.label(RichText::new("TRANSFERS").size(11.0).color(MUTED));
-        for t in transfers.iter().rev().take(5) {
-            ui.horizontal(|ui| {
-                ui.label(if t.upload { "Upload" } else { "Download" });
-                ui.label(RichText::new(&t.name).strong());
-                let frac = if t.total == 0 { 1.0 } else { t.done as f32 / t.total as f32 };
-                match &t.state {
-                    TransferState::Running => {
-                        ui.add(egui::ProgressBar::new(frac).desired_width(200.0).text(format!("{} of {}", format_size(t.done), format_size(t.total))));
+    // Transfers bar only once something has been copied.
+    if !transfers.is_empty() {
+        egui::Panel::bottom("transfers").frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(12, 8))).show(ui, |ui| {
+            for t in transfers.iter().rev().take(5) {
+                ui.horizontal(|ui| {
+                    ui.label(if t.upload { "Upload" } else { "Download" });
+                    ui.label(RichText::new(&t.name).strong());
+                    let frac = if t.total == 0 { 1.0 } else { t.done as f32 / t.total as f32 };
+                    match &t.state {
+                        TransferState::Running => {
+                            ui.add(egui::ProgressBar::new(frac).desired_width(200.0).text(format!("{} of {}", format_size(t.done), format_size(t.total))));
+                        }
+                        TransferState::Done => {
+                            ui.label(RichText::new(format!("done · {}", format_size(t.total))).color(OK));
+                        }
+                        TransferState::Failed(e) => {
+                            ui.label(RichText::new(format!("failed: {e}")).color(DANGER));
+                        }
                     }
-                    TransferState::Done => {
-                        ui.label(RichText::new(format!("done · {}", format_size(t.total))).color(OK));
-                    }
-                    TransferState::Failed(e) => {
-                        ui.label(RichText::new(format!("failed: {e}")).color(DANGER));
-                    }
-                }
-            });
-        }
-    });
+                });
+            }
+        });
+    }
     egui::CentralPanel::default().frame(egui::Frame::new().fill(BG).inner_margin(Margin::same(12))).show(ui, |ui| {
         ui.columns(2, |cols| {
             let local_hidden = fv.local_hidden;
@@ -712,8 +738,19 @@ pub fn map_events(
                 let (x, y) = norm(*p);
                 last_move = Some(InputEvent::MouseMove { mon, x, y });
             }
-            egui::Event::PointerButton { pos, button, pressed, .. } => {
+            egui::Event::PointerButton { pos, button, pressed, modifiers } => {
                 if *pressed && !hit(*pos) {
+                    continue;
+                }
+                // Ctrl+Shift+click: show the remote person this spot instead of clicking.
+                if *button == egui::PointerButton::Primary && modifiers.ctrl && modifiers.shift && !modifiers.alt {
+                    if *pressed {
+                        if let Some(m) = last_move.take() {
+                            out.push(m);
+                        }
+                        let (x, y) = norm(*pos);
+                        out.push(InputEvent::Ping { mon, x: x.clamp(0.0, 1.0), y: y.clamp(0.0, 1.0) });
+                    }
                     continue;
                 }
                 let button = match button {
@@ -3391,6 +3428,40 @@ mod tests {
     }
 
     #[test]
+    fn long_paths_keep_their_end() {
+        let w = |t: &str| t.chars().count() as f32 * 10.0;
+        assert_eq!(tail_that_fits("/a/b", 100.0, w), "/a/b");
+        assert_eq!(tail_that_fits("/home/artem/projects", 100.0, w), "…/projects");
+        assert_eq!(tail_that_fits("/home/artem/projects", 100.0, w).chars().count(), 10);
+        assert_eq!(tail_that_fits("ünïcødé/päth", 60.0, w), "…/päth");
+        assert_eq!(tail_that_fits("abc", 5.0, w), "…");
+    }
+
+    #[test]
+    fn a_long_path_shows_its_end_in_the_pane() {
+        let mut dir = sample_dir(false);
+        dir.path = format!("/very{}/last-folder", "/long".repeat(40));
+        let mut p = Pane::new(dir);
+        let (_, shapes) = p.frame(vec![]);
+        let shown = shapes.iter().find_map(|c| match &c.shape {
+            egui::Shape::Text(t) if t.galley.text().ends_with("last-folder") => Some(t.galley.text().to_string()),
+            _ => None,
+        });
+        assert!(shown.is_some_and(|t| t.starts_with('…')), "the end of the path is shown");
+    }
+
+    #[test]
+    fn the_whole_path_row_is_clickable() {
+        let mut p = Pane::new(sample_dir(false));
+        let at = p.path_at();
+        // Far right of the row, well past the short path text, left of the refresh icon.
+        p.click(Pos2::new(PANE_W - 60.0, at.y));
+        p.frame(vec![]);
+        p.frame(vec![egui::Event::Text("E:\\".into())]);
+        assert!(matches!(p.key(egui::Key::Enter), Some(PaneAction::Open(x)) if x == "E:\\"));
+    }
+
+    #[test]
     fn escape_leaves_the_path_alone() {
         let mut p = Pane::new(sample_dir(false));
         let at = p.path_at();
@@ -3487,6 +3558,38 @@ mod tests {
         };
         let out = map_events(&[press_out, release_out], rect(), rect(), 0, &mut prev, Default::default(), true);
         assert_eq!(out, vec![InputEvent::MouseButton { mon: 0, x: 0.0, y: 0.0, button: MouseButton::Right, down: false }]);
+    }
+
+    #[test]
+    fn ctrl_shift_click_pings_instead_of_clicking() {
+        let mut prev = egui::Modifiers::default();
+        let both = egui::Modifiers { ctrl: true, command: true, shift: true, ..Default::default() };
+        let at = rect().center();
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: both };
+        let out = map_events(&[button(true), button(false)], rect(), rect(), 1, &mut prev, both, false);
+        assert_eq!(out, vec![InputEvent::Ping { mon: 1, x: 0.5, y: 0.5 }], "one ping, no click");
+        // Outside the picture: nothing.
+        let out_press = egui::Event::PointerButton { pos: Pos2::new(-5.0, -5.0), button: egui::PointerButton::Primary, pressed: true, modifiers: both };
+        assert!(map_events(&[out_press], rect(), rect(), 1, &mut prev, both, false).is_empty());
+    }
+
+    #[test]
+    fn only_ctrl_shift_left_click_pings() {
+        let mut prev = egui::Modifiers::default();
+        let at = rect().center();
+        let press = |button, modifiers| egui::Event::PointerButton { pos: at, button, pressed: true, modifiers };
+        let ctrl_shift = egui::Modifiers { ctrl: true, command: true, shift: true, ..Default::default() };
+        let pinged = |ev: egui::Event, prev: &mut egui::Modifiers| {
+            map_events(&[ev], rect(), rect(), 0, prev, Default::default(), false).iter().any(|e| matches!(e, InputEvent::Ping { .. }))
+        };
+        assert!(!pinged(press(egui::PointerButton::Primary, Default::default()), &mut prev), "plain click");
+        assert!(!pinged(press(egui::PointerButton::Primary, egui::Modifiers { ctrl: true, command: true, ..Default::default() }), &mut prev));
+        assert!(!pinged(press(egui::PointerButton::Primary, egui::Modifiers { shift: true, ..Default::default() }), &mut prev));
+        assert!(!pinged(press(egui::PointerButton::Primary, egui::Modifiers { alt: true, ..ctrl_shift }), &mut prev), "Ctrl+Alt+Shift");
+        assert!(!pinged(press(egui::PointerButton::Secondary, ctrl_shift), &mut prev), "right button");
+        // A Ctrl+Shift right click is still an ordinary click.
+        let out = map_events(&[press(egui::PointerButton::Secondary, ctrl_shift)], rect(), rect(), 0, &mut prev, Default::default(), false);
+        assert!(matches!(out[..], [InputEvent::MouseButton { button: MouseButton::Right, down: true, .. }]), "{out:?}");
     }
 
     #[test]

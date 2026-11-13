@@ -21,6 +21,7 @@ pub mod keys;
 pub mod layout;
 pub mod net;
 pub mod palette;
+pub mod ping;
 pub mod proto;
 pub mod quality;
 pub mod server;

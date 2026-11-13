@@ -664,6 +664,11 @@ impl Desktop for WinDesktop {
                 self.send(&v);
             }
             InputEvent::CtrlAltDel => self.ctrl_alt_del(),
+            InputEvent::Ping { mon, x, y } => {
+                if let Some((px, py, r)) = crate::ping::place(monitors, *mon, *x, *y) {
+                    crate::ping::show(px, py, r);
+                }
+            }
         }
         Ok(())
     }

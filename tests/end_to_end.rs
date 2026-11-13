@@ -237,6 +237,7 @@ async fn view_only_links_block_input_and_can_be_withdrawn() {
 
     // Mouse/keyboard from a view-only guest never reach the host; acks do.
     send(&mut viewer, &SessionMsg::Input { event: InputEvent::Text { text: "format c:".into() } }).await;
+    send(&mut viewer, &SessionMsg::Input { event: InputEvent::Ping { mon: 0, x: 0.5, y: 0.5 } }).await;
     send(&mut viewer, &SessionMsg::Ack { seq: 42 }).await;
     let first: SessionMsg = next_json(&mut host).await;
     assert_eq!(first, SessionMsg::Ack { seq: 42 });
@@ -302,6 +303,9 @@ async fn control_links_pass_input_and_expire() {
     };
     send(&mut viewer, &click).await;
     assert_eq!(next_json::<SessionMsg>(&mut host).await, click);
+    let ping = SessionMsg::Input { event: InputEvent::Ping { mon: 1, x: 0.25, y: 0.75 } };
+    send(&mut viewer, &ping).await;
+    assert_eq!(next_json::<SessionMsg>(&mut host).await, ping, "pings reach the host");
 
     // Time passes: the link expires and the session is ended by the server.
     let token = guest.token.clone();

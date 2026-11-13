@@ -57,6 +57,9 @@ pub enum InputEvent {
     Text { text: String },
     /// Ctrl+Alt+Del (Windows secure attention sequence).
     CtrlAltDel,
+    /// Show the remote person a spot: a dot with waves spreading out from
+    /// it for a moment (see [`crate::ping`]). `x`, `y` are 0..1 inside `mon`.
+    Ping { mon: u8, x: f32, y: f32 },
 }
 
 /// Messages inside one viewing session (viewer <-> host, through the relay).
@@ -406,6 +409,16 @@ mod tests {
         }
         let s = serde_json::to_string(&SessionMsg::Ack { seq: 3 }).unwrap();
         assert_eq!(s, r#"{"t":"ack","seq":3}"#, "browser viewer relies on this shape");
+    }
+
+    #[test]
+    fn ping_is_control_input_in_the_shape_browsers_send() {
+        let ping = SessionMsg::Input { event: InputEvent::Ping { mon: 1, x: 0.5, y: 0.25 } };
+        // web/viewer.js sends exactly this.
+        let from_browser = r#"{"t":"input","event":{"k":"ping","mon":1,"x":0.5,"y":0.25}}"#;
+        assert_eq!(serde_json::from_str::<SessionMsg>(from_browser).unwrap(), ping);
+        assert_eq!(serde_json::to_string(&ping).unwrap(), from_browser);
+        assert!(ping.is_control(), "view-only viewers can't ping");
     }
 
     #[test]
