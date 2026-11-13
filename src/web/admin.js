@@ -177,17 +177,12 @@ async function updateAll() {
   refresh();
 }
 
-// Relay version and its own updates: short form in the header, details and
-// the "Update now" button in the administrator's "Relay server" card.
+// Relay version in the header; update details and the "Update now" button
+// are in the administrator's "Relay server" card.
 function renderServer(admin) {
   const u = data.server_update || {};
   const when = (t) => t ? ago(data.now - t) : 'never';
-  let line = 'relay ' + data.server_version;
-  if (u.checking) line += ' · checking for updates…';
-  else if (u.last_check) line += ' · checked ' + when(u.last_check) + (u.last_check_ok ? '' : ' (failed)');
-  if (u.last_update) line += ' · updated ' + when(u.last_update);
-  $('ver').textContent = line;
-  $('ver').title = u.last_check ? 'Last check: ' + u.last_check_result : '';
+  $('ver').textContent = 'relay ' + data.server_version;
   if (!admin) return;
   $('srvSource').innerHTML = u.source
     ? 'updates itself from <a href="https://github.com/' + esc(u.source) + '/releases" target="_blank">github.com/' + esc(u.source) + '</a>, hourly'
