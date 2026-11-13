@@ -11,7 +11,7 @@ header.top { display: flex; align-items: center; gap: 17.5px; padding: 15px 27.5
 .logo { display: flex; align-items: center; gap: 12.5px; font-weight: 700; letter-spacing: .4px; font-size: 20px; }
 .logo i { width: 27.5px; height: 27.5px; background: url(/assets/icon.svg) center / contain no-repeat; display: inline-block; }
 .spacer { flex: 1; }
-main { max-width: 1475px; margin: 0 auto; padding: 27.5px; display: grid; gap: 22.5px; }
+main { max-width: 1475px; margin: 0 auto; padding: 27.5px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 22.5px; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px 22.5px; }
 .card h2 { margin: 0 0 15px; font-size: 19px; display: flex; align-items: center; gap: 12.5px; }
 .card h2 small { color: var(--muted); font-weight: 400; }
@@ -36,14 +36,14 @@ tr:last-child td { border-bottom: 0; }
 .muted { color: var(--muted); }
 .mono { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 15.5px; }
 .copybox { display: flex; gap: 10px; align-items: center; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12.5px; overflow: hidden; }
-.copybox code { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.copybox code { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .screens { display: inline-flex; gap: 4px; vertical-align: middle; }
 .screens i { display: inline-block; height: 17.5px; border: 1.5px solid var(--muted); border-radius: 2.5px; }
 .login { max-width: 450px; margin: 12vh auto; }
 .login input { width: 100%; margin: 10px 0 17.5px; }
 .hidden { display: none !important; }
-.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 22.5px; }
-@media (max-width: 1125px) { .grid2 { grid-template-columns: 1fr; } }
+.grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 22.5px; }
+@media (max-width: 1125px) { .grid2 { grid-template-columns: minmax(0, 1fr); } }
 dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: var(--radius); padding: 25px; min-width: 450px; }
 dialog::backdrop { background: rgba(0, 0, 0, .55); }
 dialog label { display: block; margin: 12.5px 0 5px; color: var(--muted); }
