@@ -112,7 +112,8 @@ function render() {
       <button class="small danger" onclick="removeUser('${u.id}')">Remove</button></td></tr>`;
   }).join('') || '<tr><td colspan="5" class="muted">Nobody yet. “Add person” gives someone access to their own computer only.</td></tr>';
 
-  const gs = data.grants.filter((g) => g.status === 'active').concat(data.grants.filter((g) => g.status !== 'active').slice(0, 5));
+  const shown = data.grants.filter((g) => g.status !== 'withdrawn');
+  const gs = shown.filter((g) => g.status === 'active').concat(shown.filter((g) => g.status !== 'active').slice(0, 5));
   $('grants').innerHTML = gs.map((g) => `<tr>
     <td>${esc(g.label || '—')}</td><td>${esc(g.machine_name)}</td>
     <td>${g.view_only ? '<span class="tag view">view only</span>' : '<span class="tag ctrl">control</span>'}</td>
