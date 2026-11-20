@@ -141,7 +141,7 @@ pub fn load_or_init_store(path: &std::path::Path) -> Result<(Store, Option<Strin
         }
     }
     let password = random_token(6);
-    let store = Store::new(&password);
+    let store = Store::new(&password, now_secs());
     save_json(path, &store)?;
     Ok((store, Some(password)))
 }
@@ -990,6 +990,9 @@ pub struct Overview {
     pub grants: Vec<GrantView>,
     pub sessions: Vec<serde_json::Value>,
     pub install_url: String,
+    /// When the general install link was made (0 = not known).
+    #[serde(default)]
+    pub install_created: u64,
     pub server_version: String,
     pub release_version: Option<String>,
     pub now: u64,
@@ -1029,6 +1032,7 @@ pub fn overview_for(r: &Relay, who: &Who) -> Overview {
         o.grants.clear();
         o.users.clear();
         o.install_url.clear();
+        o.install_created = 0;
         o.slow_after_pause_fix = None;
         o.role = "user".into();
         if !o.server_update.last_check_ok && o.server_update.last_check.is_some() {
@@ -1095,6 +1099,7 @@ pub fn overview(r: &Relay) -> Overview {
         grants,
         sessions: sessions.iter().map(|s| serde_json::to_value(s).unwrap()).collect(),
         install_url: r.install_url(),
+        install_created: r.read_store(|s| s.enroll_created),
         server_version: crate::VERSION.into(),
         release_version: release,
         now,
@@ -1334,7 +1339,7 @@ async fn api_rotate(State(r): State<Shared>, headers: HeaderMap) -> Response {
     if !is_admin(&r, &headers) {
         return unauthorized();
     }
-    r.with_store(|s| s.rotate_enroll_token());
+    r.with_store(|s| s.rotate_enroll_token(now_secs()));
     Json(json!({"install_url": r.install_url()})).into_response()
 }
 

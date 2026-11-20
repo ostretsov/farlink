@@ -979,6 +979,7 @@ pub fn sample_overview() -> Overview {
         grants: vec![],
         sessions: vec![],
         install_url: "https://remote.example.com/install/sample".into(),
+        install_created: 0,
         server_version: crate::VERSION.into(),
         release_version: Some(crate::VERSION.into()),
         now,

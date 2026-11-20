@@ -36,9 +36,11 @@ tr:last-child td { border-bottom: 0; }
 .muted { color: var(--muted); }
 .mono { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 15.5px; }
 .copybox { display: flex; gap: 10px; align-items: center; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12.5px; overflow: hidden; }
+.addpc { display: flex; align-items: center; gap: 17.5px; padding: 12.5px 22.5px; }
+.addpc h2 { margin: 0; white-space: nowrap; }
+.addpc .copybox { flex: 1; min-width: 0; padding: 5px 7.5px 5px 12.5px; }
+.addpc small { white-space: nowrap; font-size: 15px; }
 .copybox code { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.screens { display: inline-flex; gap: 4px; vertical-align: middle; }
-.screens i { display: inline-block; height: 17.5px; border: 1.5px solid var(--muted); border-radius: 2.5px; }
 .login { max-width: 450px; margin: 12vh auto; }
 .login input { width: 100%; margin: 10px 0 17.5px; }
 .hidden { display: none !important; }
@@ -79,6 +81,7 @@ td select { padding: 5px 10px; }
 .tag.switch { cursor: pointer; }
 .tag.switch:hover { border-color: currentColor; }
 button.more { padding: 5px 10px; font-weight: 700; letter-spacing: 1px; }
+.actions { display: flex; gap: 5px; justify-content: flex-end; align-items: stretch; white-space: nowrap; }
 .ctxmenu button.danger { color: var(--danger); }
 textarea { width: 100%; resize: vertical; box-sizing: border-box; }
 .notes { color: var(--accent2); font-style: italic; white-space: pre-line; max-width: 420px; }

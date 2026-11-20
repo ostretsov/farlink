@@ -58,10 +58,6 @@ function left(secs) {
   if (secs < 86400) return 'in ' + Math.round(secs / 3600) + ' h';
   return 'in ' + Math.round(secs / 86400) + ' d';
 }
-function screens(mons) {
-  if (!mons || !mons.length) return '<span class="muted">–</span>';
-  return '<span class="screens">' + mons.map((m) => `<i title="${esc(m.width + '×' + m.height)}" style="width:${Math.round(17.5 * m.width / m.height)}px"></i>`).join('') + '</span> ' + mons.length;
-}
 
 function ownerSelect(m) {
   const opts = ['<option value="">Administrator only</option>']
@@ -77,8 +73,11 @@ function render() {
   $('mtitle').textContent = admin ? 'Computers' : 'My computers';
   renderServer(admin);
   $('installUrl').textContent = data.install_url;
+  const made = data.install_created;
+  $('installAge').textContent = made ? 'made ' + ago(data.now - made) : '';
+  $('installAge').title = made ? new Date(made * 1000).toLocaleString() : '';
   const q = $('filter').value.toLowerCase();
-  const ms = data.machines.filter((m) => !q || (m.name + m.hostname + m.os + (m.owner_name || '') + (m.notes || '') + (whoLine(m) || '')).toLowerCase().includes(q));
+  const ms = data.machines.filter((m) => !q || (m.name + m.hostname + m.os + (m.owner_name || '') + (m.notes || '') + whoLines(m).join(' ')).toLowerCase().includes(q));
   const outdated = data.machines.filter((m) => m.online && !m.up_to_date && !m.updating).length;
   $('updAll').classList.toggle('hidden', !admin || !outdated);
   $('updAll').textContent = 'Update ' + outdated + ' out of date';
@@ -87,17 +86,17 @@ function render() {
   $('machines').innerHTML = ms.map((m) => `<tr ${admin ? `oncontextmenu="rowMenu(event, '${m.id}')" title="Right-click for more"` : ''}>
     <td><span class="dot ${m.online ? 'on' : ''}"></span><b>${esc(m.name)}</b>
       ${m.sessions ? '<span class="tag ctrl">in use</span>' : ''}
-      <div class="muted">${m.online ? 'online' : 'seen ' + ago(data.now - m.last_seen)} · ${esc(m.hostname)}</div>
-      ${whoLine(m) ? `<div class="muted">${esc(whoLine(m))}</div>` : ''}
+      <div class="muted">${m.online ? '' : 'seen ' + ago(data.now - m.last_seen) + ' · '}${esc(m.hostname)}</div>
+      ${whoLines(m).map((l) => `<div class="muted">${esc(l)}</div>`).join('')}
       ${m.notes ? `<div class="notes">${esc(m.notes)}</div>` : ''}</td>
-    <td>${esc(m.os)}</td><td>${loadCell(m)}</td><td>${screens(m.monitors)}</td>
+    <td>${esc(m.os)}</td><td>${loadCell(m)}</td>
     ${admin ? `<td>${ownerSelect(m)}</td>` : ''}
     <td>${versionCell(m, admin)}</td>
-    <td style="text-align:right;white-space:nowrap">
+    <td><div class="actions">
       <a class="btn small primary" href="/view/${m.id}" target="_blank" ${m.online ? '' : 'style="opacity:.5"'}>Control</a>
       <a class="btn small" href="/view/${m.id}?view_only=1" target="_blank">View</a>
-      ${admin ? `<button class="small more" title="More" onclick="rowMenu(event, '${m.id}')">⋯</button>` : ''}</td></tr>`).join('')
-    || `<tr><td colspan="7" class="muted">${admin ? 'No computers yet. Open the install link above on a computer to add it.' : 'No computers yet. Ask the administrator for your personal install link.'}</td></tr>`;
+      ${admin ? `<button class="small more" title="More" onclick="rowMenu(event, '${m.id}')">⋯</button>` : ''}</div></td></tr>`).join('')
+    || `<tr><td colspan="6" class="muted">${admin ? 'No computers yet. Open the install link above on a computer to add it.' : 'No computers yet. Ask the administrator for your personal install link.'}</td></tr>`;
 
   if (!admin) return;
 
@@ -145,18 +144,18 @@ function loadCell(m) {
   const disks = s.disks.map((d) => {
     const used = 100 - d.free * 100 / (d.total || 1);
     return `<span class="${level(used)}" title="${bytes(d.free)} free of ${bytes(d.total)}">${esc(d.name)} ${bytes(d.free)} free</span>`;
-  }).join(' · ');
-  return `<div class="load"><span class="${level(s.cpu)}">CPU ${Math.round(s.cpu)}%</span> ·
-    <span class="${level(mem)}">RAM ${bytes(s.mem_used)} / ${bytes(s.mem_total)}</span>${disks ? '<br>' + disks : ''}</div>`;
+  });
+  return `<div class="load"><span class="${level(s.cpu)}">CPU ${Math.round(s.cpu)}%</span><br>
+    <span class="${level(mem)}">RAM ${bytes(s.mem_used)} / ${bytes(s.mem_total)}</span>${disks.map((d) => '<br>' + d).join('')}</div>`;
 }
 
-// "olga · Domain corp.example.com": who is signed in, and the Windows
-// workgroup or AD domain (online computers whose helper tells).
-function whoLine(m) {
+// ["olga", "Domain corp.example.com"]: who is signed in, and the Windows
+// workgroup or AD domain (online computers whose helper tells), one per line.
+function whoLines(m) {
   const s = m.online && m.stats;
-  if (!s || (!s.user && !s.joined)) return '';
+  if (!s || (!s.user && !s.joined)) return [];
   const j = s.joined ? (s.joined.kind === 'domain' ? 'Domain ' : 'Workgroup ') + s.joined.name : '';
-  return [s.user || (j ? 'Nobody signed in' : ''), j].filter(Boolean).join(' · ');
+  return [s.user || (j ? 'Nobody signed in' : ''), j].filter(Boolean);
 }
 
 // Helper version on a computer, how its update goes, and "Update" (administrator).

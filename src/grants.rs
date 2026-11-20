@@ -117,6 +117,9 @@ pub struct Store {
     pub admin_hash: String,
     /// Token inside install links. Rotating it invalidates old links.
     pub enroll_token: String,
+    /// When `enroll_token` was made (0 = before this was recorded).
+    #[serde(default)]
+    pub enroll_created: u64,
     #[serde(default)]
     pub machines: BTreeMap<String, Machine>,
     /// token -> grant
@@ -170,8 +173,13 @@ pub fn verify_password(pw: &str, hash: &str) -> bool {
 }
 
 impl Store {
-    pub fn new(admin_password: &str) -> Store {
-        Store { admin_hash: hash_password(admin_password), enroll_token: random_token(16), ..Default::default() }
+    pub fn new(admin_password: &str, now: u64) -> Store {
+        Store {
+            admin_hash: hash_password(admin_password),
+            enroll_token: random_token(16),
+            enroll_created: now,
+            ..Default::default()
+        }
     }
 
     pub fn set_password(&mut self, pw: &str) {
@@ -199,8 +207,9 @@ impl Store {
         self.user_sessions.remove(&h);
     }
 
-    pub fn rotate_enroll_token(&mut self) -> String {
+    pub fn rotate_enroll_token(&mut self, now: u64) -> String {
         self.enroll_token = random_token(16);
+        self.enroll_created = now;
         self.enroll_token.clone()
     }
 
@@ -506,7 +515,7 @@ mod tests {
 
     #[test]
     fn password_login_and_sessions() {
-        let mut s = Store::new("correct horse");
+        let mut s = Store::new("correct horse", 0);
         assert!(s.login("wrong", 0).is_none());
         let t = s.login("correct horse", 100).unwrap();
         assert!(s.check_admin(&t, 200));
@@ -522,7 +531,7 @@ mod tests {
 
     #[test]
     fn enrolment_then_reconnect_with_secret() {
-        let mut s = Store::new("pw");
+        let mut s = Store::new("pw", 0);
         let tok = s.enroll_token.clone();
         assert_eq!(s.register(Some("nope"), None, None, info("pc"), 0), Err(StoreError::BadEnrollToken));
         let (id, secret, name) = s.register(Some(&tok), None, None, info("pc"), 10).unwrap();
@@ -541,13 +550,14 @@ mod tests {
         let (_, _, n2) = s.register(Some(&tok), None, None, info("pc"), 40).unwrap();
         assert_eq!(n2, "pc (2)");
         // Rotated token stops old install links.
-        s.rotate_enroll_token();
+        s.rotate_enroll_token(70);
+        assert_eq!(s.enroll_created, 70);
         assert_eq!(s.register(Some(&tok), None, None, info("x"), 50), Err(StoreError::BadEnrollToken));
     }
 
     #[test]
     fn grants_expire_and_can_be_withdrawn() {
-        let mut s = Store::new("pw");
+        let mut s = Store::new("pw", 0);
         let tok = s.enroll_token.clone();
         let (id, _, _) = s.register(Some(&tok), None, None, info("srv"), 0).unwrap();
         assert_eq!(s.create_grant("ghost", 10, true, "", 0), Err(StoreError::UnknownMachine));
@@ -568,7 +578,7 @@ mod tests {
 
     #[test]
     fn removing_machine_withdraws_its_links() {
-        let mut s = Store::new("pw");
+        let mut s = Store::new("pw", 0);
         let tok = s.enroll_token.clone();
         let (id, _, _) = s.register(Some(&tok), None, None, info("a"), 0).unwrap();
         let g = s.create_grant(&id, 60, false, "", 0).unwrap();
@@ -579,7 +589,7 @@ mod tests {
 
     #[test]
     fn prune_drops_old_links() {
-        let mut s = Store::new("pw");
+        let mut s = Store::new("pw", 0);
         let tok = s.enroll_token.clone();
         let (id, _, _) = s.register(Some(&tok), None, None, info("a"), 0).unwrap();
         let old = s.create_grant(&id, 1, false, "", 0).unwrap();
@@ -591,7 +601,7 @@ mod tests {
 
     #[test]
     fn personal_install_link_gives_computer_to_that_person_only() {
-        let mut s = Store::new("admin-pw");
+        let mut s = Store::new("admin-pw", 0);
         let anna = s.create_user("Anna", "Anna", "anna-secret", 0).unwrap();
         assert_eq!(anna.login, "anna");
         assert!(s.create_user("Other Anna", "anna", "12345678", 0).is_err(), "sign-in names are unique");
@@ -633,7 +643,7 @@ mod tests {
 
     #[test]
     fn store_serializes() {
-        let s = Store::new("pw");
+        let s = Store::new("pw", 0);
         let json = serde_json::to_string(&s).unwrap();
         assert!(!json.contains("\"pw\""), "password never stored in clear");
         let back: Store = serde_json::from_str(&json).unwrap();

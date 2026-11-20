@@ -28,16 +28,17 @@
 </div>
 
 <main id="dash" class="hidden">
-  <div class="card admin-only">
-    <h2>Add a computer <small>general link: the computer is visible to the administrator only</small></h2>
-    <div class="copybox"><code class="mono" id="installUrl"></code>
+  <div class="card admin-only addpc">
+    <h2 title="General install link: computers installed with it are visible to the administrator only">Add a computer</h2>
+    <div class="copybox"><code class="mono" id="installUrl" title="General install link: computers installed with it are visible to the administrator only"></code>
+      <small class="muted" id="installAge"></small>
       <button class="small" onclick="copyText(document.getElementById('installUrl').textContent)">Copy</button>
       <button class="small" onclick="rotate()" title="Old install links stop working">New link</button></div>
   </div>
 
   <div class="card">
     <h2><span id="mtitle">Computers</span> <small id="mcount"></small><span class="spacer"></span><button id="updAll" class="small hidden" onclick="updateAll()"></button> <input id="filter" placeholder="Search" oninput="render()"></h2>
-    <table><thead><tr><th>Name</th><th>System</th><th>Load and disks</th><th>Screens</th><th class="admin-only">Belongs to</th><th>Version</th><th></th></tr></thead><tbody id="machines"></tbody></table>
+    <table><thead><tr><th>Name</th><th>System</th><th>Load and disks</th><th class="admin-only">Belongs to</th><th>Version</th><th></th></tr></thead><tbody id="machines"></tbody></table>
   </div>
 
   <div class="card admin-only">
