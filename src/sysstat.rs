@@ -1,6 +1,7 @@
 //! What the helper tells the relay about its computer besides the screens:
 //! CPU load, memory and disks ([`SystemStats`], sent with every
-//! `AgentMsg::Heartbeat`), and the full OS version ([`os_version`]).
+//! `AgentMsg::Heartbeat`, together with who is signed in and the
+//! workgroup / domain), and the full OS version ([`os_version`]).
 
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +23,45 @@ pub struct SystemStats {
     pub mem_total: u64,
     pub mem_used: u64,
     pub disks: Vec<DiskStat>,
+    /// Who is signed in on the screen the helper shows ("olga", or
+    /// "CORP\\olga" for a domain account); `None` when nobody is (or an
+    /// older helper that does not tell).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Windows: the workgroup or Active Directory domain the computer is in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joined: Option<Joined>,
+}
+
+/// Where a Windows computer belongs (JSON: `{"kind":"domain","name":"corp.example.com"}`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "name", rename_all = "snake_case")]
+pub enum Joined {
+    Workgroup(String),
+    /// Active Directory domain (DNS name when known, else the NetBIOS name).
+    Domain(String),
+}
+
+impl Joined {
+    /// "Workgroup WORKGROUP" / "Domain corp.example.com".
+    pub fn label(&self) -> String {
+        match self {
+            Joined::Workgroup(n) => format!("Workgroup {n}"),
+            Joined::Domain(n) => format!("Domain {n}"),
+        }
+    }
+}
+
+/// "olga · Domain corp.example.com", "Nobody signed in · Workgroup WORKGROUP";
+/// `None` when the helper told neither.
+pub fn user_line(s: &SystemStats) -> Option<String> {
+    let joined = s.joined.as_ref().map(Joined::label);
+    match (&s.user, joined) {
+        (None, None) => None,
+        (Some(u), None) => Some(u.clone()),
+        (Some(u), Some(j)) => Some(format!("{u} · {j}")),
+        (None, Some(j)) => Some(format!("Nobody signed in · {j}")),
+    }
 }
 
 /// Remembers the previous CPU counters so each sample reports the load
@@ -48,6 +88,8 @@ impl Sampler {
             mem_total,
             mem_used,
             disks: disks(),
+            user: signed_in_user(),
+            joined: joined(),
         }
     }
 }
@@ -89,6 +131,8 @@ pub fn demo_stats() -> SystemStats {
         mem_total: 16 * G,
         mem_used: 6 * G,
         disks: vec![DiskStat { name: "/".into(), total: 512 * G, free: 201 * G }],
+        user: Some("demo".into()),
+        joined: None,
     }
 }
 
@@ -186,7 +230,110 @@ fn real_mounts(mounts: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The user running the helper (on Linux it runs in the signed-in user's session).
+#[cfg(not(windows))]
+fn signed_in_user() -> Option<String> {
+    let pw = unsafe { libc::getpwuid(libc::geteuid()) };
+    if !pw.is_null() {
+        let name = unsafe { std::ffi::CStr::from_ptr((*pw).pw_name) }.to_string_lossy().into_owned();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    std::env::var("USER").ok().filter(|u| !u.is_empty())
+}
+
+/// Workgroups and AD domains are a Windows thing.
+#[cfg(not(windows))]
+fn joined() -> Option<Joined> {
+    None
+}
+
 // ------------------------------------------------------------------ Windows
+
+/// The user of the console session (the screen the helper shows), else of
+/// any active remote session; "DOMAIN\\user" unless it is a local account.
+#[cfg(windows)]
+fn signed_in_user() -> Option<String> {
+    use windows_sys::Win32::System::RemoteDesktop::*;
+    let query = |session: u32, class: WTS_INFO_CLASS| -> Option<String> {
+        let mut buf: windows_sys::core::PWSTR = std::ptr::null_mut();
+        let mut len = 0u32;
+        if unsafe { WTSQuerySessionInformationW(std::ptr::null_mut(), session, class, &mut buf, &mut len) } == 0 || buf.is_null() {
+            return None;
+        }
+        let text = unsafe { wide_to_string(buf) };
+        unsafe { WTSFreeMemory(buf.cast()) };
+        Some(text).filter(|t| !t.trim().is_empty())
+    };
+    let user_of = |session: u32| -> Option<String> {
+        let user = query(session, WTSUserName)?;
+        let domain = query(session, WTSDomainName);
+        Some(account_label(&user, domain.as_deref(), &crate::util::hostname()))
+    };
+    let console = unsafe { WTSGetActiveConsoleSessionId() };
+    if console != u32::MAX
+        && let Some(u) = user_of(console)
+    {
+        return Some(u);
+    }
+    let mut list: *mut WTS_SESSION_INFOW = std::ptr::null_mut();
+    let mut count = 0u32;
+    if unsafe { WTSEnumerateSessionsW(std::ptr::null_mut(), 0, 1, &mut list, &mut count) } == 0 || list.is_null() {
+        return None;
+    }
+    let sessions = unsafe { std::slice::from_raw_parts(list, count as usize) };
+    let found = sessions.iter().filter(|s| s.State == WTSActive).find_map(|s| user_of(s.SessionId));
+    unsafe { WTSFreeMemory(list.cast()) };
+    found
+}
+
+/// Workgroup or domain from `NetGetJoinInformation`; for a domain the DNS
+/// name ("corp.example.com") when Windows knows it.
+#[cfg(windows)]
+fn joined() -> Option<Joined> {
+    use windows_sys::Win32::NetworkManagement::NetManagement::*;
+    use windows_sys::Win32::System::SystemInformation::{ComputerNameDnsDomain, GetComputerNameExW};
+    let mut buf: windows_sys::core::PWSTR = std::ptr::null_mut();
+    let mut status: NETSETUP_JOIN_STATUS = 0;
+    if unsafe { NetGetJoinInformation(std::ptr::null(), &mut buf, &mut status) } != 0 || buf.is_null() {
+        return None;
+    }
+    let name = unsafe { wide_to_string(buf) };
+    unsafe { NetApiBufferFree(buf.cast()) };
+    match status {
+        s if s == NetSetupWorkgroupName => Some(Joined::Workgroup(name)),
+        s if s == NetSetupDomainName => {
+            let mut dns = [0u16; 256];
+            let mut len = dns.len() as u32;
+            let dns = (unsafe { GetComputerNameExW(ComputerNameDnsDomain, dns.as_mut_ptr(), &mut len) } != 0)
+                .then(|| String::from_utf16_lossy(&dns[..len as usize]))
+                .filter(|d| !d.is_empty());
+            Some(Joined::Domain(dns.unwrap_or(name)))
+        }
+        _ => None,
+    }
+}
+
+/// A NUL-terminated UTF-16 string.
+#[cfg(windows)]
+unsafe fn wide_to_string(p: *const u16) -> String {
+    let mut n = 0;
+    while unsafe { *p.add(n) } != 0 {
+        n += 1;
+    }
+    String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, n) })
+}
+
+/// "olga" for a local account (its domain is the computer's own name),
+/// "CORP\\olga" for a domain account.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn account_label(user: &str, domain: Option<&str>, computer: &str) -> String {
+    match domain.map(str::trim).filter(|d| !d.is_empty() && !d.eq_ignore_ascii_case(computer)) {
+        Some(d) => format!("{d}\\{user}"),
+        None => user.to_string(),
+    }
+}
 
 #[cfg(windows)]
 fn cpu_times() -> Option<(u64, u64)> {
@@ -328,6 +475,27 @@ mod tests {
             "Windows 11 Pro 23H2 (build 22631)"
         );
         assert_eq!(windows_label(Some("Windows 10 Pro".into()), None, Some("19045".into())), "Windows 10 Pro (build 19045)");
+    }
+
+    #[test]
+    fn names_users_and_where_the_computer_belongs() {
+        assert_eq!(account_label("olga", Some("RENA2"), "rena2"), "olga");
+        assert_eq!(account_label("olga", Some("CORP"), "RENA2"), "CORP\\olga");
+        assert_eq!(account_label("olga", None, "RENA2"), "olga");
+        let mut s = demo_stats();
+        s.user = Some("CORP\\olga".into());
+        s.joined = Some(Joined::Domain("corp.example.com".into()));
+        assert_eq!(user_line(&s).as_deref(), Some("CORP\\olga · Domain corp.example.com"));
+        s.user = None;
+        s.joined = Some(Joined::Workgroup("WORKGROUP".into()));
+        assert_eq!(user_line(&s).as_deref(), Some("Nobody signed in · Workgroup WORKGROUP"));
+        s.joined = None;
+        assert_eq!(user_line(&s), None, "older helpers tell neither");
+        let json = serde_json::to_string(&Joined::Domain("corp".into())).unwrap();
+        assert_eq!(json, r#"{"kind":"domain","name":"corp"}"#);
+        // Stats from older helpers still read.
+        let old: SystemStats = serde_json::from_str(r#"{"cpu":1,"cores":2,"mem_total":3,"mem_used":1,"disks":[]}"#).unwrap();
+        assert_eq!((old.user, old.joined), (None, None));
     }
 
     #[test]

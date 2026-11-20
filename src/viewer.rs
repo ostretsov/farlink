@@ -821,6 +821,8 @@ struct PreviewState {
     /// Seconds since 1970 when the pictures were taken.
     taken: u64,
     textures: HashMap<u8, egui::TextureHandle>,
+    /// The decoded pictures behind `textures`, for "Take screenshot".
+    frames: HashMap<u8, Arc<Frame>>,
     error: Option<String>,
 }
 
@@ -876,6 +878,8 @@ pub struct ViewerApp {
     notes_edit: Option<NotesEdit>,
     /// "Update" / "Update all" of helpers: what to tell the administrator.
     job_update: Option<Job<String>>,
+    /// "Take screenshot" from a screen preview: where the PNG was saved.
+    job_save_shot: Option<Job<PathBuf>>,
     renaming: Option<Renaming>,
     last_refresh: Option<Instant>,
     selected: Option<String>,
@@ -945,11 +949,15 @@ pub fn sample_overview() -> Overview {
         s.cpu = 94.0;
         s.mem_used = 15 * G;
         s.disks = vec![disk("C:", 120, 7), disk("D:", 2000, 860)];
+        s.user = Some("ACME\\backup".into());
+        s.joined = Some(crate::sysstat::Joined::Domain("acme.local".into()));
     }
     let mut office = m("demo-office", "Office PC", "OFFICE-PC", "Windows 11 Pro 23H2 (build 22631)", vec![mon(0, 0, 1600, 900), mon(1, 1600, 1280, 1024)], true, 0);
     office.machine.notes = "Reception, printer on USB".into();
     if let Some(s) = office.stats.as_mut() {
         s.disks = vec![disk("C:", 476, 212)];
+        s.user = Some("Reception".into());
+        s.joined = Some(crate::sysstat::Joined::Workgroup("WORKGROUP".into()));
     }
     Overview {
         machines: vec![
@@ -1025,6 +1033,7 @@ impl ViewerApp {
             job_notes: None,
             notes_edit: None,
             job_update: None,
+            job_save_shot: None,
             renaming: None,
             last_refresh: None,
             selected: None,
@@ -1338,6 +1347,12 @@ impl ViewerApp {
             }
             self.refresh(ctx);
         }
+        if let Some(r) = take_job(&mut self.job_save_shot) {
+            match r {
+                Ok(path) => self.toast(format!("Screenshot saved: {}", path.display())),
+                Err(e) => self.toast(format!("Screenshot failed: {e}")),
+            }
+        }
         if let Some(r) = take_job(&mut self.job_revoke) {
             match r {
                 Ok(()) => self.toast("Access withdrawn, open sessions were ended"),
@@ -1360,8 +1375,10 @@ impl ViewerApp {
                     p.error = None;
                     p.taken = taken;
                     p.textures.retain(|i, _| frames.iter().any(|(j, _)| j == i));
+                    p.frames.clear();
                     for (i, f) in frames {
                         let img = egui::ColorImage::from_rgba_unmultiplied([f.width as usize, f.height as usize], &f.rgba);
+                        p.frames.insert(i, Arc::new(f));
                         match p.textures.get_mut(&i) {
                             Some(t) => t.set(img, egui::TextureOptions::LINEAR),
                             None => {
@@ -1387,7 +1404,7 @@ impl ViewerApp {
             return;
         };
         if self.preview.as_ref().is_none_or(|p| p.machine_id != id) {
-            self.preview = Some(PreviewState { machine_id: id.clone(), fetched: None, taken: 0, textures: HashMap::new(), error: None });
+            self.preview = Some(PreviewState { machine_id: id.clone(), fetched: None, taken: 0, textures: HashMap::new(), frames: HashMap::new(), error: None });
         }
         let p = self.preview.as_ref().unwrap();
         let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
@@ -1613,6 +1630,7 @@ impl ViewerApp {
                 }
                 ui.add_space(2.0);
                 let mut clicked = None;
+                let mut connect: Option<MachineSummary> = None;
                 let mut rename_start: Option<(String, String)> = None;
                 let mut notes_start: Option<NotesEdit> = None;
                 let can_rename = ov.role == "admin";
@@ -1631,11 +1649,12 @@ impl ViewerApp {
                         if resp.clicked() {
                             clicked = Some(m.machine.id.clone());
                         }
+                        // Double click: connect with control, as the "Control" button does.
+                        if resp.double_clicked() && m.online && !in_session {
+                            connect = Some(m.machine.clone());
+                        }
                         // Right click: rename (administrator only, as on the server).
                         if can_rename {
-                            if resp.double_clicked() {
-                                rename_start = Some((m.machine.id.clone(), m.machine.name.clone()));
-                            }
                             resp.context_menu(|ui| {
                                 if ui.button("Rename...").clicked() {
                                     rename_start = Some((m.machine.id.clone(), m.machine.name.clone()));
@@ -1668,6 +1687,9 @@ impl ViewerApp {
                 }
                 if notes_start.is_some() {
                     self.notes_edit = notes_start;
+                }
+                if let Some(m) = connect {
+                    self.connect_machine(ui.ctx(), &m, false);
                 }
                 if let Some((id, name)) = rename_start {
                     self.renaming = Some(Renaming { machine_id: id, text: name, focus: true });
@@ -2100,7 +2122,6 @@ impl ViewerApp {
         card(ui, f32::INFINITY, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Screens").size(16.0).strong());
-                ui.label(RichText::new(format!("{} on this computer · each opens in its own window", monitors.len())).color(MUTED));
                 if let Some(e) = self.preview.as_ref().filter(|p| p.machine_id == m.id).and_then(|p| p.error.as_ref()) {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(RichText::new(format!("Preview: {e}")).color(AMBER).size(12.5));
@@ -2120,6 +2141,7 @@ impl ViewerApp {
             let (area, _) = ui.allocate_exact_size(Vec2::new(avail_w, vh as f32 * scale + 8.0), Sense::hover());
             let key = m.id.clone();
             let mut forget: Option<String> = None;
+            let mut shoot: Option<(Arc<Frame>, String)> = None;
             let painter = ui.painter_at(area);
             let off = Vec2::new((avail_w - vw as f32 * scale) / 2.0, 4.0);
             for mon in &monitors {
@@ -2157,7 +2179,23 @@ impl ViewerApp {
                 let resp = if can_connect { resp.on_hover_text("Double-click to control this computer") } else { resp };
                 let fp = monitor_fingerprint(mon);
                 let place = self.layouts.get(&key, &fp);
+                // Full size from an open connection, else the (small) preview picture.
+                let picture = || -> Option<Arc<Frame>> {
+                    if let Some(i) = session_idx {
+                        let shared = self.sessions[i].handle.shared.lock().unwrap();
+                        return shared.canvases.get(&mon.index).and_then(|c| c.frame.clone()).map(Arc::new);
+                    }
+                    self.preview.as_ref().filter(|p| p.machine_id == m.id)?.frames.get(&mon.index).cloned()
+                };
+                let has_picture = tex.is_some();
                 resp.context_menu(|ui| {
+                    if ui.add_enabled(has_picture, egui::Button::new("Take screenshot")).clicked() {
+                        if let Some(f) = picture() {
+                            shoot = Some((f, mon.label()));
+                        }
+                        ui.close();
+                    }
+                    ui.separator();
                     let text = match place {
                         Some(p) => format!(
                             "Window remembered at {:.0}, {:.0} · {:.0}×{:.0}{}",
@@ -2175,6 +2213,10 @@ impl ViewerApp {
                         ui.close();
                     }
                 });
+            }
+            if let Some((frame, screen)) = shoot {
+                let name = m.name.clone();
+                self.job_save_shot = Some(spawn_job(ui.ctx(), move || save_screenshot(&frame, &name, &screen)));
             }
             if let Some(fp) = forget {
                 self.layouts.forget_monitor(&key, &fp);
@@ -3045,6 +3087,54 @@ impl eframe::App for ViewerApp {
     }
 }
 
+// ------------------------------------------------------------------ screenshots of a screen
+
+/// Saves one remote screen as a PNG in the temporary folder (`/tmp` on Linux,
+/// `%TEMP%` on Windows) and returns its path. Never overwrites a file.
+fn save_screenshot(frame: &Frame, machine: &str, screen: &str) -> anyhow::Result<PathBuf> {
+    let dir = std::env::temp_dir();
+    let base = screenshot_name(machine, screen, crate::util::now_secs());
+    let mut path = dir.join(format!("{base}.png"));
+    let mut n = 2;
+    while path.exists() {
+        path = dir.join(format!("{base}-{n}.png"));
+        n += 1;
+    }
+    image::save_buffer(&path, &frame.rgba, frame.width, frame.height, image::ExtendedColorType::Rgba8)?;
+    Ok(path)
+}
+
+/// `farlink-<computer>-<screen>-YYYY-MM-DD_HH-MM-SS` (UTC), with only
+/// characters that are safe in file names on every system.
+fn screenshot_name(machine: &str, screen: &str, secs: u64) -> String {
+    let clean = |s: &str| -> String {
+        let t: String = s.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect();
+        let t = t.split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("-");
+        t.chars().take(40).collect()
+    };
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    // Days since 1970-01-01 → civil date (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if mo <= 2 { 1 } else { 0 };
+    let mut parts = vec!["farlink".to_string()];
+    parts.extend([clean(machine), clean(screen)].into_iter().filter(|p| !p.is_empty()));
+    format!(
+        "{}-{y:04}-{mo:02}-{d:02}_{:02}-{:02}-{:02}",
+        parts.join("-"),
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
 // ------------------------------------------------------------------ widgets
 
 /// Small "● text" for the status bar, painted as one piece so it reads the
@@ -3151,7 +3241,8 @@ fn paint_os_glyph(p: &egui::Painter, r: Rect, os: &str) {
 fn machine_row(ui: &mut egui::Ui, m: &MachineView, selected: bool, in_session: bool, now: u64) -> egui::Response {
     let stats = m.stats.as_ref().filter(|_| m.online);
     let notes = m.machine.notes.lines().map(str::trim).find(|l| !l.is_empty());
-    let extra = stats.map_or(0, |s| 1 + usize::from(!s.disks.is_empty())) + usize::from(notes.is_some());
+    let who = stats.and_then(crate::sysstat::user_line);
+    let extra = stats.map_or(0, |s| 1 + usize::from(!s.disks.is_empty())) + usize::from(notes.is_some()) + usize::from(who.is_some());
     let height = 54.0 + 17.0 * extra as f32;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
     let p = ui.painter();
@@ -3181,6 +3272,10 @@ fn machine_row(ui: &mut egui::Ui, m: &MachineView, selected: bool, in_session: b
     };
     one_line(p, Pos2::new(x, rect.min.y + 37.0), &sub, 12.0, MUTED, rect.max.x - x - 10.0);
     let mut y = rect.min.y + 54.0;
+    if let Some(w) = &who {
+        one_line(p, Pos2::new(x, y), w, 12.0, MUTED, rect.max.x - x - 10.0);
+        y += 17.0;
+    }
     if let Some(s) = stats {
         let mut job = egui::text::LayoutJob::default();
         let font = FontId::proportional(12.0);
@@ -3247,6 +3342,23 @@ fn stats_card(ui: &mut egui::Ui, s: &crate::sysstat::SystemStats) {
             ui.label(RichText::new("updated every 30 s").color(MUTED));
         });
         ui.add_space(6.0);
+        if s.user.is_some() || s.joined.is_some() {
+            egui::Grid::new("who").num_columns(2).spacing(Vec2::new(14.0, 6.0)).show(ui, |ui| {
+                ui.label("Signed in");
+                ui.label(RichText::new(s.user.as_deref().unwrap_or("nobody")).color(MUTED));
+                ui.end_row();
+                if let Some(j) = &s.joined {
+                    let (kind, name) = match j {
+                        crate::sysstat::Joined::Workgroup(n) => ("Workgroup", n),
+                        crate::sysstat::Joined::Domain(n) => ("Domain", n),
+                    };
+                    ui.label(kind);
+                    ui.label(RichText::new(name).color(MUTED));
+                    ui.end_row();
+                }
+            });
+            ui.add_space(6.0);
+        }
         let mem = s.mem_used as f32 * 100.0 / s.mem_total.max(1) as f32;
         let mut rows = vec![
             (format!("CPU · {} cores", s.cores), s.cpu, format!("{:.0}% busy", s.cpu)),
@@ -3341,6 +3453,18 @@ fn relay_details(o: &Overview) -> (String, bool) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn screenshot_names_are_safe_and_dated() {
+        assert_eq!(screenshot_name("Office PC / 2", "Screen 1", 0), "farlink-Office-PC-2-Screen-1-1970-01-01_00-00-00");
+        assert_eq!(screenshot_name("", "", 1_795_000_000), "farlink-2026-11-18_11-06-40");
+        let f = Frame::filled(4, 3, [10, 20, 30, 255]);
+        let p = save_screenshot(&f, "test", "s").unwrap();
+        assert!(p.starts_with(std::env::temp_dir()));
+        let img = image::open(&p).unwrap();
+        assert_eq!((img.width(), img.height()), (4, 3));
+        std::fs::remove_file(p).unwrap();
+    }
     use super::*;
 
     // ---- file browser pane, driven through egui with real pointer/key events

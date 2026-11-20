@@ -78,7 +78,7 @@ function render() {
   renderServer(admin);
   $('installUrl').textContent = data.install_url;
   const q = $('filter').value.toLowerCase();
-  const ms = data.machines.filter((m) => !q || (m.name + m.hostname + m.os + (m.owner_name || '') + (m.notes || '')).toLowerCase().includes(q));
+  const ms = data.machines.filter((m) => !q || (m.name + m.hostname + m.os + (m.owner_name || '') + (m.notes || '') + (whoLine(m) || '')).toLowerCase().includes(q));
   const outdated = data.machines.filter((m) => m.online && !m.up_to_date && !m.updating).length;
   $('updAll').classList.toggle('hidden', !admin || !outdated);
   $('updAll').textContent = 'Update ' + outdated + ' out of date';
@@ -88,6 +88,7 @@ function render() {
     <td><span class="dot ${m.online ? 'on' : ''}"></span><b>${esc(m.name)}</b>
       ${m.sessions ? '<span class="tag ctrl">in use</span>' : ''}
       <div class="muted">${m.online ? 'online' : 'seen ' + ago(data.now - m.last_seen)} · ${esc(m.hostname)}</div>
+      ${whoLine(m) ? `<div class="muted">${esc(whoLine(m))}</div>` : ''}
       ${m.notes ? `<div class="notes">${esc(m.notes)}</div>` : ''}</td>
     <td>${esc(m.os)}</td><td>${loadCell(m)}</td><td>${screens(m.monitors)}</td>
     ${admin ? `<td>${ownerSelect(m)}</td>` : ''}
@@ -147,6 +148,15 @@ function loadCell(m) {
   }).join(' · ');
   return `<div class="load"><span class="${level(s.cpu)}">CPU ${Math.round(s.cpu)}%</span> ·
     <span class="${level(mem)}">RAM ${bytes(s.mem_used)} / ${bytes(s.mem_total)}</span>${disks ? '<br>' + disks : ''}</div>`;
+}
+
+// "olga · Domain corp.example.com": who is signed in, and the Windows
+// workgroup or AD domain (online computers whose helper tells).
+function whoLine(m) {
+  const s = m.online && m.stats;
+  if (!s || (!s.user && !s.joined)) return '';
+  const j = s.joined ? (s.joined.kind === 'domain' ? 'Domain ' : 'Workgroup ') + s.joined.name : '';
+  return [s.user || (j ? 'Nobody signed in' : ''), j].filter(Boolean).join(' · ');
 }
 
 // Helper version on a computer, how its update goes, and "Update" (administrator).
