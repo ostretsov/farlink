@@ -91,7 +91,7 @@ async fn agent_connection(
     log::info!("connected to {}", cfg.server_url);
 
     // Preview pictures are taken on their own thread (screen APIs block).
-    let (preview_tx, preview_rx) = std::sync::mpsc::channel::<u32>();
+    let (preview_tx, preview_rx) = std::sync::mpsc::channel::<(u32, Option<u8>)>();
     let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<AgentMsg>();
     std::thread::Builder::new().name("preview".into()).spawn(move || preview_worker(demo, preview_rx, reply_tx))?;
 
@@ -139,8 +139,8 @@ async fn agent_connection(
                             }
                         });
                     }
-                    AgentMsg::PreviewRequest { req } => {
-                        let _ = preview_tx.send(req);
+                    AgentMsg::PreviewRequest { req, full } => {
+                        let _ = preview_tx.send((req, full));
                     }
                     AgentMsg::UpdateAvailable { version, force } => {
                         if !force && (opts.no_update || !crate::version::is_newer(&version, crate::VERSION)) {
@@ -189,33 +189,37 @@ async fn agent_connection(
 const PREVIEW_KEEP_OPEN: Duration = Duration::from_secs(60);
 
 /// Answers [`AgentMsg::PreviewRequest`]s until the connection ends.
-fn preview_worker(demo: bool, rx: std::sync::mpsc::Receiver<u32>, tx: tokio::sync::mpsc::UnboundedSender<AgentMsg>) {
+fn preview_worker(demo: bool, rx: std::sync::mpsc::Receiver<(u32, Option<u8>)>, tx: tokio::sync::mpsc::UnboundedSender<AgentMsg>) {
     let mut desk: Option<Box<dyn Desktop>> = None;
     loop {
         let first = match rx.recv_timeout(PREVIEW_KEEP_OPEN) {
-            Ok(req) => req,
+            Ok(r) => r,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 desk = None;
                 continue;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         };
-        // Requests that piled up meanwhile all get the same pictures.
-        let reqs: Vec<u32> = std::iter::once(first).chain(rx.try_iter()).collect();
+        let pending: Vec<(u32, Option<u8>)> = std::iter::once(first).chain(rx.try_iter()).collect();
         if desk.is_none() {
             desk = desktop(demo).map_err(|e| log::debug!("preview: {e:#}")).ok();
         }
-        let shots = match desk.as_mut().map(|d| preview_shots(d.as_mut())) {
-            Some(Ok(s)) => s,
-            Some(Err(e)) => {
+        // Requests for small pictures that piled up meanwhile all get the same
+        // ones; each full-size screenshot is taken on its own.
+        let mut small: Option<Vec<PreviewShot>> = None;
+        for (req, full) in pending {
+            let result = match (desk.as_mut(), full) {
+                (None, _) => Ok(Vec::new()),
+                (Some(d), Some(index)) => screenshot_shot(d.as_mut(), index).map(|s| s.into_iter().collect()),
+                (Some(_), None) if small.is_some() => Ok(small.clone().unwrap()),
+                (Some(d), None) => preview_shots(d.as_mut()).inspect(|s| small = Some(s.clone())),
+            };
+            let shots = result.unwrap_or_else(|e| {
                 log::debug!("preview: {e:#}");
                 desk = None; // e.g. the desktop switched; open it again next time
                 Vec::new()
-            }
-            None => Vec::new(),
-        };
-        for req in reqs {
-            if tx.send(AgentMsg::Preview { req, shots: shots.clone() }).is_err() {
+            });
+            if tx.send(AgentMsg::Preview { req, shots }).is_err() {
                 return;
             }
         }
@@ -232,6 +236,15 @@ pub fn preview_shots(desk: &mut dyn Desktop) -> Result<Vec<PreviewShot>> {
         shots.push(PreviewShot { index: m.index, width, height, jpeg: crate::util::base64_encode(&jpeg) });
     }
     Ok(shots)
+}
+
+/// One monitor at full size ("Take screenshot"); `None` if there is no such monitor.
+pub fn screenshot_shot(desk: &mut dyn Desktop, index: u8) -> Result<Option<PreviewShot>> {
+    let _ = desk.changed();
+    let Some(m) = desk.monitors()?.into_iter().find(|m| m.index == index) else { return Ok(None) };
+    let frame = desk.capture(&m)?;
+    let (data, _) = crate::codec::screenshot_image(&frame)?;
+    Ok(Some(PreviewShot { index, width: frame.width, height: frame.height, jpeg: crate::util::base64_encode(&data) }))
 }
 
 /// Regular update check: logs failures, returns the exit code if updated.
@@ -1426,17 +1439,42 @@ mod tests {
     }
 
     #[test]
+    fn screenshot_is_full_size_and_lossless() {
+        let mut desk = TestPattern::dual();
+        let m = desk.monitors().unwrap().remove(0);
+        let shot = screenshot_shot(&mut desk, 0).unwrap().unwrap();
+        assert_eq!((shot.index, shot.width, shot.height), (0, m.width, m.height));
+        let data = crate::util::base64_decode(&shot.jpeg).unwrap();
+        assert!(data.starts_with(b"\x89PNG"));
+        let f = crate::codec::decode_image(&data).unwrap();
+        let _ = desk.changed();
+        let orig = desk.capture(&m).unwrap();
+        assert_eq!((f.width, f.height), (orig.width, orig.height));
+    }
+
+    #[test]
     fn preview_worker_answers_every_request_and_stops_with_the_connection() {
         let (tx, rx) = std::sync::mpsc::channel();
         let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
         // Several requests at once share one set of pictures.
         for req in [7, 8, 9] {
-            tx.send(req).unwrap();
+            tx.send((req, None)).unwrap();
         }
+        // A full-size screenshot of the second screen, and one of a screen that isn't there.
+        tx.send((10, Some(1))).unwrap();
+        tx.send((11, Some(5))).unwrap();
         let th = std::thread::spawn(move || preview_worker(true, rx, out_tx));
         let mut answered = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..5 {
             match out_rx.blocking_recv().unwrap() {
+                AgentMsg::Preview { req: 10, shots } => {
+                    assert_eq!(shots.iter().map(|s| (s.index, s.width, s.height)).collect::<Vec<_>>(), vec![(1, 1280, 1024)]);
+                    answered.push(10);
+                }
+                AgentMsg::Preview { req: 11, shots } => {
+                    assert!(shots.is_empty());
+                    answered.push(11);
+                }
                 AgentMsg::Preview { req, shots } => {
                     assert_eq!(shots.len(), 2);
                     answered.push(req);
@@ -1444,7 +1482,7 @@ mod tests {
                 other => panic!("unexpected {other:?}"),
             }
         }
-        assert_eq!(answered, vec![7, 8, 9]);
+        assert_eq!(answered, vec![7, 8, 9, 10, 11]);
         drop(tx);
         th.join().unwrap();
         assert!(out_rx.blocking_recv().is_none(), "worker ended when the connection went away");

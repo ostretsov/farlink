@@ -11,7 +11,7 @@ use crate::server::{MachineSummary, MachineView, Overview};
 use crate::tray::{Tray, TrayEvent, TrayStatus};
 use crate::util::{human_duration, normalize_server_url, now_secs};
 use eframe::egui::{
-    self, Align, Color32, CornerRadius, FontId, Layout, Margin, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2,
+    self, Align, Align2, Color32, CornerRadius, FontId, Layout, Margin, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2,
     ViewportBuilder, ViewportCommand, ViewportId,
 };
 use std::collections::{HashMap, HashSet};
@@ -934,6 +934,7 @@ pub fn sample_overview() -> Overview {
         updating: false,
         update_error: None,
         stats: online.then(crate::sysstat::demo_stats),
+        load: Vec::new(),
     };
     const G: u64 = 1 << 30;
     let disk = |name: &str, total: u64, free: u64| crate::sysstat::DiskStat { name: name.into(), total: total * G, free: free * G };
@@ -959,7 +960,7 @@ pub fn sample_overview() -> Overview {
         s.user = Some("Reception".into());
         s.joined = Some(crate::sysstat::Joined::Workgroup("WORKGROUP".into()));
     }
-    Overview {
+    let mut o = Overview {
         machines: vec![
             office,
             srv,
@@ -1001,7 +1002,14 @@ pub fn sample_overview() -> Overview {
             checking: false,
         },
         slow_after_pause_fix: None,
+    };
+    for (i, mv) in o.machines.iter_mut().enumerate() {
+        if let Some(s) = &mv.stats {
+            let mem = s.mem_used as f32 * 100.0 / s.mem_total.max(1) as f32;
+            mv.load = crate::sysstat::demo_load(now, s.cpu, mem, i as u32);
+        }
     }
+    o
 }
 
 impl ViewerApp {
@@ -1969,7 +1977,7 @@ impl ViewerApp {
 
         if let Some(s) = mv.stats.as_ref().filter(|_| mv.online) {
             ui.add_space(14.0);
-            stats_card(ui, s);
+            stats_card(ui, s, &mv.load);
         }
     }
 
@@ -2141,7 +2149,9 @@ impl ViewerApp {
             let (area, _) = ui.allocate_exact_size(Vec2::new(avail_w, vh as f32 * scale + 8.0), Sense::hover());
             let key = m.id.clone();
             let mut forget: Option<String> = None;
-            let mut shoot: Option<(Arc<Frame>, String)> = None;
+            // "Take screenshot": the picture of an open connection, or the
+            // monitor to ask the computer for at full size.
+            let mut shoot: Option<(Result<Arc<Frame>, MonitorInfo>, String)> = None;
             let painter = ui.painter_at(area);
             let off = Vec2::new((avail_w - vw as f32 * scale) / 2.0, 4.0);
             for mon in &monitors {
@@ -2179,17 +2189,17 @@ impl ViewerApp {
                 let resp = if can_connect { resp.on_hover_text("Double-click to control this computer") } else { resp };
                 let fp = monitor_fingerprint(mon);
                 let place = self.layouts.get(&key, &fp);
-                // Full size from an open connection, else the (small) preview picture.
-                let picture = || -> Option<Arc<Frame>> {
+                // Full size from an open connection, else asked from the computer.
+                let picture = || -> Option<Result<Arc<Frame>, MonitorInfo>> {
                     if let Some(i) = session_idx {
                         let shared = self.sessions[i].handle.shared.lock().unwrap();
-                        return shared.canvases.get(&mon.index).and_then(|c| c.frame.clone()).map(Arc::new);
+                        return shared.canvases.get(&mon.index).and_then(|c| c.frame.clone()).map(|f| Ok(Arc::new(f)));
                     }
-                    self.preview.as_ref().filter(|p| p.machine_id == m.id)?.frames.get(&mon.index).cloned()
+                    Some(Err(mon.clone()))
                 };
-                let has_picture = tex.is_some();
+                let can_shoot = tex.is_some() && (session_idx.is_some() || online) && self.job_save_shot.is_none();
                 resp.context_menu(|ui| {
-                    if ui.add_enabled(has_picture, egui::Button::new("Take screenshot")).clicked() {
+                    if ui.add_enabled(can_shoot, egui::Button::new("Take screenshot")).clicked() {
                         if let Some(f) = picture() {
                             shoot = Some((f, mon.label()));
                         }
@@ -2214,9 +2224,23 @@ impl ViewerApp {
                     }
                 });
             }
-            if let Some((frame, screen)) = shoot {
+            if let Some((picture, screen)) = shoot {
                 let name = m.name.clone();
-                self.job_save_shot = Some(spawn_job(ui.ctx(), move || save_screenshot(&frame, &name, &screen)));
+                let (api, demo, id) = (self.api(), self.demo, m.id.clone());
+                if picture.is_err() {
+                    self.toast("Taking a screenshot…");
+                }
+                self.job_save_shot = Some(spawn_job(ui.ctx(), move || {
+                    let frame = match picture {
+                        Ok(f) => f,
+                        Err(mon) if demo => Arc::new(crate::desktop::TestPattern::render(&mon, (now_secs() / 5) as u32, None)),
+                        Err(mon) => {
+                            let api = api.ok_or_else(|| anyhow::anyhow!("not signed in"))?;
+                            Arc::new(api.screenshot(&id, mon.index)?)
+                        }
+                    };
+                    save_screenshot(&frame, &name, &screen)
+                }));
             }
             if let Some(fp) = forget {
                 self.layouts.forget_monitor(&key, &fp);
@@ -3334,7 +3358,7 @@ fn machine_row(ui: &mut egui::Ui, m: &MachineView, selected: bool, in_session: b
 }
 
 /// CPU, memory and every disk of an online computer.
-fn stats_card(ui: &mut egui::Ui, s: &crate::sysstat::SystemStats) {
+fn stats_card(ui: &mut egui::Ui, s: &crate::sysstat::SystemStats, load: &[crate::sysstat::LoadPoint]) {
     use crate::sysstat::human_bytes;
     card(ui, f32::INFINITY, |ui| {
         ui.horizontal(|ui| {
@@ -3380,7 +3404,167 @@ fn stats_card(ui: &mut egui::Ui, s: &crate::sysstat::SystemStats) {
                 ui.end_row();
             }
         });
+        if !load.is_empty() {
+            ui.add_space(12.0);
+            let series = [
+                Series { name: "CPU", color: ACCENT, fill: true, values: load.iter().map(|l| Some(l.cpu)).collect() },
+                Series { name: "Memory", color: MEM_LINE, fill: false, values: load.iter().map(|l| Some(l.mem)).collect() },
+            ];
+            line_chart(ui, "CPU and memory · last 10 minutes", load, &series, 100.0, |v| format!("{v:.0}%"), false);
+        }
+        if load.iter().any(|l| l.net.is_some()) {
+            ui.add_space(12.0);
+            let series = [
+                Series { name: "In", color: ACCENT, fill: true, values: load.iter().map(|l| l.net.map(|n| n.rx as f32)).collect() },
+                Series { name: "Out", color: OUT_LINE, fill: false, values: load.iter().map(|l| l.net.map(|n| n.tx as f32)).collect() },
+            ];
+            let top = series.iter().flat_map(|s| s.values.iter().flatten()).fold(0.0f32, |a, &b| a.max(b));
+            line_chart(ui, "Network · last 10 minutes", load, &series, rate_axis_max(top), |v| crate::sysstat::human_rate(v as f64), true);
+        }
     });
+}
+
+/// Colour of the memory line (CPU uses `ACCENT`).
+const MEM_LINE: Color32 = Color32::from_rgb(122, 162, 247);
+/// Colour of the "sent" network line (received uses `ACCENT`).
+const OUT_LINE: Color32 = Color32::from_rgb(187, 134, 252);
+/// Two heartbeats are normally 30 s apart; a longer pause (helper restarted)
+/// breaks the lines.
+const CHART_GAP: u64 = 75;
+
+/// One line of a [`line_chart`]: a value per load point (`None`: not known then).
+struct Series<'a> {
+    name: &'a str,
+    color: Color32,
+    /// Soft fill under the line.
+    fill: bool,
+    values: Vec<Option<f32>>,
+}
+
+/// The connected pieces of one line: no point missing and no pause longer
+/// than [`CHART_GAP`] inside a piece.
+fn chart_runs(times: &[u64], values: &[Option<f32>]) -> Vec<Vec<(u64, f32)>> {
+    let mut runs: Vec<Vec<(u64, f32)>> = Vec::new();
+    let mut last: Option<u64> = None;
+    for (&t, v) in times.iter().zip(values) {
+        match v {
+            Some(v) => {
+                if last.is_none_or(|l| t.saturating_sub(l) > CHART_GAP) {
+                    runs.push(Vec::new());
+                }
+                runs.last_mut().unwrap().push((t, *v));
+                last = Some(t);
+            }
+            None => last = None,
+        }
+    }
+    runs
+}
+
+/// Top of the network chart: the busiest moment rounded up to 1, 2 or 5 of
+/// a byte unit (so the axis reads "5 MB/s", "200 KB/s"), at least 10 KB/s
+/// so a quiet computer does not look busy.
+fn rate_axis_max(top: f32) -> f32 {
+    let top = top.max(10.0 * 1024.0);
+    let mut unit = 1.0f32;
+    while top / unit >= 1000.0 {
+        unit *= 1024.0;
+    }
+    let v = top / unit;
+    let step = 10f32.powf(v.log10().floor());
+    let nice = [1.0, 2.0, 5.0, 10.0].into_iter().map(|m| m * step).find(|&n| n >= v * 0.999).unwrap_or(10.0 * step);
+    nice * unit
+}
+
+/// Lines over the last 10 minutes from 0 to `max` ("now" = the newest point
+/// at the right); `legend_values` puts the newest value next to each name.
+/// Hovering shows the values of the nearest heartbeat.
+fn line_chart(
+    ui: &mut egui::Ui,
+    title: &str,
+    load: &[crate::sysstat::LoadPoint],
+    series: &[Series],
+    max: f32,
+    fmt: impl Fn(f32) -> String,
+    legend_values: bool,
+) {
+    let window = crate::sysstat::LOAD_WINDOW as f32;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(title).strong());
+        ui.add_space(10.0);
+        for s in series {
+            let (r, _) = ui.allocate_exact_size(Vec2::new(14.0, 10.0), Sense::hover());
+            ui.painter().line_segment([r.left_center(), r.right_center()], Stroke::new(2.5, s.color));
+            let newest = s.values.last().copied().flatten().filter(|_| legend_values);
+            let text = match newest {
+                Some(v) => format!("{} {}", s.name, fmt(v)),
+                None => s.name.to_string(),
+            };
+            ui.label(RichText::new(text).color(MUTED));
+            ui.add_space(6.0);
+        }
+    });
+    ui.add_space(4.0);
+    let axis_w = 64.0;
+    let width = ui.available_width().min(760.0);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 130.0), Sense::hover());
+    let p = ui.painter_at(rect.expand(2.0));
+    let plot = Rect::from_min_max(Pos2::new(rect.min.x + axis_w, rect.min.y + 6.0), Pos2::new(rect.max.x - 4.0, rect.max.y - 18.0));
+    let small = FontId::proportional(11.0);
+    for share in [0.0, 0.5, 1.0] {
+        let y = plot.bottom() - plot.height() * share;
+        p.line_segment([Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)], Stroke::new(1.0, LINE));
+        p.text(Pos2::new(plot.left() - 6.0, y), Align2::RIGHT_CENTER, fmt(max * share), small.clone(), MUTED);
+    }
+    for (label, at, align) in [("10 min ago", 0.0, Align2::LEFT_TOP), ("5 min ago", 0.5, Align2::CENTER_TOP), ("now", 1.0, Align2::RIGHT_TOP)] {
+        p.text(Pos2::new(plot.left() + plot.width() * at, plot.bottom() + 4.0), align, label, small.clone(), MUTED);
+    }
+    let now = load.last().map(|l| l.t).unwrap_or_default();
+    let x = |t: u64| plot.right() - plot.width() * (now.saturating_sub(t) as f32 / window).min(1.0);
+    let y = |v: f32| plot.bottom() - plot.height() * (v / max.max(f32::MIN_POSITIVE)).clamp(0.0, 1.0);
+    let times: Vec<u64> = load.iter().map(|l| l.t).collect();
+    // Fills first, so no line is hidden under another series' fill.
+    let runs: Vec<Vec<Vec<Pos2>>> = series
+        .iter()
+        .map(|s| chart_runs(&times, &s.values).into_iter().map(|r| r.into_iter().map(|(t, v)| Pos2::new(x(t), y(v))).collect()).collect())
+        .collect();
+    for (s, pieces) in series.iter().zip(&runs) {
+        if !s.fill {
+            continue;
+        }
+        let fill = s.color.gamma_multiply(0.12);
+        for w in pieces.iter().flat_map(|pts| pts.windows(2)) {
+            let quad = vec![w[0], w[1], Pos2::new(w[1].x, plot.bottom()), Pos2::new(w[0].x, plot.bottom())];
+            p.add(egui::Shape::convex_polygon(quad, fill, Stroke::NONE));
+        }
+    }
+    for (s, pieces) in series.iter().zip(runs).rev() {
+        for pts in pieces {
+            if pts.len() == 1 {
+                p.circle_filled(pts[0], 2.5, s.color);
+            } else {
+                p.add(egui::Shape::line(pts, Stroke::new(2.0, s.color)));
+            }
+        }
+    }
+    if let Some(pos) = resp.hover_pos().filter(|h| plot.x_range().contains(h.x))
+        && let Some(i) = (0..load.len()).min_by(|&a, &b| (x(load[a].t) - pos.x).abs().total_cmp(&(x(load[b].t) - pos.x).abs()))
+    {
+        let lx = x(load[i].t);
+        p.line_segment([Pos2::new(lx, plot.top()), Pos2::new(lx, plot.bottom())], Stroke::new(1.0, MUTED));
+        let ago = now.saturating_sub(load[i].t);
+        let mut tip = if ago < 15 { "now".to_string() } else { format!("{} ago", human_duration(ago)) };
+        for s in series.iter().rev() {
+            if let Some(v) = s.values[i] {
+                p.circle_filled(Pos2::new(lx, y(v)), 3.5, s.color);
+            }
+        }
+        for s in series {
+            let v = s.values[i].map_or("—".to_string(), &fmt);
+            tip.push_str(&format!("\n{} {v}", s.name));
+        }
+        resp.on_hover_text(tip);
+    }
 }
 
 /// Normal below 75 %, amber up to 90 %, red above.
@@ -3453,6 +3637,45 @@ fn relay_details(o: &Overview) -> (String, bool) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn chart_lines_break_at_pauses_and_unknown_values() {
+        let t = [0, 30, 60, 200, 230, 260, 290];
+        let v = [Some(1.0), Some(2.0), Some(3.0), Some(4.0), None, Some(6.0), Some(7.0)];
+        let runs = chart_runs(&t, &v);
+        assert_eq!(runs, vec![vec![(0, 1.0), (30, 2.0), (60, 3.0)], vec![(200, 4.0)], vec![(260, 6.0), (290, 7.0)]]);
+        assert!(chart_runs(&t, &[None; 7]).is_empty(), "older helper: no network line at all");
+        assert!(chart_runs(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn network_axis_ends_on_a_round_rate() {
+        const K: f32 = 1024.0;
+        assert_eq!(rate_axis_max(0.0), 10.0 * K, "quiet computer: 10 KB/s");
+        assert_eq!(rate_axis_max(11.0 * K), 20.0 * K);
+        assert_eq!(rate_axis_max(150.0 * K), 200.0 * K);
+        assert_eq!(rate_axis_max(600.0 * K), 1000.0 * K);
+        assert_eq!(rate_axis_max(2.4 * K * K), 5.0 * K * K);
+        assert_eq!(rate_axis_max(5.0 * K * K), 5.0 * K * K, "already round");
+        assert_eq!(crate::sysstat::human_rate(rate_axis_max(2.4 * K * K) as f64), "5.0 MB/s");
+        for top in [1.0, 900.0, 33.0 * K, 7.7 * K * K, 950.0 * K * K] {
+            assert!(rate_axis_max(top) >= top, "{top} fits under the axis");
+        }
+    }
+
+    #[test]
+    fn sample_computers_have_ten_minutes_of_load() {
+        let o = sample_overview();
+        for m in &o.machines {
+            if m.online {
+                assert_eq!(m.load.len(), 21, "{}", m.machine.name);
+                assert!(m.load.iter().all(|l| l.net.is_some()));
+                assert_eq!(m.load.last().unwrap().t, o.now);
+            } else {
+                assert!(m.load.is_empty());
+            }
+        }
+    }
 
     #[test]
     fn screenshot_names_are_safe_and_dated() {

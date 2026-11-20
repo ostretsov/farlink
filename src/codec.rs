@@ -337,6 +337,26 @@ pub fn thumbnail_jpeg(f: &Frame, max: u32, quality: u8) -> Result<(u32, u32, Vec
     Ok((w, h, jpeg(&small, quality, ColorDepth::Full)?))
 }
 
+/// Largest full-size screenshot sent as PNG; bigger ones (photos, video on a
+/// large screen) go as a sharp JPEG so they fit through the relay.
+pub const SCREENSHOT_PNG_MAX: usize = 12 << 20;
+
+/// A whole monitor at full size for "Take screenshot": lossless PNG, or a
+/// JPEG at quality 95 when the PNG would be too big. Returns `(bytes, is_png)`.
+pub fn screenshot_image(f: &Frame) -> Result<(Vec<u8>, bool)> {
+    let png = png_lossless(f, ColorDepth::Full, true)?;
+    if png.len() <= SCREENSHOT_PNG_MAX {
+        return Ok((png, true));
+    }
+    Ok((jpeg(f, 95, ColorDepth::Full)?, false))
+}
+
+/// Decode a JPEG or PNG, whichever the bytes are.
+pub fn decode_image(data: &[u8]) -> Result<Frame> {
+    let format = if data.starts_with(b"\x89PNG") { TileFormat::Png } else { TileFormat::Jpeg };
+    decode_tile(format, data)
+}
+
 fn jpeg(tile: &Frame, quality: u8, color: ColorDepth) -> Result<Vec<u8>> {
     use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
     let mut buf = Vec::with_capacity(tile.rgba.len() / 8);

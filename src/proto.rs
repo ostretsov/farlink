@@ -236,8 +236,14 @@ pub enum AgentMsg {
         stats: Option<crate::sysstat::SystemStats>,
     },
     /// relay -> host: send small pictures of every screen (the preview of a
-    /// computer selected in the list).
-    PreviewRequest { req: u32 },
+    /// computer selected in the list). With `full`: only that monitor, at full
+    /// size and lossless when it fits ("Take screenshot"; older helpers ignore
+    /// it and answer with the small pictures).
+    PreviewRequest {
+        req: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        full: Option<u8>,
+    },
     /// host -> relay: the answer to [`AgentMsg::PreviewRequest`].
     Preview { req: u32, shots: Vec<PreviewShot> },
 }
@@ -251,7 +257,8 @@ pub struct PreviewShot {
     pub index: u8,
     pub width: u32,
     pub height: u32,
-    /// Base64 JPEG.
+    /// Base64 JPEG (a full-size screenshot may be a PNG instead: decoders
+    /// look at the bytes).
     pub jpeg: String,
 }
 
@@ -443,12 +450,14 @@ mod tests {
     #[test]
     fn preview_messages_round_trip() {
         let shot = PreviewShot { index: 1, width: 480, height: 270, jpeg: "/9j/".into() };
-        let msgs = [AgentMsg::PreviewRequest { req: 5 }, AgentMsg::Preview { req: 5, shots: vec![shot.clone()] }];
+        let msgs = [AgentMsg::PreviewRequest { req: 5, full: None }, AgentMsg::PreviewRequest { req: 6, full: Some(1) }, AgentMsg::Preview { req: 5, shots: vec![shot.clone()] }];
         for m in msgs {
             let s = serde_json::to_string(&m).unwrap();
             assert_eq!(serde_json::from_str::<AgentMsg>(&s).unwrap(), m);
         }
-        assert_eq!(serde_json::to_string(&AgentMsg::PreviewRequest { req: 5 }).unwrap(), r#"{"t":"preview_request","req":5}"#);
+        assert_eq!(serde_json::to_string(&AgentMsg::PreviewRequest { req: 5, full: None }).unwrap(), r#"{"t":"preview_request","req":5}"#);
+        // Older relays ask without `full`.
+        assert_eq!(serde_json::from_str::<AgentMsg>(r#"{"t":"preview_request","req":5}"#).unwrap(), AgentMsg::PreviewRequest { req: 5, full: None });
         let p = Preview { taken: 1, shots: vec![shot] };
         assert_eq!(serde_json::from_str::<Preview>(&serde_json::to_string(&p).unwrap()).unwrap(), p);
     }

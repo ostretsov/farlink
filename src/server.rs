@@ -79,6 +79,9 @@ pub struct Relay {
     state_path: PathBuf,
     store: Mutex<Store>,
     agents: Mutex<HashMap<String, AgentConn>>,
+    /// CPU and memory of the last 10 minutes per machine (memory only; kept
+    /// over a helper restart so the chart just shows a gap).
+    load: Mutex<HashMap<String, crate::sysstat::LoadHistory>>,
     pending: Mutex<HashMap<String, Pending>>,
     sessions: Mutex<HashMap<String, SessionEntry>>,
     sha_cache: Mutex<HashMap<PathBuf, (SystemTime, u64, String)>>,
@@ -121,6 +124,8 @@ const FORCED_UPDATE_WAIT: Duration = Duration::from_secs(180);
 const PREVIEW_CACHE: Duration = Duration::from_secs(3);
 /// How long the relay waits for a host's preview pictures.
 const PREVIEW_TIMEOUT: Duration = Duration::from_secs(8);
+/// … and for one full-size screenshot (a big PNG takes a moment to make and send).
+const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub type Shared = Arc<Relay>;
 
@@ -164,6 +169,7 @@ impl Relay {
             state_path,
             store: Mutex::new(store),
             agents: Mutex::new(HashMap::new()),
+            load: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             sha_cache: Mutex::new(HashMap::new()),
@@ -383,9 +389,11 @@ impl Relay {
 }
 
 impl Relay {
-    /// Small pictures of a machine's screens (from the cache or asked from the host).
-    pub async fn preview(&self, machine_id: &str) -> std::result::Result<Preview, (StatusCode, &'static str)> {
-        if let Some((at, p)) = self.preview_cache.lock().unwrap().get(machine_id)
+    /// Small pictures of a machine's screens (from the cache or asked from the
+    /// host); with `full`, that one screen at full size (never cached).
+    pub async fn preview(&self, machine_id: &str, full: Option<u8>) -> std::result::Result<Preview, (StatusCode, &'static str)> {
+        if full.is_none()
+            && let Some((at, p)) = self.preview_cache.lock().unwrap().get(machine_id)
             && at.elapsed() < PREVIEW_CACHE
         {
             return Ok(p.clone());
@@ -395,11 +403,12 @@ impl Relay {
         let req = self.preview_seq.fetch_add(1, Ordering::Relaxed);
         let (otx, orx) = oneshot::channel();
         self.previews.lock().unwrap().insert(req, (machine_id.to_string(), otx));
-        if tx.send(AgentMsg::PreviewRequest { req }).is_err() {
+        if tx.send(AgentMsg::PreviewRequest { req, full }).is_err() {
             self.previews.lock().unwrap().remove(&req);
             return Err((StatusCode::SERVICE_UNAVAILABLE, "This computer just went offline"));
         }
-        let shots = match tokio::time::timeout(PREVIEW_TIMEOUT, orx).await {
+        let wait = if full.is_some() { SCREENSHOT_TIMEOUT } else { PREVIEW_TIMEOUT };
+        let shots = match tokio::time::timeout(wait, orx).await {
             Ok(Ok(shots)) => shots,
             _ => {
                 self.previews.lock().unwrap().remove(&req);
@@ -407,6 +416,9 @@ impl Relay {
             }
         };
         let p = Preview { taken: now_secs(), shots };
+        if full.is_some() {
+            return Ok(p);
+        }
         self.preview_cache.lock().unwrap().insert(machine_id.to_string(), (Instant::now(), p.clone()));
         Ok(p)
     }
@@ -452,6 +464,7 @@ pub fn router(relay: Shared) -> Router {
         .route("/api/machines/{id}", delete(api_remove_machine))
         .route("/api/machines/{id}/owner", post(api_set_owner))
         .route("/api/machines/{id}/preview", get(api_preview))
+        .route("/api/machines/{id}/screenshot/{index}", get(api_screenshot))
         .route("/api/machines/{id}/update", post(api_update_machine))
         .route("/api/machines/update-all", post(api_update_all))
         .route("/api/users", post(api_create_user))
@@ -913,6 +926,9 @@ pub struct MachineView {
     /// CPU, memory and disks while online (helpers from 0.1.9 on).
     #[serde(default)]
     pub stats: Option<crate::sysstat::SystemStats>,
+    /// CPU and memory use of the last 10 minutes, oldest first (while online).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub load: Vec<crate::sysstat::LoadPoint>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -1044,6 +1060,7 @@ pub fn overview(r: &Relay) -> Overview {
                     updating,
                     update_error,
                     stats: if online { r.agents.lock().unwrap().get(&m.id).and_then(|a| a.stats.clone()) } else { None },
+                    load: if online { r.load.lock().unwrap().get(&m.id).map(|h| h.recent(now_secs())).unwrap_or_default() } else { Vec::new() },
                 }
             })
             .collect();
@@ -1207,7 +1224,19 @@ async fn api_preview(State(r): State<Shared>, headers: HeaderMap, Path(id): Path
     if !r.read_store(|s| s.can_access(&who, &id)) {
         return (StatusCode::FORBIDDEN, "not your computer").into_response();
     }
-    match r.preview(&id).await {
+    match r.preview(&id, None).await {
+        Ok(p) => Json(p).into_response(),
+        Err((code, msg)) => (code, msg).into_response(),
+    }
+}
+
+/// One screen of a computer at full size, for "Take screenshot" (same access as previews).
+async fn api_screenshot(State(r): State<Shared>, headers: HeaderMap, Path((id, index)): Path<(String, u8)>) -> Response {
+    let Some(who) = who(&r, &headers) else { return unauthorized() };
+    if !r.read_store(|s| s.can_access(&who, &id)) {
+        return (StatusCode::FORBIDDEN, "not your computer").into_response();
+    }
+    match r.preview(&id, Some(index)).await {
         Ok(p) => Json(p).into_response(),
         Err((code, msg)) => (code, msg).into_response(),
     }
@@ -1242,6 +1271,7 @@ async fn api_remove_machine(State(r): State<Shared>, headers: HeaderMap, Path(id
     match r.with_store(|s| s.remove_machine(&id)) {
         Ok(_) => {
             r.kill_sessions("This computer was removed by the administrator", |s| s.machine_id == id);
+            r.load.lock().unwrap().remove(&id);
             if let Some(a) = r.agents.lock().unwrap().remove(&id) {
                 let _ = a.tx.send(AgentMsg::Rejected { reason: "removed by administrator".into() });
             }
@@ -1333,7 +1363,8 @@ async fn api_guest_info(State(r): State<Shared>, Path(token): Path<String>) -> R
 // ------------------------------------------------------------------ WebSockets
 
 async fn ws_agent(State(r): State<Shared>, ws: WebSocketUpgrade) -> Response {
-    ws.max_message_size(1 << 20).on_upgrade(move |socket| agent_loop(r, socket))
+    // Room for a full-size screenshot (PNG up to `codec::SCREENSHOT_PNG_MAX`, base64).
+    ws.max_message_size(24 << 20).max_frame_size(24 << 20).on_upgrade(move |socket| agent_loop(r, socket))
 }
 
 async fn agent_loop(r: Shared, socket: WebSocket) {
@@ -1391,6 +1422,9 @@ async fn agent_loop(r: Shared, socket: WebSocket) {
                     Ok(AgentMsg::Preview { req, shots }) => r.preview_arrived(&id, req, shots),
                     Ok(AgentMsg::UpdateFailed { version, error }) => r.update_failed(&id, version, error),
                     Ok(AgentMsg::Heartbeat { monitors, stats }) => {
+                        if let Some(s) = &stats {
+                            r.load.lock().unwrap().entry(id.clone()).or_default().push(now_secs(), s);
+                        }
                         if stats.is_some()
                             && let Some(a) = r.agents.lock().unwrap().get_mut(&id).filter(|a| a.conn == conn)
                         {

@@ -783,7 +783,14 @@ async fn notes_are_the_admins_and_heartbeats_bring_load_and_disks() {
     assert_eq!(seen, Some(stats.clone()));
     let api = farlink::net::Api { server: s.url.clone(), token: mine_token(&s).await };
     let theirs = blocking(move || api.overview().unwrap()).await;
-    assert_eq!(theirs.machines[0].stats, Some(stats));
+    assert_eq!(theirs.machines[0].stats, Some(stats.clone()));
+    // ... with the CPU / memory history for the chart.
+    let load = &theirs.machines[0].load;
+    assert_eq!(load.len(), 1);
+    assert_eq!(load[0].cpu, 12.5);
+    assert!((load[0].mem - 37.5).abs() < 0.01);
+    assert_eq!(load[0].net, stats.net, "network traffic for the second chart");
+    assert!(load[0].net.is_some());
 
     // Offline: no load shown any more, notes stay.
     drop(agent);
@@ -792,6 +799,7 @@ async fn notes_are_the_admins_and_heartbeats_bring_load_and_disks() {
         let m = s.overview().await.machines[0].clone();
         if !m.online {
             assert_eq!(m.stats, None);
+            assert!(m.load.is_empty());
             assert_eq!(m.machine.notes, "Kitchen\nprinter on USB");
             gone = true;
             break;
@@ -1096,12 +1104,18 @@ async fn real_helper_sends_previews_of_every_screen() {
     }
     let id = id.expect("helper never came online");
 
-    let api = s.api();
-    let p = blocking(move || api.preview(&id).unwrap()).await;
+    let (api, pc) = (s.api(), id.clone());
+    let p = blocking(move || api.preview(&pc).unwrap()).await;
     assert!(p.taken > 0);
     let frames = farlink::net::decode_preview(&p);
     let sizes: Vec<_> = frames.iter().map(|(i, f)| (*i, f.width, f.height)).collect();
     assert_eq!(sizes, vec![(0, 480, 270), (1, 480, 384)], "both demo screens, scaled down");
+    // "Take screenshot": one screen at full size.
+    let (api, pc) = (s.api(), id.clone());
+    let shot = blocking(move || api.screenshot(&pc, 1).unwrap()).await;
+    assert_eq!((shot.width, shot.height), (1280, 1024));
+    let (api, pc) = (s.api(), id.clone());
+    assert!(blocking(move || api.screenshot(&pc, 7)).await.is_err(), "no such screen");
     // No viewing session was opened for it.
     assert!(s.overview().await.sessions.is_empty());
 }
@@ -1139,7 +1153,7 @@ async fn previews_follow_access_rules_and_are_shared_briefly() {
     let api = farlink::net::Api { server: s.url.clone(), token: anna.clone() };
     let pc = anna_pc.clone();
     let request = tokio::spawn(async move { blocking(move || api.preview(&pc)).await });
-    let AgentMsg::PreviewRequest { req } = next_json::<AgentMsg>(&mut anna_agent).await else { panic!("expected preview_request") };
+    let AgentMsg::PreviewRequest { req, full: None } = next_json::<AgentMsg>(&mut anna_agent).await else { panic!("expected preview_request") };
     // Another computer can't answer in its place.
     let fake = farlink::proto::PreviewShot { index: 0, width: 1, height: 1, jpeg: "AAAA".into() };
     send(&mut office_agent, &AgentMsg::Preview { req, shots: vec![fake.clone(), fake] }).await;

@@ -31,6 +31,32 @@ pub struct SystemStats {
     /// Windows: the workgroup or Active Directory domain the computer is in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub joined: Option<Joined>,
+    /// Network traffic since the previous sample (helpers from 0.1.18 on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net: Option<NetRate>,
+}
+
+/// Average network traffic over a while, in bytes per second, of the
+/// computer's real network cards (no loopback, bridges or virtual links).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct NetRate {
+    /// Received.
+    #[serde(rename = "in")]
+    pub rx: f64,
+    /// Sent.
+    #[serde(rename = "out")]
+    pub tx: f64,
+}
+
+/// Total bytes `(received, sent)` read at `at`.
+type NetCounters = (u64, u64);
+
+/// Bytes per second between two counter readings `secs` apart; `None`
+/// without both readings or time between them. A counter that went down
+/// (a network card disappeared) counts as nothing.
+fn rate_between(prev: Option<NetCounters>, now: Option<NetCounters>, secs: f64) -> Option<NetRate> {
+    let ((rx0, tx0), (rx1, tx1)) = (prev?, now?);
+    (secs > 0.0).then(|| NetRate { rx: rx1.saturating_sub(rx0) as f64 / secs, tx: tx1.saturating_sub(tx0) as f64 / secs })
 }
 
 /// Where a Windows computer belongs (JSON: `{"kind":"domain","name":"corp.example.com"}`).
@@ -69,6 +95,7 @@ pub fn user_line(s: &SystemStats) -> Option<String> {
 #[derive(Default)]
 pub struct Sampler {
     prev: Option<(u64, u64)>,
+    prev_net: Option<(std::time::Instant, NetCounters)>,
 }
 
 impl Sampler {
@@ -76,11 +103,18 @@ impl Sampler {
     pub fn sample(&mut self) -> SystemStats {
         if self.prev.is_none() {
             self.prev = cpu_times();
+            self.prev_net = net_counters().map(|c| (std::time::Instant::now(), c));
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
         let now = cpu_times();
         let cpu = busy_between(self.prev, now).unwrap_or(0.0);
         self.prev = now.or(self.prev);
+        let net_now = net_counters().map(|c| (std::time::Instant::now(), c));
+        let net = match (self.prev_net, net_now) {
+            (Some((t0, c0)), Some((t1, c1))) => rate_between(Some(c0), Some(c1), t1.duration_since(t0).as_secs_f64()),
+            _ => None,
+        };
+        self.prev_net = net_now.or(self.prev_net);
         let (mem_total, mem_used) = memory().unwrap_or((0, 0));
         SystemStats {
             cpu: cpu.clamp(0.0, 100.0),
@@ -90,6 +124,7 @@ impl Sampler {
             disks: disks(),
             user: signed_in_user(),
             joined: joined(),
+            net,
         }
     }
 }
@@ -122,6 +157,69 @@ impl CpuLoad {
     }
 }
 
+/// How far back the relay remembers CPU and memory use.
+pub const LOAD_WINDOW: u64 = 600;
+
+/// CPU, memory and network use at one heartbeat
+/// (JSON: `{"t":…,"cpu":…,"mem":…,"net":{"in":…,"out":…}}`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LoadPoint {
+    /// Unix seconds (relay clock).
+    pub t: u64,
+    /// CPU busy, 0–100.
+    pub cpu: f32,
+    /// Memory used, 0–100.
+    pub mem: f32,
+    /// Network traffic (`None` from helpers before 0.1.18).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net: Option<NetRate>,
+}
+
+/// The last [`LOAD_WINDOW`] seconds of heartbeats of one computer (relay memory only).
+#[derive(Debug, Clone, Default)]
+pub struct LoadHistory(std::collections::VecDeque<LoadPoint>);
+
+impl LoadHistory {
+    pub fn push(&mut self, now: u64, s: &SystemStats) {
+        let mem = (s.mem_used as f64 * 100.0 / s.mem_total.max(1) as f64) as f32;
+        self.0.push_back(LoadPoint { t: now, cpu: s.cpu.clamp(0.0, 100.0), mem: mem.clamp(0.0, 100.0), net: s.net });
+        self.prune(now);
+    }
+
+    fn prune(&mut self, now: u64) {
+        while self.0.front().is_some_and(|p| p.t + LOAD_WINDOW < now) {
+            self.0.pop_front();
+        }
+    }
+
+    /// Points of the last [`LOAD_WINDOW`] seconds, oldest first.
+    pub fn recent(&self, now: u64) -> Vec<LoadPoint> {
+        self.0.iter().filter(|p| p.t + LOAD_WINDOW >= now).copied().collect()
+    }
+}
+
+/// Made-up history for the demo: a heartbeat every 30 s for 10 minutes.
+pub fn demo_load(now: u64, cpu: f32, mem: f32, seed: u32) -> Vec<LoadPoint> {
+    (0..=20u32)
+        .map(|i| {
+            let w = ((i * 7 + seed * 13) % 11) as f32 / 10.0 - 0.5;
+            let spike = if (i + seed) % 9 == 4 { 35.0 } else { 0.0 };
+            // A download a few minutes ago, otherwise a little background traffic.
+            let busy = (8..12).contains(&((i + seed * 3) % 20));
+            let base = 40_000.0 + 25_000.0 * f64::from(w);
+            LoadPoint {
+                t: now - u64::from(20 - i) * 30,
+                cpu: if i == 20 { cpu } else { (cpu + w * 18.0 + spike).clamp(1.0, 100.0) },
+                mem: if i == 20 { mem } else { (mem + w * 4.0 - (20 - i) as f32 * 0.2).clamp(1.0, 100.0) },
+                net: Some(NetRate {
+                    rx: if busy { 2_400_000.0 + 600_000.0 * f64::from(w) } else { base * 3.0 },
+                    tx: if busy { 90_000.0 } else { base },
+                }),
+            }
+        })
+        .collect()
+}
+
 /// Made-up numbers for the demo helper and tests.
 pub fn demo_stats() -> SystemStats {
     const G: u64 = 1 << 30;
@@ -133,7 +231,13 @@ pub fn demo_stats() -> SystemStats {
         disks: vec![DiskStat { name: "/".into(), total: 512 * G, free: 201 * G }],
         user: Some("demo".into()),
         joined: None,
+        net: Some(NetRate { rx: 120_000.0, tx: 40_000.0 }),
     }
+}
+
+/// "0 B/s", "850 B/s", "120 KB/s", "2.4 MB/s".
+pub fn human_rate(bytes_per_sec: f64) -> String {
+    format!("{}/s", human_bytes(bytes_per_sec.max(0.0).round() as u64))
 }
 
 /// Human size: "512 GB", "7.5 GB", "800 MB".
@@ -168,6 +272,37 @@ fn parse_proc_stat(s: &str) -> Option<(u64, u64)> {
     let total: u64 = v.iter().take(8).sum();
     let idle = v[3] + v.get(4).copied().unwrap_or(0);
     Some((idle, total))
+}
+
+/// Bytes received and sent by the real network cards since boot: every
+/// interface in `/proc/net/dev` that is not virtual (loopback, docker and
+/// libvirt bridges, veth, VPN tunnels: their traffic also crosses a real card).
+#[cfg(not(windows))]
+fn net_counters() -> Option<NetCounters> {
+    let s = std::fs::read_to_string("/proc/net/dev").ok()?;
+    parse_net_dev(&s, |name| std::path::Path::new("/sys/devices/virtual/net").join(name).exists())
+}
+
+/// Sum of `/proc/net/dev` over the interfaces `virtual_if` does not reject.
+#[cfg_attr(windows, allow(dead_code))]
+fn parse_net_dev(s: &str, virtual_if: impl Fn(&str) -> bool) -> Option<NetCounters> {
+    let mut total: Option<NetCounters> = None;
+    for line in s.lines() {
+        let Some((name, rest)) = line.split_once(':') else { continue };
+        let name = name.trim();
+        if name.is_empty() || name == "lo" || virtual_if(name) {
+            continue;
+        }
+        // Receive: bytes packets errs drop fifo frame compressed multicast; then transmit: bytes …
+        let v: Vec<u64> = rest.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+        if v.len() < 9 {
+            continue;
+        }
+        let t = total.get_or_insert((0, 0));
+        t.0 += v[0];
+        t.1 += v[8];
+    }
+    total
 }
 
 /// (total, used) bytes.
@@ -349,6 +484,36 @@ fn cpu_times() -> Option<(u64, u64)> {
     Some((v(idle), v(kernel) + v(user)))
 }
 
+/// Bytes received and sent by the hardware network cards (not loopback,
+/// not the filter layers Windows lists for each card, which would count twice).
+#[cfg(windows)]
+fn net_counters() -> Option<NetCounters> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, IF_TYPE_SOFTWARE_LOOPBACK, MIB_IF_TABLE2};
+    use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+    let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+    if unsafe { GetIfTable2(&mut table) } != 0 || table.is_null() {
+        return None;
+    }
+    let mut total: Option<NetCounters> = None;
+    unsafe {
+        let n = (*table).NumEntries as usize;
+        let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), n);
+        for r in rows {
+            let flags = r.InterfaceAndOperStatusFlags._bitfield;
+            let hardware = flags & 1 != 0;
+            let filter = flags & 2 != 0;
+            if !hardware || filter || r.Type == IF_TYPE_SOFTWARE_LOOPBACK || r.OperStatus != IfOperStatusUp {
+                continue;
+            }
+            let t = total.get_or_insert((0, 0));
+            t.0 += r.InOctets;
+            t.1 += r.OutOctets;
+        }
+        FreeMibTable(table as *const _);
+    }
+    total
+}
+
 #[cfg(windows)]
 fn memory() -> Option<(u64, u64)> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -499,11 +664,66 @@ mod tests {
     }
 
     #[test]
+    fn reads_network_traffic_of_real_cards() {
+        let dev = "Inter-|   Receive                                                |  Transmit\n \
+             face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n    \
+             lo: 5000 50 0 0 0 0 0 0 5000 50 0 0 0 0 0 0\n  \
+             eth0: 1000 10 0 0 0 0 0 0 300 3 0 0 0 0 0 0\n\
+             wlan0:200 2 0 0 0 0 0 0 100 1 0 0 0 0 0 0\n\
+             docker0: 7777 7 0 0 0 0 0 0 7777 7 0 0 0 0 0 0\n";
+        assert_eq!(parse_net_dev(dev, |n| n == "docker0"), Some((1200, 400)), "no loopback, no virtual bridge; `wlan0:200` has no space");
+        assert_eq!(parse_net_dev(dev, |_| true), None, "only virtual interfaces: nothing to tell");
+        assert_eq!(parse_net_dev("garbage\nno: numbers here\n", |_| false), None);
+
+        assert_eq!(rate_between(Some((1000, 500)), Some((4000, 1100)), 30.0), Some(NetRate { rx: 100.0, tx: 20.0 }));
+        assert_eq!(rate_between(Some((9000, 900)), Some((100, 1000)), 10.0), Some(NetRate { rx: 0.0, tx: 10.0 }), "a card went away");
+        assert_eq!(rate_between(None, Some((1, 1)), 30.0), None, "first reading");
+        assert_eq!(rate_between(Some((1, 1)), Some((2, 2)), 0.0), None, "no time passed");
+
+        assert_eq!(human_rate(0.0), "0 B/s");
+        assert_eq!(human_rate(850.4), "850 B/s");
+        assert_eq!(human_rate(2.5 * 1024.0 * 1024.0), "2.5 MB/s");
+        assert_eq!(human_rate(-3.0), "0 B/s");
+
+        // JSON names and older helpers.
+        let s = serde_json::to_string(&NetRate { rx: 1.5, tx: 2.0 }).unwrap();
+        assert_eq!(s, r#"{"in":1.5,"out":2.0}"#);
+        let old: LoadPoint = serde_json::from_str(r#"{"t":5,"cpu":1,"mem":2}"#).unwrap();
+        assert_eq!(old.net, None);
+    }
+
+    #[test]
     fn samples_this_computer() {
-        let s = Sampler::default().sample();
+        let mut sampler = Sampler::default();
+        let s = sampler.sample();
         assert!(s.mem_total > 0 && s.mem_used <= s.mem_total);
         assert!((0.0..=100.0).contains(&s.cpu));
+        // Network: measured over the first pause already (if this computer has a real card).
+        if net_counters().is_some() {
+            let n = s.net.expect("network rate from the first sample");
+            assert!(n.rx >= 0.0 && n.tx >= 0.0);
+            assert!(sampler.sample().net.is_some());
+        }
         assert_eq!(human_bytes(512 << 30), "512 GB");
         assert_eq!(human_bytes(7 << 29), "3.5 GB");
+    }
+
+    #[test]
+    fn load_history_keeps_ten_minutes() {
+        let mut h = super::LoadHistory::default();
+        let mut s = super::demo_stats();
+        for i in 0..30u64 {
+            s.cpu = i as f32;
+            h.push(1000 + i * 30, &s);
+        }
+        let now = 1000 + 29 * 30;
+        let pts = h.recent(now);
+        assert_eq!(pts.len(), 21);
+        assert_eq!(pts.first().unwrap().t, now - super::LOAD_WINDOW);
+        assert_eq!(pts.last().unwrap().cpu, 29.0);
+        assert!((pts[0].mem - 37.5).abs() < 0.01);
+        assert_eq!(pts[0].net, s.net, "network traffic is kept too");
+        // A computer that went quiet: nothing old is shown.
+        assert!(h.recent(now + 601).is_empty());
     }
 }

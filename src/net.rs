@@ -80,6 +80,24 @@ impl Api {
         Ok(r.body_mut().read_json()?)
     }
 
+    /// One screen at full size, taken by the computer's helper right now.
+    /// Older helpers answer with the small preview pictures instead.
+    pub fn screenshot(&self, machine_id: &str, index: u8) -> Result<Frame> {
+        let mut r = ureq::get(&self.url(&format!("/api/machines/{}/screenshot/{index}", url_encode(machine_id))))
+            .header("Authorization", &self.auth())
+            .config()
+            .timeout_global(Some(std::time::Duration::from_secs(60)))
+            .build()
+            .call()
+            .map_err(|e| match e {
+                ureq::Error::StatusCode(503) => anyhow!("This computer is offline right now"),
+                ureq::Error::StatusCode(504) => anyhow!("The computer did not send the screenshot"),
+                e => api_error(e),
+            })?;
+        let p: Preview = r.body_mut().with_config().limit(64 << 20).read_json()?;
+        decode_preview(&p).into_iter().find(|(i, _)| *i == index).map(|(_, f)| f).ok_or_else(|| anyhow!("The computer sent no picture of this screen"))
+    }
+
     pub fn create_grant(&self, machine_id: &str, minutes: u64, view_only: bool, label: &str) -> Result<String> {
         let mut r = ureq::post(&self.url("/api/grants"))
             .header("Authorization", &self.auth())
@@ -155,8 +173,8 @@ pub fn decode_preview(p: &Preview) -> Vec<(u8, Frame)> {
     p.shots
         .iter()
         .filter_map(|s| {
-            let jpeg = crate::util::base64_decode(&s.jpeg)?;
-            let f = crate::codec::decode_tile(crate::proto::TileFormat::Jpeg, &jpeg).ok()?;
+            let data = crate::util::base64_decode(&s.jpeg)?;
+            let f = crate::codec::decode_image(&data).ok()?;
             Some((s.index, f))
         })
         .collect()
