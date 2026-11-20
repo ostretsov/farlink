@@ -175,7 +175,17 @@ fn main() -> Result<()> {
             }
             let (relay, _) = Relay::new(cfg)?;
             relay.with_store(|s| s.set_password(pw));
-            println!("Password changed. Everyone was signed out. Restart is not needed.");
+            // A running server keeps its state in memory (and would write the
+            // old password back): restart it so the new one counts.
+            let restarted = std::process::Command::new("systemctl")
+                .args(["try-restart", "farlink-server.service"])
+                .status()
+                .is_ok_and(|s| s.success());
+            if restarted {
+                println!("Password changed and the server restarted. Everyone was signed out.");
+            } else {
+                println!("Password changed. Restart the running server now so it takes effect (systemctl restart farlink-server).");
+            }
             Ok(())
         }
         "version" | "--version" => {

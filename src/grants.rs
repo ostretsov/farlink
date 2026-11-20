@@ -156,6 +156,12 @@ pub fn hash_password(pw: &str) -> String {
     Argon2::default().hash_password(pw.as_bytes()).map(|h| h.to_string()).unwrap_or_default()
 }
 
+/// Hash of a random password nobody knows, checked for unknown sign-in names.
+fn unknown_user_hash() -> &'static str {
+    static HASH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| hash_password(&random_token(16)));
+    &HASH
+}
+
 pub fn verify_password(pw: &str, hash: &str) -> bool {
     match PasswordHash::new(hash) {
         Ok(parsed) => Argon2::default().verify_password(pw.as_bytes(), &parsed).is_ok(),
@@ -320,18 +326,46 @@ impl Store {
 
     /// Sign in as admin (empty name or "admin") or as a person.
     pub fn login_as(&mut self, login: &str, pw: &str, now: u64) -> Option<(String, Who, String)> {
-        let login = login.trim().to_lowercase();
-        if login.is_empty() || login == "admin" {
-            return self.login(pw, now).map(|t| (t, Who::Admin, "Administrator".to_string()));
-        }
-        let u = self.users.values().find(|u| u.login == login)?;
-        if !verify_password(pw, &u.password_hash) {
+        let (hash, who, name) = self.credentials(login);
+        if !verify_password(pw, &hash) {
             return None;
         }
-        let (id, name) = (u.id.clone(), u.name.clone());
+        let who = who?;
+        let token = self.start_session(&who, now)?;
+        Some((token, who, name))
+    }
+
+    /// The password hash to check for a sign-in name, and whose it is. An
+    /// unknown name gets a stand-in hash (so checking it takes just as long
+    /// and nobody can tell which names exist) and no `Who`.
+    pub fn credentials(&self, login: &str) -> (String, Option<Who>, String) {
+        let login = login.trim().to_lowercase();
+        if login.is_empty() || login == "admin" {
+            return (self.admin_hash.clone(), Some(Who::Admin), "Administrator".to_string());
+        }
+        match self.users.values().find(|u| u.login == login) {
+            Some(u) => (u.password_hash.clone(), Some(Who::User(u.id.clone())), u.name.clone()),
+            None => (unknown_user_hash().to_string(), None, String::new()),
+        }
+    }
+
+    /// Open a sign-in session after the password was checked. `None` when
+    /// the person was removed in the meantime.
+    pub fn start_session(&mut self, who: &Who, now: u64) -> Option<String> {
         let token = random_token(24);
-        self.user_sessions.insert(sha256_hex(token.as_bytes()), (id.clone(), now + ADMIN_SESSION_SECS));
-        Some((token, Who::User(id), name))
+        let key = sha256_hex(token.as_bytes());
+        match who {
+            Who::Admin => {
+                self.admin_sessions.insert(key, now + ADMIN_SESSION_SECS);
+            }
+            Who::User(id) => {
+                if !self.users.contains_key(id) {
+                    return None;
+                }
+                self.user_sessions.insert(key, (id.clone(), now + ADMIN_SESSION_SECS));
+            }
+        }
+        Some(token)
     }
 
     /// Who does this session token belong to?
@@ -586,6 +620,11 @@ mod tests {
         assert_eq!(s.who(&tok, 1), None, "her sign-in ends");
         assert_eq!(s.machines[&pc_anna].owner, None, "computers stay, admin-only");
         assert!(s.enroll_owner(&anna.enroll_token).is_none(), "her install link stops working");
+
+        assert!(s.login_as("nobody", "anna-secret", 0).is_none());
+        let (_, unknown, _) = s.credentials("nobody");
+        assert_eq!(unknown, None, "unknown names are never signed in");
+        assert!(s.start_session(&Who::User(anna.id.clone()), 0).is_none(), "removed people get no session");
 
         let (atok, awho, _) = s.login_as("", "admin-pw", 0).unwrap();
         assert_eq!(awho, Who::Admin);

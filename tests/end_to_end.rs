@@ -1232,3 +1232,104 @@ async fn copied_text_goes_both_ways_in_control_sessions_only() {
     demo_set("after switching back");
     assert_eq!(next_clip(&mut viewer).await, "after switching back");
 }
+
+/// Status of a sign-in attempt straight over HTTP.
+fn login_status(base: &str, username: &str, password: &str) -> u16 {
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    agent
+        .post(&format!("{base}/api/login"))
+        .send_json(serde_json::json!({"username": username, "password": password}))
+        .map(|r| r.status().as_u16())
+        .unwrap_or(0)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn password_guessing_is_stopped() {
+    let s = start_server().await;
+    let (base, admin) = (s.url.clone(), s.admin.clone());
+    blocking(move || {
+        ureq::post(&format!("{base}/api/users"))
+            .header("Authorization", &format!("Bearer {admin}"))
+            .send_json(serde_json::json!({"name": "Anna", "login": "anna", "password": "anna-pass-1"}))
+            .unwrap();
+    })
+    .await;
+    // Guesses sent all at once are counted too (the delay alone would not stop them).
+    let guesses: Vec<_> = (0..farlink::guard::PER_ADDRESS)
+        .map(|i| {
+            let base = s.url.clone();
+            blocking(move || login_status(&base, "anna", &format!("guess-{i}")))
+        })
+        .collect();
+    for g in guesses {
+        assert_eq!(g.await, 401);
+    }
+    let base = s.url.clone();
+    assert_eq!(blocking(move || login_status(&base, "anna", "anna-pass-1")).await, 429, "even the right password waits now");
+    let base = s.url.clone();
+    assert_eq!(blocking(move || login_status(&base, "", "whatever")).await, 429, "the address is blocked for every name");
+    // A token that is far too long is not even checked.
+    let base = s.url.clone();
+    s.relay.reset_login_guard();
+    assert_eq!(blocking(move || login_status(&base, "anna", &"x".repeat(100_000))).await, 401);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pages_carry_browser_protections_and_hide_computer_names() {
+    let s = start_server().await;
+    let base = s.url.clone();
+    let (headers, body) = blocking(move || {
+        let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let mut r = agent.get(&format!("{base}/view/abc123")).call().unwrap();
+        let h: Vec<(String, String)> =
+            r.headers().iter().map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string())).collect();
+        (h, r.body_mut().read_to_string().unwrap())
+    })
+    .await;
+    let get = |k: &str| headers.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default();
+    assert_eq!(get("x-frame-options"), "DENY");
+    assert_eq!(get("x-content-type-options"), "nosniff");
+    assert_eq!(get("referrer-policy"), "no-referrer");
+    assert!(get("content-security-policy").contains("frame-ancestors 'none'"));
+    assert!(body.contains(r#""name":"""#), "no computer name for someone not signed in");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_password_ends_that_persons_open_screens() {
+    let s = start_server().await;
+    let (base, admin) = (s.url.clone(), s.admin.clone());
+    let created: serde_json::Value = blocking(move || {
+        ureq::post(&format!("{base}/api/users"))
+            .header("Authorization", &format!("Bearer {admin}"))
+            .send_json(serde_json::json!({"name": "Anna", "login": "anna", "password": "anna-pass-1"}))
+            .unwrap()
+            .body_mut()
+            .read_json()
+            .unwrap()
+    })
+    .await;
+    let (uid, enroll) = (created["id"].as_str().unwrap().to_string(), created["install_url"].as_str().unwrap().rsplit('/').next().unwrap().to_string());
+    let (mut agent, pc, secret) = fake_host_with(&s, &enroll, "ANNA-PC").await;
+    let anna = mine_token(&s).await;
+    let url = s.ws(&format!("/ws/view/{pc}?token={anna}"));
+    let viewer_task = tokio::spawn(async move { connect_async(url).await.unwrap().0 });
+    let (_host, _) = accept_session(&s, &mut agent, &pc, &secret).await;
+    let mut viewer = viewer_task.await.unwrap();
+
+    let (base, admin) = (s.url.clone(), s.admin.clone());
+    blocking(move || {
+        ureq::post(&format!("{base}/api/users/{uid}/password"))
+            .header("Authorization", &format!("Bearer {admin}"))
+            .send_json(serde_json::json!({"password": "anna-pass-2"}))
+            .unwrap();
+    })
+    .await;
+    let reason = loop {
+        if let SessionMsg::Closed { reason } = next_json::<SessionMsg>(&mut viewer).await {
+            break reason;
+        }
+    };
+    assert!(reason.contains("password was changed"), "{reason}");
+    let api = farlink::net::Api { server: s.url.clone(), token: anna };
+    assert!(blocking(move || api.overview().is_err()).await, "old sign-in is gone too");
+}

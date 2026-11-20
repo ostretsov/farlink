@@ -27,8 +27,9 @@
     document.title = (name || 'Remote') + ' · Farlink';
   };
   showName(cfg.name);
-  // Keep the computer's name in sync when the administrator renames it.
-  setInterval(async () => {
+  // The computer's name (asked signed in), kept in sync when the
+  // administrator renames it.
+  const refreshName = async () => {
     try {
       if (cfg.mode === 'guest') {
         const r = await fetch('/api/guest/' + cfg.token);
@@ -39,7 +40,9 @@
         if (m) showName(m.name);
       }
     } catch (e) { /* offline for a moment: keep the old name */ }
-  }, 10000);
+  };
+  refreshName();
+  setInterval(refreshName, 10000);
   // View-only switch during the session (not for view-only temporary links).
   let viewLocked = cfg.mode === 'guest' && !!cfg.view_only;
   const setMode = () => {

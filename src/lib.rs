@@ -14,6 +14,7 @@ pub mod config;
 pub mod desktop;
 pub mod files;
 pub mod grants;
+pub mod guard;
 pub mod host;
 pub mod install;
 pub mod keygrab;

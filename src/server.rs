@@ -92,7 +92,17 @@ pub struct Relay {
     preview_cache: Mutex<HashMap<String, (Instant, Preview)>>,
     /// Updates the administrator asked for, per machine (not saved).
     forced_updates: Mutex<HashMap<String, ForcedUpdate>>,
+    /// Failed sign-ins per address and name (password guessing brake).
+    login_guard: Mutex<crate::guard::LoginGuard>,
+    /// Password checks running at once: they are slow on purpose, so a flood
+    /// of sign-ins must not take every CPU core.
+    login_slots: tokio::sync::Semaphore,
 }
+
+/// Password checks allowed at the same time.
+const LOGIN_SLOTS: usize = 2;
+/// Longest password or sign-in name looked at.
+const MAX_CREDENTIAL: usize = 1024;
 
 /// An "Update" the administrator pressed for one computer.
 #[derive(Clone, Debug)]
@@ -134,6 +144,14 @@ pub fn load_or_init_store(path: &std::path::Path) -> Result<(Store, Option<Strin
 impl Relay {
     pub fn new(cfg: ServerConfig) -> Result<(Shared, Option<String>)> {
         std::fs::create_dir_all(&cfg.data_dir)?;
+        // Sign-ins, link tokens and the certificate key live here: owner only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(&cfg.data_dir, std::fs::Permissions::from_mode(0o700)) {
+                log::warn!("could not make {} private: {e}", cfg.data_dir.display());
+            }
+        }
         let state_path = cfg.data_dir.join("state.json");
         let (store, first_password) = load_or_init_store(&state_path)?;
         let source = cfg.update_from_github.clone().filter(|r| !r.trim().is_empty());
@@ -155,8 +173,15 @@ impl Relay {
             preview_seq: AtomicU32::new(1),
             preview_cache: Mutex::new(HashMap::new()),
             forced_updates: Mutex::new(HashMap::new()),
+            login_guard: Mutex::new(crate::guard::LoginGuard::default()),
+            login_slots: tokio::sync::Semaphore::new(LOGIN_SLOTS),
         };
         Ok((Arc::new(relay), first_password))
+    }
+
+    /// Forget all failed sign-ins (tests).
+    pub fn reset_login_guard(&self) {
+        *self.login_guard.lock().unwrap() = crate::guard::LoginGuard::default();
     }
 
     /// Change the store and save it to disk.
@@ -442,7 +467,74 @@ pub fn router(relay: Shared) -> Router {
         .route("/ws/host-session/{session}", get(ws_host_session))
         .route("/ws/view/{machine}", get(ws_view))
         .route("/ws/guest/{token}", get(ws_guest))
+        .layer(axum::middleware::map_response(security_headers))
         .with_state(relay)
+}
+
+/// Browser protections on every answer: no framing (clickjacking), scripts
+/// and connections only from this server, no links leaking tokens in the
+/// address (`/g/…`, `/install/…`) to other sites, nothing private cached.
+async fn security_headers(mut res: Response) -> Response {
+    use axum::http::HeaderValue;
+    let h = res.headers_mut();
+    let set = |h: &mut HeaderMap, k: &'static str, v: &'static str| {
+        h.entry(k).or_insert(HeaderValue::from_static(v));
+    };
+    set(h, "x-content-type-options", "nosniff");
+    set(h, "x-frame-options", "DENY");
+    set(h, "referrer-policy", "no-referrer");
+    set(
+        h,
+        "content-security-policy",
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; \
+         img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; \
+         form-action 'self'; frame-ancestors 'none'",
+    );
+    set(h, "cache-control", "no-store");
+    res
+}
+
+/// The client's address, as the connection shows it.
+#[derive(Clone, Copy, Debug)]
+pub struct ClientAddr(pub std::net::SocketAddr);
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>> for ClientAddr {
+    fn connect_info(s: axum::serve::IncomingStream<'_, tokio::net::TcpListener>) -> Self {
+        ClientAddr(*s.remote_addr())
+    }
+}
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, crate::tls::PlainListener>> for ClientAddr {
+    fn connect_info(s: axum::serve::IncomingStream<'_, crate::tls::PlainListener>) -> Self {
+        ClientAddr(*s.remote_addr())
+    }
+}
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, crate::tls::TlsListener>> for ClientAddr {
+    fn connect_info(s: axum::serve::IncomingStream<'_, crate::tls::TlsListener>) -> Self {
+        ClientAddr(*s.remote_addr())
+    }
+}
+
+/// Who is knocking, for counting failed sign-ins. Behind a proxy on this
+/// same machine the proxy's `X-Forwarded-For` / `X-Real-IP` counts; from
+/// anywhere else those headers are ignored (anyone could send them).
+fn client_key(ext: &axum::http::Extensions, headers: &HeaderMap) -> String {
+    let Some(axum::extract::ConnectInfo(ClientAddr(peer))) = ext.get::<axum::extract::ConnectInfo<ClientAddr>>() else {
+        return "unknown".into();
+    };
+    if peer.ip().is_loopback() {
+        let forwarded = headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit(',').next())
+            .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
+            .and_then(|v| v.trim().parse::<std::net::IpAddr>().ok());
+        if let Some(ip) = forwarded {
+            return crate::guard::client_key(ip);
+        }
+    }
+    crate::guard::client_key(peer.ip())
 }
 
 /// Background jobs: expire link sessions, prune old links, push updates.
@@ -473,12 +565,21 @@ pub async fn serve<L>(relay: Shared, listener: L) -> Result<()>
 where
     L: axum::serve::Listener,
     L::Addr: std::fmt::Debug,
+    ClientAddr: for<'a> axum::extract::connect_info::Connected<axum::serve::IncomingStream<'a, L>>,
 {
     spawn_housekeeping(relay.clone());
     if let Some(repo) = relay.cfg.update_from_github.clone().filter(|r| !r.trim().is_empty()) {
         crate::server_update::spawn(relay.clone(), repo.trim().to_string());
     }
-    axum::serve(listener, router(relay)).await?;
+    let public = relay.cfg.public_url.trim().to_lowercase();
+    if !public.starts_with("https://") && !public.contains("://127.0.0.1") && !public.contains("://localhost") {
+        log::warn!(
+            "the public address {} is not https://: passwords, sign-ins and computer keys travel unencrypted. \
+             Use HTTPS (--tls-domain or certificate files) unless this is a closed test network",
+            relay.cfg.public_url
+        );
+    }
+    axum::serve(listener, router(relay).into_make_service_with_connect_info::<ClientAddr>()).await?;
     Ok(())
 }
 
@@ -545,12 +646,13 @@ async fn admin_page() -> Html<&'static str> {
     Html(ADMIN_HTML)
 }
 
-async fn admin_viewer_page(State(r): State<Shared>, Path(machine): Path<String>) -> Response {
-    let name = r.read_store(|s| s.machines.get(&machine).map(|m| m.name.clone()));
-    match name {
-        Some(name) => viewer_page(json!({"mode": "admin", "machine": machine, "name": name})).into_response(),
-        None => message_page("Not found", "This computer is not registered on this server.").into_response(),
+/// The page itself is public (the sign-in token lives in the browser), so it
+/// tells nothing about the computer: the script asks for its name signed in.
+async fn admin_viewer_page(Path(machine): Path<String>) -> Response {
+    if !safe_segment(&machine) {
+        return message_page("Not found", "This computer is not registered on this server.").into_response();
     }
+    viewer_page(json!({"mode": "admin", "machine": machine, "name": ""})).into_response()
 }
 
 async fn guest_page(State(r): State<Shared>, Path(token): Path<String>) -> Response {
@@ -749,14 +851,37 @@ struct LoginReq {
     password: String,
 }
 
-async fn api_login(State(r): State<Shared>, Json(req): Json<LoginReq>) -> Response {
-    let token = r.with_store(|s| s.login_as(&req.username, &req.password, now_secs()));
-    match token {
+async fn api_login(State(r): State<Shared>, ext: axum::http::Extensions, headers: HeaderMap, Json(req): Json<LoginReq>) -> Response {
+    let addr = client_key(&ext, &headers);
+    if let Some(wait) = r.login_guard.lock().unwrap().blocked(&addr, &req.username, now_secs()) {
+        log::warn!("sign-in from {addr} refused: too many wrong passwords");
+        let mins = wait.div_ceil(60).max(1);
+        let msg = format!("Too many wrong passwords. Try again in {mins} minute{}.", if mins == 1 { "" } else { "s" });
+        return (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": msg}))).into_response();
+    }
+    let ok = if req.username.len() > MAX_CREDENTIAL || req.password.len() > MAX_CREDENTIAL {
+        None
+    } else {
+        // The slow password check runs outside the state lock and on a
+        // blocking thread, a few at a time.
+        let Ok(_slot) = r.login_slots.acquire().await else { return unauthorized() };
+        let (hash, who, name) = r.read_store(|s| s.credentials(&req.username));
+        let pw = req.password.clone();
+        let right = tokio::task::spawn_blocking(move || crate::grants::verify_password(&pw, &hash)).await.unwrap_or(false);
+        match who {
+            Some(who) if right => r.with_store(|s| s.start_session(&who, now_secs())).map(|t| (t, who, name)),
+            _ => None,
+        }
+    };
+    match ok {
         Some((t, who, name)) => {
+            r.login_guard.lock().unwrap().succeeded(&addr);
             let role = if who == Who::Admin { "admin" } else { "user" };
             Json(json!({"token": t, "role": role, "name": name})).into_response()
         }
         None => {
+            r.login_guard.lock().unwrap().failed(&addr, &req.username, now_secs());
+            log::info!("wrong password from {addr}");
             tokio::time::sleep(Duration::from_millis(800)).await; // slow down guessing
             (StatusCode::UNAUTHORIZED, Json(json!({"error": "Wrong password"}))).into_response()
         }
@@ -1014,7 +1139,11 @@ async fn api_user_password(State(r): State<Shared>, headers: HeaderMap, Path(id)
         return unauthorized();
     }
     match r.with_store(|s| s.set_user_password(&id, &req.password)) {
-        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Ok(()) => {
+            // A new password signs them out everywhere, open screens too.
+            r.kill_sessions("Your password was changed. Please sign in again", |s| s.user.as_deref() == Some(id.as_str()));
+            Json(json!({"ok": true})).into_response()
+        }
         Err(e) => bad(e),
     }
 }

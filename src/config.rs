@@ -23,9 +23,26 @@ pub fn save_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     }
     let tmp = path.with_extension(format!("tmp-{}", crate::util::random_token(4)));
     std::fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
+    make_private(&tmp, path);
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
+
+/// Settings files hold secrets (machine keys, sign-ins, link tokens): only
+/// their owner may read them. A file replaced by someone else (root running
+/// `farlink-server set-password`) keeps its old owner, so the service can
+/// still read it.
+#[cfg(unix)]
+fn make_private(tmp: &Path, target: &Path) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let _ = std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(0o600));
+    if let Ok(old) = std::fs::metadata(target) {
+        let _ = std::os::unix::fs::chown(tmp, Some(old.uid()), Some(old.gid()));
+    }
+}
+
+#[cfg(not(unix))]
+fn make_private(_tmp: &Path, _target: &Path) {}
 
 // ---------------------------------------------------------------- host
 
@@ -262,6 +279,22 @@ pub const SERVER_CONFIG_PATH: &str = "/etc/farlink-server/config.json";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_settings_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::util::unique_temp_dir("farlink-private");
+        let p = dir.join("state.json");
+        std::fs::write(&p, "{}").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        save_json(&p, &serde_json::json!({"secret": "x"})).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600, "replaced file is owner-only");
+        let fresh = dir.join("new.json");
+        save_json(&fresh, &1).unwrap();
+        assert_eq!(std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn json_round_trip_and_atomic_write() {
