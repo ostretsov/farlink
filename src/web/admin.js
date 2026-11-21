@@ -125,8 +125,9 @@ function render() {
   const name = (id) => (byId(id) || {}).name || id;
   $('sessions').innerHTML = data.sessions.map((s) => `<tr><td>${esc(s.who)}</td><td>${esc(name(s.machine_id))}</td>
     <td>${s.view_only ? '<span class="tag view">view</span>' : '<span class="tag ctrl">control</span>'}</td>
+    <td class="muted" title="${s.direct ? 'Straight between the computers (peer-to-peer); this server only watches over the session' : 'All traffic goes through this server'}">${s.direct ? 'direct' : 'relay'}</td>
     <td style="text-align:right"><button class="small danger" onclick="endSession('${s.id}')">End</button></td></tr>`).join('')
-    || '<tr><td colspan="4" class="muted">Nobody is connected.</td></tr>';
+    || '<tr><td colspan="5" class="muted">Nobody is connected.</td></tr>';
 }
 
 // CPU, memory and disks of an online computer (helpers that report them).

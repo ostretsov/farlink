@@ -281,7 +281,11 @@ async fn run_update(server: &str, force: bool) -> Result<Option<i32>, String> {
 }
 
 /// One viewing session: connect the session socket and stream pictures.
-pub async fn run_session(server: String, machine_id: String, secret: String, session_id: String, mut view_only: bool, demo: bool) -> Result<()> {
+/// Starts through the relay; when the relay allows it, a direct connection
+/// to the viewer is tried meanwhile and used once it works (see
+/// [`crate::direct`]). The relay socket stays the authority either way:
+/// mode switches and the end of the session only ever come from it.
+pub async fn run_session(server: String, machine_id: String, secret: String, session_id: String, view_only: bool, demo: bool) -> Result<()> {
     let url = ws_url(
         &server,
         &format!("/ws/host-session/{}?machine={}&secret={}", url_encode(&session_id), url_encode(&machine_id), url_encode(&secret)),
@@ -292,8 +296,6 @@ pub async fn run_session(server: String, machine_id: String, secret: String, ses
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(32);
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
-    let file_out = out_tx.clone();
-    let mut files = crate::files::FileService::default();
     // Copied text both ways (control sessions only).
     let clip = Arc::new(std::sync::Mutex::new(ClipboardSync::for_host(demo)));
     let clip_view_only = Arc::new(AtomicBool::new(view_only));
@@ -301,52 +303,92 @@ pub async fn run_session(server: String, machine_id: String, secret: String, ses
         let (clip, tx, vo, stop) = (clip.clone(), out_tx.clone(), clip_view_only.clone(), stop.clone());
         std::thread::Builder::new().name("clipboard".into()).spawn(move || crate::clipboard::poll_loop(clip, tx, vo, stop))?;
     }
+    let mut viewer = ViewerInput { view_only, clip, clip_view_only, files: crate::files::FileService::default(), file_out: out_tx.clone(), cmd_tx };
     std::thread::Builder::new()
         .name("screen".into())
         .spawn(move || screen_loop(demo, view_only, cmd_rx, out_tx, stop2))?;
+    let (mut direct, mut direct_events) = crate::direct::DirectState::new(false);
+    let mut relay_ping = tokio::time::interval(crate::direct::RELAY_PING);
+    // Back on the relay: pictures sent on the broken path are lost, so the
+    // screen thread forgets them (flow control) and sends everything again.
+    let fell_back = |cmd_tx: &std::sync::mpsc::Sender<SessionMsg>| {
+        let _ = cmd_tx.send(SessionMsg::PathSwitch { direct: false });
+    };
     let result = async {
         loop {
             tokio::select! {
+                _ = relay_ping.tick() => sink.send(Message::Ping(Default::default())).await?,
                 msg = stream.next() => match msg {
                     Some(Ok(Message::Text(t))) => {
-                        if let Ok(m) = serde_json::from_str::<SessionMsg>(&t) {
-                            if matches!(m, SessionMsg::Closed { .. }) { break; }
-                            // Only the relay sends this, after checking the person may switch.
-                            if let SessionMsg::SetViewOnly { view_only: v } = m {
-                                view_only = v;
-                                clip_view_only.store(v, Ordering::Relaxed);
-                            }
-                            if let SessionMsg::Clipboard { text } = m {
-                                // Done before later messages go on, so the Ctrl+V
-                                // that follows pastes this text.
-                                if !view_only {
-                                    let clip = clip.clone();
-                                    let _ = tokio::task::spawn_blocking(move || clip.lock().unwrap().receive(text)).await;
+                        let Ok(m) = serde_json::from_str::<SessionMsg>(&t) else { continue };
+                        // Only the relay ends sessions, switches modes and arranges the direct path.
+                        match m {
+                            SessionMsg::Closed { .. } => break,
+                            SessionMsg::DirectInfo { stun_port, stun_servers } => direct.allowed(&server, stun_port, stun_servers),
+                            SessionMsg::DirectOffer { fp, addrs, hard_nat, attempt } => {
+                                // A newer attempt from the viewer replaces a direct path we still had.
+                                if let Some(m) = direct.offer(fp, addrs, hard_nat, attempt) {
+                                    sink.send(crate::direct::json(&m)).await?;
+                                    fell_back(&viewer.cmd_tx);
                                 }
-                                continue;
                             }
-                            if m.is_file_request() {
-                                // Files only in control sessions (the relay checks too).
-                                if !view_only { files.handle(m, &file_out).await; }
-                                continue;
+                            SessionMsg::PathSwitch { direct: d } => {
+                                if let Some(m) = direct.peer_switched(d) {
+                                    sink.send(crate::direct::json(&m)).await?;
+                                    fell_back(&viewer.cmd_tx);
+                                }
                             }
-                            let _ = cmd_tx.send(m);
+                            SessionMsg::SetViewOnly { view_only: v } => {
+                                viewer.view_only = v;
+                                viewer.clip_view_only.store(v, Ordering::Relaxed);
+                                let _ = viewer.cmd_tx.send(m);
+                            }
+                            m => viewer.message(m).await,
                         }
                     }
-                    Some(Ok(Message::Binary(b))) => {
-                        if !view_only
-                            && let Some((c, data)) = crate::proto::FileChunk::decode(&b)
-                            && let Some(reply) = files.chunk(c, data)
-                        {
-                            let _ = file_out.send(Message::Text(serde_json::to_string(&reply)?.into())).await;
-                        }
-                    }
+                    Some(Ok(Message::Binary(b))) => viewer.binary(&b).await,
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Err(e)) => return Err(e.into()),
                     _ => {}
                 },
+                msg = direct.recv() => match msg {
+                    Ok(Message::Text(t)) => {
+                        if let Ok(m) = serde_json::from_str::<SessionMsg>(&t)
+                            && !relay_only(&m)
+                        {
+                            viewer.message(m).await;
+                        }
+                    }
+                    Ok(Message::Binary(b)) => viewer.binary(&b).await,
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::info!("direct connection lost: {e:#}");
+                        if let Some(m) = direct.broken() {
+                            sink.send(crate::direct::json(&m)).await?;
+                            fell_back(&viewer.cmd_tx);
+                        }
+                    }
+                },
+                Some(ev) = direct_events.recv() => {
+                    let say = match ev {
+                        crate::direct::Event::Bound(n, ep) => direct.bound(n, ep),
+                        crate::direct::Event::Linked(n, link) => direct.linked(n, link),
+                        crate::direct::Event::Retry(_) | crate::direct::Event::NoAnswer(_) => None, // the viewer's business
+                    };
+                    if let Some(m) = say {
+                        sink.send(crate::direct::json(&m)).await?;
+                    }
+                }
                 out = out_rx.recv() => match out {
-                    Some(m) => sink.send(m).await?,
+                    Some(m) => {
+                        let was_direct = direct.remote().is_some();
+                        for m in direct.send(m).await {
+                            sink.send(m).await?;
+                        }
+                        if was_direct && direct.remote().is_none() {
+                            fell_back(&viewer.cmd_tx);
+                        }
+                    }
                     None => break,
                 }
             }
@@ -355,8 +397,66 @@ pub async fn run_session(server: String, machine_id: String, secret: String, ses
     }
     .await;
     stop.store(true, Ordering::Relaxed);
+    direct.broken();
     let _ = sink.close().await;
     result
+}
+
+/// Messages only the relay may send: never taken from the direct path.
+fn relay_only(m: &SessionMsg) -> bool {
+    matches!(
+        m,
+        SessionMsg::Closed { .. }
+            | SessionMsg::SetViewOnly { .. }
+            | SessionMsg::ViewMode { .. }
+            | SessionMsg::DirectInfo { .. }
+            | SessionMsg::DirectOffer { .. }
+            | SessionMsg::PathSwitch { .. }
+            | SessionMsg::Hello { .. }
+    )
+}
+
+/// What the viewer sends, from either path. The helper checks the mode
+/// itself: on the direct path the relay can't.
+struct ViewerInput {
+    view_only: bool,
+    clip: Arc<std::sync::Mutex<ClipboardSync>>,
+    clip_view_only: Arc<AtomicBool>,
+    files: crate::files::FileService,
+    file_out: tokio::sync::mpsc::Sender<Message>,
+    cmd_tx: std::sync::mpsc::Sender<SessionMsg>,
+}
+
+impl ViewerInput {
+    async fn message(&mut self, m: SessionMsg) {
+        if let SessionMsg::Clipboard { text } = m {
+            // Done before later messages go on, so the Ctrl+V that follows
+            // pastes this text.
+            if !self.view_only {
+                let clip = self.clip.clone();
+                let _ = tokio::task::spawn_blocking(move || clip.lock().unwrap().receive(text)).await;
+            }
+            return;
+        }
+        if m.is_file_request() {
+            // Files only in control sessions (the relay checks too).
+            if !self.view_only {
+                self.files.handle(m, &self.file_out).await;
+            }
+            return;
+        }
+        // Input is dropped by the screen thread while view-only.
+        let _ = self.cmd_tx.send(m);
+    }
+
+    async fn binary(&mut self, b: &[u8]) {
+        if !self.view_only
+            && let Some((c, data)) = crate::proto::FileChunk::decode(b)
+            && let Some(reply) = self.files.chunk(c, data)
+        {
+            let _ = self.file_out.send(crate::direct::json(&reply)).await;
+        }
+    }
 }
 
 /// Capture + encode loop on its own thread (screen APIs are not async).
@@ -431,248 +531,326 @@ pub fn run_screen(
     // one, so everything is sent again once the screen is still.
     let mut repaint_for_palette = false;
 
-    while !stop.load(Ordering::Relaxed) {
-        loop {
-            let now = Instant::now();
-            let msg = if now >= next_look {
-                match rx.try_recv() {
-                    Ok(m) => m,
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
-                }
-            } else {
-                match rx.recv_timeout(next_look - now) {
-                    Ok(m) => m,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-                }
-            };
-            match msg {
-                SessionMsg::Quality { quality: q } => {
-                    quality = q.clamped();
-                    encoders.iter_mut().for_each(|e| e.reset());
-                    prev_raw.iter_mut().for_each(|p| *p = None);
-                }
-                SessionMsg::SetViewOnly { view_only: v } => view_only = v,
-                SessionMsg::Input { event } => {
-                    let now = Instant::now();
-                    idle.activity(now);
-                    if !view_only {
-                        last_input = Some(now);
-                        if let Err(e) = desk.input(&monitors, &event) {
-                            log::debug!("input: {e}");
-                        }
+    // Keys and buttons pressed here and not let go yet: released when input
+    // may have been lost (direct path broke), the session turns view-only,
+    // or it ends, so nothing stays stuck down on this computer.
+    let mut held = HeldInput::default();
+    // (A closure so every way out of the loop ends up below.)
+    let mut session = || {
+        while !stop.load(Ordering::Relaxed) {
+            loop {
+                let now = Instant::now();
+                let msg = if now >= next_look {
+                    match rx.try_recv() {
+                        Ok(m) => m,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
                     }
-                    next_look = next_look.min(after_input(now, last_look));
-                }
-                SessionMsg::Ack { seq: s } => flow.acked(s, Instant::now()),
-                SessionMsg::Refresh => {
-                    encoders.iter_mut().for_each(|e| e.reset());
-                    prev_raw.iter_mut().for_each(|p| *p = None);
-                    pointer.resend();
-                }
-                SessionMsg::Watch { monitors: w } => {
-                    // Screens that come back into view get a complete picture.
-                    for (i, m) in monitors.iter().enumerate() {
-                        let was = watch.as_ref().is_none_or(|v| v.contains(&m.index));
-                        if !was && w.contains(&m.index) {
-                            encoders[i].reset();
-                            prev_raw[i] = None;
-                        }
+                } else {
+                    match rx.recv_timeout(next_look - now) {
+                        Ok(m) => m,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                     }
-                    watch = Some(w);
-                    idle.activity(Instant::now());
-                }
-                SessionMsg::PointerMode { local } => {
-                    // Only if this system can tell where the pointer is.
-                    let on = local && desk.pointer().is_some();
-                    if on != pointer.on {
-                        pointer = PointerSender { on, ..PointerSender::default() };
-                        desk.set_pointer_in_picture(!on);
-                        // Pictures with / without the pointer drawn in.
+                };
+                match msg {
+                    SessionMsg::Quality { quality: q } => {
+                        quality = q.clamped();
                         encoders.iter_mut().for_each(|e| e.reset());
                         prev_raw.iter_mut().for_each(|p| *p = None);
                     }
+                    SessionMsg::SetViewOnly { view_only: v } => {
+                        view_only = v;
+                        if v {
+                            // Its let-go would be dropped from now on.
+                            release_held(desk.as_mut(), &monitors, &mut held);
+                        }
+                    }
+                    SessionMsg::Input { event } => {
+                        let now = Instant::now();
+                        idle.activity(now);
+                        if !view_only {
+                            last_input = Some(now);
+                            held.note(&event);
+                            if let Err(e) = desk.input(&monitors, &event) {
+                                log::debug!("input: {e}");
+                            }
+                        }
+                        next_look = next_look.min(after_input(now, last_look));
+                    }
+                    SessionMsg::Ack { seq: s } => flow.acked(s, Instant::now()),
+                    // (From `run_session`.) The direct path broke: pictures on it
+                    // are lost, so don't wait for their acks; send everything again.
+                    SessionMsg::PathSwitch { direct: false } => {
+                        // Input on its way was lost too, maybe a key's let-go.
+                        release_held(desk.as_mut(), &monitors, &mut held);
+                        flow.forget_in_flight();
+                        encoders.iter_mut().for_each(|e| e.reset());
+                        prev_raw.iter_mut().for_each(|p| *p = None);
+                        pointer.resend();
+                    }
+                    SessionMsg::Refresh => {
+                        encoders.iter_mut().for_each(|e| e.reset());
+                        prev_raw.iter_mut().for_each(|p| *p = None);
+                        pointer.resend();
+                    }
+                    SessionMsg::Watch { monitors: w } => {
+                        // Screens that come back into view get a complete picture.
+                        for (i, m) in monitors.iter().enumerate() {
+                            let was = watch.as_ref().is_none_or(|v| v.contains(&m.index));
+                            if !was && w.contains(&m.index) {
+                                encoders[i].reset();
+                                prev_raw[i] = None;
+                            }
+                        }
+                        watch = Some(w);
+                        idle.activity(Instant::now());
+                    }
+                    SessionMsg::PointerMode { local } => {
+                        // Only if this system can tell where the pointer is.
+                        let on = local && desk.pointer().is_some();
+                        if on != pointer.on {
+                            pointer = PointerSender { on, ..PointerSender::default() };
+                            desk.set_pointer_in_picture(!on);
+                            // Pictures with / without the pointer drawn in.
+                            encoders.iter_mut().for_each(|e| e.reset());
+                            prev_raw.iter_mut().for_each(|p| *p = None);
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
-        if stop.load(Ordering::Relaxed) {
-            return;
-        }
-        let start = Instant::now();
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let start = Instant::now();
 
-        if last_monitor_check.elapsed() > Duration::from_secs(3) {
-            last_monitor_check = Instant::now();
-            if let Ok(now) = desk.monitors()
-                && now != monitors
-            {
-                monitors = now;
-                encoders = monitors.iter().map(|_| MonitorEncoder::default()).collect();
-                prev_raw = monitors.iter().map(|_| None).collect();
-                last_change = monitors.iter().map(|_| Instant::now()).collect();
-                if !send_json(&SessionMsg::Monitors { monitors: monitors.clone() }) {
+            if last_monitor_check.elapsed() > Duration::from_secs(3) {
+                last_monitor_check = Instant::now();
+                if let Ok(now) = desk.monitors()
+                    && now != monitors
+                {
+                    monitors = now;
+                    encoders = monitors.iter().map(|_| MonitorEncoder::default()).collect();
+                    prev_raw = monitors.iter().map(|_| None).collect();
+                    last_change = monitors.iter().map(|_| Instant::now()).collect();
+                    if !send_json(&SessionMsg::Monitors { monitors: monitors.clone() }) {
+                        return;
+                    }
+                }
+            }
+
+            // The pointer goes on its own, small and quick, whatever the pictures do.
+            let moved = pointer.step(desk.as_mut(), start);
+            if !moved.is_empty() {
+                idle.activity(start);
+                if !moved.iter().all(send_json) {
                     return;
                 }
             }
-        }
 
-        // The pointer goes on its own, small and quick, whatever the pictures do.
-        let moved = pointer.step(desk.as_mut(), start);
-        if !moved.is_empty() {
-            idle.activity(start);
-            if !moved.iter().all(send_json) {
-                return;
-            }
-        }
-
-        // Flow control: only so many pictures on the way (see `FlowControl`).
-        if !flow.can_send(start) {
-            next_look = start + Duration::from_millis(5);
-            continue;
-        }
-
-        let optimised = quality.color == crate::quality::ColorDepth::Optimized && quality.codec != crate::quality::Codec::Jpeg;
-        if optimised {
-            repaint_for_palette |= learner.step(start);
-            if repaint_for_palette && last_change.iter().all(|t| t.elapsed() >= PALETTE_REPAINT_AFTER) {
-                repaint_for_palette = false;
-                encoders.iter_mut().for_each(|e| e.reset());
-                prev_raw.iter_mut().for_each(|p| *p = None);
-                idle.activity(start); // look now, not at the idle pace
-            }
-        } else {
-            repaint_for_palette = false;
-        }
-
-        // Auto quality: parts first sent as rough JPEG (photos, video) are
-        // sent again sharp once that screen has been still for a moment.
-        let mut refined = false;
-        for (i, m) in monitors.iter().enumerate() {
-            if watch.as_ref().is_some_and(|w| !w.contains(&m.index))
-                || !encoders[i].needs_refine()
-                || last_change[i].elapsed() < REFINE_AFTER
-            {
+            // Flow control: only so many pictures on the way (see `FlowControl`).
+            if !flow.can_send(start) {
+                next_look = start + Duration::from_millis(5);
                 continue;
             }
-            seq = seq.wrapping_add(1).max(1);
-            match encoders[i].refine(&quality, m.index, seq) {
-                Ok(msgs) => {
-                    for msg in msgs {
-                        refined = true;
-                        if tx.blocking_send(Message::Binary(msg.into())).is_err() {
-                            return;
-                        }
-                    }
-                }
-                Err(e) => log::warn!("encode: {e}"),
-            }
-        }
-        if refined {
-            flow.sent(seq, Instant::now());
-            next_look = Instant::now();
-            continue; // flow control first, then look at the screen again
-        }
 
-        // Nothing changed on screen (X11 tells us), and no safety re-check is
-        // due: don't even read the screen.
-        let now = Instant::now();
-        // After a reset (new palette, refresh...) the next picture is sent whole.
-        let reset = monitors
-            .iter()
-            .zip(&encoders)
-            .any(|(m, e)| e.is_reset() && watch.as_ref().is_none_or(|w| w.contains(&m.index)));
-        let changed = desk.changed() || reset;
-        if !changed && !idle.recheck_due(now) {
-            let regular = idle.interval(&quality, now);
-            next_look = next_after(start, look_interval(regular, last_input.map(|t| now.duration_since(t)), None), &pointer);
-            continue;
-        }
-        idle.checked(now);
-        last_look = now;
-
-        seq = seq.wrapping_add(1).max(1);
-        let mut sent_any = false;
-        let (mut capture_time, mut encode_time) = (Duration::ZERO, Duration::ZERO);
-        for (i, m) in monitors.iter().enumerate() {
-            if watch.as_ref().is_some_and(|w| !w.contains(&m.index)) {
-                continue; // nobody is looking at this screen
-            }
-            let t_capture = Instant::now();
-            let captured = desk.capture(m);
-            capture_time += t_capture.elapsed();
-            let t_encode = Instant::now();
-            let frame = match captured {
-                Ok(f) => {
-                    errors = 0;
-                    f
+            let optimised = quality.color == crate::quality::ColorDepth::Optimized && quality.codec != crate::quality::Codec::Jpeg;
+            if optimised {
+                repaint_for_palette |= learner.step(start);
+                if repaint_for_palette && last_change.iter().all(|t| t.elapsed() >= PALETTE_REPAINT_AFTER) {
+                    repaint_for_palette = false;
+                    encoders.iter_mut().for_each(|e| e.reset());
+                    prev_raw.iter_mut().for_each(|p| *p = None);
+                    idle.activity(start); // look now, not at the idle pace
                 }
-                Err(e) => {
-                    errors += 1;
-                    log::debug!("capture: {e}");
-                    if errors > 10 {
-                        std::thread::sleep(Duration::from_millis(500));
-                        if let Ok(mut d) = open() {
-                            d.set_pointer_in_picture(!pointer.on);
-                            desk = d;
-                            pointer.resend();
-                        }
-                        errors = 0;
-                    }
+            } else {
+                repaint_for_palette = false;
+            }
+
+            // Auto quality: parts first sent as rough JPEG (photos, video) are
+            // sent again sharp once that screen has been still for a moment.
+            let mut refined = false;
+            for (i, m) in monitors.iter().enumerate() {
+                if watch.as_ref().is_some_and(|w| !w.contains(&m.index))
+                    || !encoders[i].needs_refine()
+                    || last_change[i].elapsed() < REFINE_AFTER
+                {
                     continue;
                 }
-            };
-            let prepared = if quality.scale_pct >= 100 {
-                frame // nothing to prepare (colours are reduced per part); the encoder skips unchanged parts itself
-            } else {
-                if prev_raw[i].as_ref() == Some(&frame) {
-                    continue; // identical picture: skip scaling and compression
-                }
-                let prepared = prepare(&frame, &quality);
-                prev_raw[i] = Some(frame);
-                prepared
-            };
-            encoders[i].tight = flow.far() || spare.check(now);
-            if optimised {
-                learner.observe(&prepared, start);
-                if learner.palette().is_none() {
-                    learner.step(start); // the first palette, before the first picture
-                }
-                encoders[i].palette = learner.palette();
-            } else {
-                encoders[i].palette = None;
-            }
-            let encoded = encoders[i].encode(prepared, &quality, m.index, seq);
-            encode_time += t_encode.elapsed();
-            match encoded {
-                Ok(msgs) => {
-                    if !msgs.is_empty() {
-                        last_change[i] = Instant::now();
-                    }
-                    for msg in msgs {
-                        sent_any = true;
-                        if tx.blocking_send(Message::Binary(msg.into())).is_err() {
-                            return;
+                seq = seq.wrapping_add(1).max(1);
+                match encoders[i].refine(&quality, m.index, seq) {
+                    Ok(msgs) => {
+                        for msg in msgs {
+                            refined = true;
+                            if tx.blocking_send(Message::Binary(msg.into())).is_err() {
+                                return;
+                            }
                         }
                     }
+                    Err(e) => log::warn!("encode: {e}"),
                 }
-                Err(e) => log::warn!("encode: {e}"),
             }
-        }
-        if sent_any {
-            flow.sent(seq, Instant::now());
-            idle.activity(Instant::now());
-            timing.picture(capture_time, encode_time);
-            if let Some(t) = timing.report(Instant::now(), &mut flow)
-                && !send_json(&t)
-            {
-                return;
+            if refined {
+                flow.sent(seq, Instant::now());
+                next_look = Instant::now();
+                continue; // flow control first, then look at the screen again
             }
+
+            // Nothing changed on screen (X11 tells us), and no safety re-check is
+            // due: don't even read the screen.
+            let now = Instant::now();
+            // After a reset (new palette, refresh...) the next picture is sent whole.
+            let reset = monitors
+                .iter()
+                .zip(&encoders)
+                .any(|(m, e)| e.is_reset() && watch.as_ref().is_none_or(|w| w.contains(&m.index)));
+            let changed = desk.changed() || reset;
+            if !changed && !idle.recheck_due(now) {
+                let regular = idle.interval(&quality, now);
+                next_look = next_after(start, look_interval(regular, last_input.map(|t| now.duration_since(t)), None), &pointer);
+                continue;
+            }
+            idle.checked(now);
+            last_look = now;
+
+            seq = seq.wrapping_add(1).max(1);
+            let mut sent_any = false;
+            let (mut capture_time, mut encode_time) = (Duration::ZERO, Duration::ZERO);
+            for (i, m) in monitors.iter().enumerate() {
+                if watch.as_ref().is_some_and(|w| !w.contains(&m.index)) {
+                    continue; // nobody is looking at this screen
+                }
+                let t_capture = Instant::now();
+                let captured = desk.capture(m);
+                capture_time += t_capture.elapsed();
+                let t_encode = Instant::now();
+                let frame = match captured {
+                    Ok(f) => {
+                        errors = 0;
+                        f
+                    }
+                    Err(e) => {
+                        errors += 1;
+                        log::debug!("capture: {e}");
+                        if errors > 10 {
+                            std::thread::sleep(Duration::from_millis(500));
+                            if let Ok(mut d) = open() {
+                                d.set_pointer_in_picture(!pointer.on);
+                                desk = d;
+                                pointer.resend();
+                            }
+                            errors = 0;
+                        }
+                        continue;
+                    }
+                };
+                let prepared = if quality.scale_pct >= 100 {
+                    frame // nothing to prepare (colours are reduced per part); the encoder skips unchanged parts itself
+                } else {
+                    if prev_raw[i].as_ref() == Some(&frame) {
+                        continue; // identical picture: skip scaling and compression
+                    }
+                    let prepared = prepare(&frame, &quality);
+                    prev_raw[i] = Some(frame);
+                    prepared
+                };
+                encoders[i].tight = flow.far() || spare.check(now);
+                if optimised {
+                    learner.observe(&prepared, start);
+                    if learner.palette().is_none() {
+                        learner.step(start); // the first palette, before the first picture
+                    }
+                    encoders[i].palette = learner.palette();
+                } else {
+                    encoders[i].palette = None;
+                }
+                let encoded = encoders[i].encode(prepared, &quality, m.index, seq);
+                encode_time += t_encode.elapsed();
+                match encoded {
+                    Ok(msgs) => {
+                        if !msgs.is_empty() {
+                            last_change[i] = Instant::now();
+                        }
+                        for msg in msgs {
+                            sent_any = true;
+                            if tx.blocking_send(Message::Binary(msg.into())).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => log::warn!("encode: {e}"),
+                }
+            }
+            if sent_any {
+                flow.sent(seq, Instant::now());
+                idle.activity(Instant::now());
+                timing.picture(capture_time, encode_time);
+                if let Some(t) = timing.report(Instant::now(), &mut flow)
+                    && !send_json(&t)
+                {
+                    return;
+                }
+            }
+            let now = Instant::now();
+            let regular = idle.interval(&quality, now);
+            let interval = look_interval(regular, last_input.map(|t| now.duration_since(t)), Some(now.duration_since(start)));
+            next_look = next_after(start, interval, &pointer);
         }
-        let now = Instant::now();
-        let regular = idle.interval(&quality, now);
-        let interval = look_interval(regular, last_input.map(|t| now.duration_since(t)), Some(now.duration_since(start)));
-        next_look = next_after(start, interval, &pointer);
+    };
+    session();
+    release_held(desk.as_mut(), &monitors, &mut held);
+}
+
+/// Keys and mouse buttons the viewer pressed and has not let go of yet.
+#[derive(Default, Debug)]
+pub struct HeldInput {
+    keys: Vec<String>,
+    buttons: Vec<crate::proto::MouseButton>,
+    /// Where the pointer last was (monitor, x, y), to let buttons go there.
+    at: Option<(u8, f32, f32)>,
+}
+
+impl HeldInput {
+    pub fn note(&mut self, ev: &crate::proto::InputEvent) {
+        use crate::proto::InputEvent;
+        match ev {
+            InputEvent::Key { key, down: true } => {
+                if !self.keys.contains(key) {
+                    self.keys.push(key.clone());
+                }
+            }
+            InputEvent::Key { key, down: false } => self.keys.retain(|k| k != key),
+            InputEvent::MouseMove { mon, x, y } => self.at = Some((*mon, *x, *y)),
+            InputEvent::MouseButton { mon, x, y, button, down } => {
+                self.at = Some((*mon, *x, *y));
+                self.buttons.retain(|b| b != button);
+                if *down {
+                    self.buttons.push(*button);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The let-go events for everything still held (newest first), and
+    /// forget it.
+    pub fn release(&mut self) -> Vec<crate::proto::InputEvent> {
+        use crate::proto::InputEvent;
+        let (mon, x, y) = self.at.unwrap_or((0, 0.5, 0.5));
+        let buttons = self.buttons.drain(..).rev().map(|button| InputEvent::MouseButton { mon, x, y, button, down: false });
+        let keys = self.keys.drain(..).rev().map(|key| InputEvent::Key { key, down: false });
+        buttons.chain(keys).collect()
+    }
+}
+
+/// Let go of everything still held on this computer.
+fn release_held(desk: &mut dyn Desktop, monitors: &[MonitorInfo], held: &mut HeldInput) {
+    for ev in held.release() {
+        log::debug!("letting go of {ev:?}");
+        if let Err(e) = desk.input(monitors, &ev) {
+            log::debug!("input: {e}");
+        }
     }
 }
 
@@ -797,6 +975,11 @@ impl FlowControl {
 
     pub fn window(&self) -> usize {
         self.window
+    }
+
+    /// Pictures on the way were lost (the path they took broke).
+    pub fn forget_in_flight(&mut self) {
+        self.in_flight.clear();
     }
 
     /// Average round trip (picture sent → its ack back) since the last call,
@@ -1349,6 +1532,104 @@ mod tests {
         fn pointer_image(&mut self) -> Option<crate::desktop::PointerImage> {
             self.inner.pointer_image()
         }
+    }
+
+    /// The pretend computer, noting the input it was given.
+    struct Recording {
+        inner: TestPattern,
+        input: Arc<std::sync::Mutex<Vec<crate::proto::InputEvent>>>,
+    }
+
+    impl Desktop for Recording {
+        fn monitors(&mut self) -> Result<Vec<MonitorInfo>> {
+            self.inner.monitors()
+        }
+        fn capture(&mut self, m: &MonitorInfo) -> Result<Frame> {
+            self.inner.capture(m)
+        }
+        fn input(&mut self, m: &[MonitorInfo], ev: &crate::proto::InputEvent) -> Result<()> {
+            self.input.lock().unwrap().push(ev.clone());
+            self.inner.input(m, ev)
+        }
+    }
+
+    /// Run the screen loop on a [`Recording`] desktop: `script` = messages
+    /// with a pause after each; returns all input it applied (the session
+    /// ends after the script).
+    fn input_applied(script: Vec<SessionMsg>) -> Vec<crate::proto::InputEvent> {
+        let input = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let i2 = input.clone();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(1024);
+        let th = std::thread::spawn(move || {
+            let open = move || -> Result<Box<dyn Desktop>> { Ok(Box::new(Recording { inner: TestPattern::new(&[(800, 600)]), input: i2.clone() })) };
+            run_screen(&open, false, cmd_rx, out_tx, Arc::new(AtomicBool::new(false)))
+        });
+        let drain = std::thread::spawn(move || while out_rx.blocking_recv().is_some() {});
+        cmd_tx.send(SessionMsg::Quality { quality: Quality::preset(Preset::Fast) }).unwrap();
+        for m in script {
+            cmd_tx.send(m).unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        drop(cmd_tx); // the session ends
+        th.join().unwrap();
+        drain.join().unwrap();
+        let input = input.lock().unwrap().clone();
+        input
+    }
+
+    #[test]
+    fn held_input_is_remembered_and_let_go_newest_first() {
+        use crate::proto::{InputEvent, MouseButton};
+        let key = |k: &str, down| InputEvent::Key { key: k.into(), down };
+        let mut h = HeldInput::default();
+        assert!(h.release().is_empty());
+        for ev in [
+            key("Shift", true),
+            key("Control", true),
+            key("a", true),
+            key("a", false),
+            key("Shift", true), // auto-repeat: still once
+            InputEvent::MouseButton { mon: 1, x: 0.2, y: 0.3, button: MouseButton::Left, down: true },
+            InputEvent::MouseMove { mon: 1, x: 0.6, y: 0.7 },
+            InputEvent::Text { text: "x".into() },
+        ] {
+            h.note(&ev);
+        }
+        assert_eq!(
+            h.release(),
+            vec![
+                InputEvent::MouseButton { mon: 1, x: 0.6, y: 0.7, button: MouseButton::Left, down: false },
+                key("Control", false),
+                key("Shift", false),
+            ],
+            "the drag ends where the pointer is now"
+        );
+        assert!(h.release().is_empty(), "forgotten once let go");
+    }
+
+    #[test]
+    fn held_keys_are_let_go_when_the_direct_path_breaks() {
+        use crate::proto::InputEvent;
+        let shift = |down| SessionMsg::Input { event: InputEvent::Key { key: "Shift".into(), down } };
+        let applied = input_applied(vec![shift(true), SessionMsg::PathSwitch { direct: false }]);
+        assert_eq!(applied.last(), Some(&InputEvent::Key { key: "Shift".into(), down: false }), "{applied:?}");
+        assert_eq!(applied.len(), 2, "let go once, not again at the end: {applied:?}");
+        // Nothing held: a broken path changes nothing.
+        let applied = input_applied(vec![shift(true), shift(false), SessionMsg::PathSwitch { direct: false }]);
+        assert_eq!(applied.len(), 2);
+    }
+
+    #[test]
+    fn held_input_is_let_go_when_the_session_ends_or_turns_view_only() {
+        use crate::proto::{InputEvent, MouseButton};
+        let press = SessionMsg::Input { event: InputEvent::MouseButton { mon: 0, x: 0.5, y: 0.5, button: MouseButton::Left, down: true } };
+        let up = InputEvent::MouseButton { mon: 0, x: 0.5, y: 0.5, button: MouseButton::Left, down: false };
+        let applied = input_applied(vec![press.clone()]);
+        assert_eq!(applied.last(), Some(&up), "the viewer left mid-drag: {applied:?}");
+        let applied = input_applied(vec![press, SessionMsg::SetViewOnly { view_only: true }]);
+        assert_eq!(applied.last(), Some(&up), "its let-go would be dropped in view-only: {applied:?}");
+        assert_eq!(applied.len(), 2);
     }
 
     #[test]

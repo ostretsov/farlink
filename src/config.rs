@@ -236,6 +236,26 @@ pub struct ServerConfig {
     /// updates only (`farlink-server publish`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_from_github: Option<String>,
+    /// UDP port of the STUN answerer that lets viewers and helpers connect
+    /// directly (peer-to-peer, see `crate::direct`); `0` = direct connections
+    /// off, everything goes through this relay.
+    #[serde(default = "default_stun_port")]
+    pub stun_port: u16,
+    /// Public STUN servers (`host:port`) viewers and helpers also ask, to
+    /// tell a "hard" NAT (a new port for every destination: hole punching
+    /// can't work, so they stay on the relay). Empty: only this relay is
+    /// asked, and hard NATs just fail to connect directly after a few seconds.
+    /// These servers see the public addresses of viewers and helpers.
+    #[serde(default = "default_extra_stun")]
+    pub extra_stun_servers: Vec<String>,
+}
+
+fn default_stun_port() -> u16 {
+    crate::stun::DEFAULT_PORT
+}
+
+pub fn default_extra_stun() -> Vec<String> {
+    vec!["stun.cloudflare.com:3478".into(), "stun.l.google.com:19302".into()]
 }
 
 /// Where the server's HTTPS certificate comes from.
@@ -270,6 +290,8 @@ impl Default for ServerConfig {
             releases_dir: PathBuf::from("farlink-data/releases"),
             tls: Tls::Off,
             update_from_github: None,
+            stun_port: crate::stun::DEFAULT_PORT,
+            extra_stun_servers: default_extra_stun(),
         }
     }
 }

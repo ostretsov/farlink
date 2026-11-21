@@ -21,11 +21,28 @@ struct TestServer {
 }
 
 async fn start_server() -> TestServer {
+    start_server_with(|_| {}).await
+}
+
+async fn start_server_with(change: impl FnOnce(&mut ServerConfig)) -> TestServer {
     let dir = farlink::util::unique_temp_dir("farlink-e2e");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let url = format!("http://{addr}");
-    let cfg = ServerConfig { public_url: url.clone(), bind: addr.to_string(), data_dir: dir.clone(), releases_dir: dir.join("releases"), ..Default::default() };
+    // Its own STUN port (tests run side by side).
+    let stun_port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let cfg = ServerConfig {
+        public_url: url.clone(),
+        bind: addr.to_string(),
+        data_dir: dir.clone(),
+        releases_dir: dir.join("releases"),
+        stun_port,
+        // Never the internet from tests.
+        extra_stun_servers: Vec::new(),
+        ..Default::default()
+    };
+    let mut cfg = cfg;
+    change(&mut cfg);
     let (relay, pw) = Relay::new(cfg).unwrap();
     let pw = pw.expect("first start creates a password");
     tokio::spawn(farlink::server::serve(relay.clone(), listener));
@@ -62,6 +79,7 @@ async fn next_json<T: serde::de::DeserializeOwned>(ws: &mut Ws) -> T {
         // Mode notices from the relay are checked separately (next_mode).
         if let Message::Text(t) = msg
             && !t.contains(r#""t":"view_mode""#)
+            && !t.contains(r#""t":"direct_"#)
         {
             return serde_json::from_str(&t).unwrap();
         }
@@ -887,6 +905,8 @@ async fn https_with_certificate_files() {
         releases_dir: dir.join("releases"),
         tls: tls.clone(),
         update_from_github: None,
+        stun_port: 0,
+        extra_stun_servers: Vec::new(),
     };
     let (relay, _) = Relay::new(cfg).unwrap();
     let tls_listener = farlink::tls::listen(listener, &tls, &dir).unwrap();
@@ -1346,4 +1366,176 @@ async fn a_new_password_ends_that_persons_open_screens() {
     assert!(reason.contains("password was changed"), "{reason}");
     let api = farlink::net::Api { server: s.url.clone(), token: anna };
     assert!(blocking(move || api.overview().is_err()).await, "old sign-in is gone too");
+}
+
+/// A real helper comes online; returns its machine id.
+async fn real_helper(s: &TestServer) -> String {
+    let cfg_dir = farlink::util::unique_temp_dir("farlink-e2e-direct");
+    let cfg = HostConfig { server_url: s.url.clone(), enroll_token: Some(s.relay.enroll_token()), machine_id: None, secret: None };
+    tokio::spawn(run_agent(cfg_dir.join("host.json"), cfg, HostOptions { demo: true, no_update: true }));
+    for _ in 0..100 {
+        if let Some(m) = s.overview().await.machines.iter().find(|m| m.online) {
+            return m.machine.id.clone();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("helper never came online");
+}
+
+/// Wait until `check` holds for the viewer's session state.
+async fn wait_for(h: &farlink::net::SessionHandle, what: &str, check: impl Fn(&farlink::net::SessionShared) -> bool) {
+    for _ in 0..300 {
+        if check(&h.shared.lock().unwrap()) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let sh = h.shared.lock().unwrap();
+    panic!("{what}: never happened (route {:?}, state {:?})", sh.route, sh.state);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_viewer_goes_direct_to_real_helper() {
+    use farlink::net::{ConnState, Route, SessionHandle, Target};
+    let s = start_server().await;
+    let machine = real_helper(&s).await;
+    let target = Target::Admin { server: s.url.clone(), token: s.admin.clone(), machine_id: machine.clone(), view_only: false };
+    let q = farlink::quality::Quality::preset(farlink::quality::Preset::Fast);
+    let h = SessionHandle::start(target, q, false, std::sync::Arc::new(|| {}));
+    wait_for(&h, "session live", |sh| sh.state == ConnState::Live).await;
+    wait_for(&h, "direct path", |sh| sh.route.is_direct()).await;
+    let Route::Direct { peer, .. } = h.shared.lock().unwrap().route.clone() else { panic!() };
+    assert!(peer.ip().is_loopback(), "{peer}");
+    assert_eq!(h.shared.lock().unwrap().route.short(), "direct (LAN)");
+
+    // Pictures keep coming over the direct path: ask for everything again.
+    for c in h.shared.lock().unwrap().canvases.values_mut() {
+        *c = Default::default();
+    }
+    h.send(SessionMsg::Refresh);
+    wait_for(&h, "both screens over the direct path", |sh| sh.canvases.values().filter(|c| c.frame.is_some()).count() == 2).await;
+    // The host's round trip is measured there too.
+    wait_for(&h, "timing", |sh| sh.latency.total_ms().is_some()).await;
+    // The relay knows (web admin's sessions list).
+    let mut direct_seen = false;
+    for _ in 0..50 {
+        if s.overview().await.sessions.first().is_some_and(|x| x["direct"] == true) {
+            direct_seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(direct_seen, "sessions list shows the direct path");
+
+    // The relay is still in charge: ending the session there ends it here.
+    let id = s.overview().await.sessions[0]["id"].as_str().unwrap().to_string();
+    let (url, admin) = (s.url.clone(), s.admin.clone());
+    blocking(move || {
+        ureq::post(format!("{url}/api/sessions/{id}/end")).header("Authorization", format!("Bearer {admin}")).send_empty().unwrap();
+    })
+    .await;
+    wait_for(&h, "closed by the relay", |sh| matches!(sh.state, ConnState::Closed(_))).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_broken_direct_path_falls_back_to_the_relay_and_comes_back() {
+    use farlink::net::{ConnState, Route, SessionHandle, Target};
+    let s = start_server().await;
+    let machine = real_helper(&s).await;
+    let target = Target::Admin { server: s.url.clone(), token: s.admin.clone(), machine_id: machine, view_only: false };
+    let h = SessionHandle::start(target, farlink::quality::Quality::preset(farlink::quality::Preset::Fast), false, std::sync::Arc::new(|| {}));
+    wait_for(&h, "direct path", |sh| sh.state == ConnState::Live && sh.route.is_direct()).await;
+
+    // The direct path breaks (here: the viewer drops it, as when its network changes).
+    h.send(SessionMsg::PathSwitch { direct: false });
+    wait_for(&h, "back on the relay", |sh| matches!(&sh.route, Route::Relay { why: Some(w), .. } if w.contains("broke"))).await;
+    // Pictures go on through the relay: the whole screen is sent again.
+    for c in h.shared.lock().unwrap().canvases.values_mut() {
+        *c = Default::default();
+    }
+    wait_for(&h, "pictures over the relay", |sh| sh.canvases.values().filter(|c| c.frame.is_some()).count() == 2).await;
+    assert!(!h.shared.lock().unwrap().route.is_direct());
+    let mut relay_seen = false;
+    for _ in 0..50 {
+        if s.overview().await.sessions.first().is_some_and(|x| x["direct"] == false) {
+            relay_seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(relay_seen, "the sessions list shows the relay again");
+
+    // A few seconds later the viewer tries again, and both go direct once more.
+    let broke = std::time::Instant::now();
+    wait_for(&h, "direct again", |sh| sh.route.is_direct()).await;
+    assert!(broke.elapsed() >= farlink::direct::RETRY_AFTER[0] - Duration::from_millis(500), "waited before trying again");
+    for c in h.shared.lock().unwrap().canvases.values_mut() {
+        *c = Default::default();
+    }
+    h.send(SessionMsg::Refresh);
+    wait_for(&h, "pictures over the new direct path", |sh| sh.canvases.values().filter(|c| c.frame.is_some()).count() == 2).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_stun_everything_stays_on_the_relay() {
+    use farlink::net::{ConnState, Route, SessionHandle, Target};
+    let s = start_server_with(|c| c.stun_port = 0).await;
+    let machine = real_helper(&s).await;
+    let target = Target::Admin { server: s.url.clone(), token: s.admin.clone(), machine_id: machine, view_only: false };
+    let h = SessionHandle::start(target, Default::default(), false, std::sync::Arc::new(|| {}));
+    wait_for(&h, "pictures", |sh| sh.state == ConnState::Live && sh.canvases.values().any(|c| c.frame.is_some())).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let route = h.shared.lock().unwrap().route.clone();
+    let Route::Relay { why: Some(why), .. } = route else { panic!("{route:?}") };
+    assert!(why.contains("allows no direct"), "{why}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn when_no_direct_path_works_the_session_stays_on_the_relay() {
+    let s = start_server().await;
+    let machine = real_helper(&s).await;
+    let url = s.ws(&format!("/ws/view/{machine}?token={}&view_only=0", s.admin));
+    let (mut viewer, _) = connect_async(url).await.unwrap();
+    // The helper offers its addresses; this viewer answers with one nobody
+    // listens on (as behind a firewall that drops UDP).
+    let mut offered = false;
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let fake = SessionMsg::DirectOffer { fp: "00".repeat(32), addrs: vec![silent.local_addr().unwrap()], hard_nat: false, attempt: 0 };
+    send(&mut viewer, &fake).await;
+    let mut q = farlink::quality::Quality::preset(farlink::quality::Preset::Fast);
+    q.max_fps = 30;
+    send(&mut viewer, &SessionMsg::Quality { quality: q }).await;
+    // Pictures keep coming over the relay the whole time the helper tries
+    // (and after it gave up), and it never switches.
+    let until = std::time::Instant::now() + farlink::direct::ESTABLISH_TIMEOUT + Duration::from_secs(2);
+    let mut pictures_late = 0;
+    while std::time::Instant::now() < until {
+        let msg = tokio::time::timeout(Duration::from_secs(5), viewer.next()).await.expect("the relay path stalled").unwrap().unwrap();
+        match msg {
+            Message::Binary(b) => {
+                if let Some((h, _)) = TileHeader::decode(&b)
+                    && h.is_last()
+                {
+                    send(&mut viewer, &SessionMsg::Ack { seq: h.seq }).await;
+                    if until.duration_since(std::time::Instant::now()) < Duration::from_secs(2) {
+                        pictures_late += 1;
+                    }
+                }
+                // Keep the screen changing so pictures keep coming.
+                let ev = InputEvent::MouseMove { mon: 0, x: rand_f(), y: 0.5 };
+                send(&mut viewer, &SessionMsg::Input { event: ev }).await;
+            }
+            Message::Text(t) => {
+                assert!(!t.contains("path_switch"), "never switched: {t}");
+                offered |= t.contains(r#""t":"direct_offer""#);
+            }
+            _ => {}
+        }
+    }
+    assert!(offered, "the helper tried");
+    assert!(pictures_late > 0, "still streaming after the direct attempt gave up");
+}
+
+fn rand_f() -> f32 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos() as f32 / 1e9
 }

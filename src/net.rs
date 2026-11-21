@@ -534,9 +534,12 @@ fn receive(shared: &Mutex<SessionShared>, msg: &Message, quality: &Quality) -> V
 /// How pictures reach this viewer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Route {
-    /// Through the Farlink server (the only way today: nothing goes
-    /// straight between the computers). `encrypted` = wss (HTTPS).
-    Relay { server: String, encrypted: bool },
+    /// Through the Farlink server. `encrypted` = wss (HTTPS); `why`: why
+    /// there is no direct path (`None`: not known yet).
+    Relay { server: String, encrypted: bool, why: Option<String> },
+    /// Straight to the remote computer at `peer` over QUIC (see
+    /// [`crate::direct`]); the server at `server` still watches over the session.
+    Direct { server: String, encrypted: bool, peer: std::net::SocketAddr },
     /// The pretend computer inside this program.
     Demo,
 }
@@ -547,23 +550,47 @@ impl Route {
         let encrypted = url.starts_with("wss://");
         let rest = url.split_once("://").map_or(url, |(_, r)| r);
         let server = rest.split(['/', '?']).next().unwrap_or(rest).to_string();
-        Route::Relay { server, encrypted }
+        Route::Relay { server, encrypted, why: None }
+    }
+
+    /// The route now, given the direct-path state.
+    pub fn with(&self, direct: &crate::direct::DirectState) -> Route {
+        let (server, encrypted) = match self {
+            Route::Relay { server, encrypted, .. } | Route::Direct { server, encrypted, .. } => (server.clone(), *encrypted),
+            Route::Demo => return Route::Demo,
+        };
+        match direct.remote() {
+            Some(peer) => Route::Direct { server, encrypted, peer },
+            None => Route::Relay { server, encrypted, why: direct.why_not().map(str::to_string) },
+        }
     }
 
     /// Short text for the screen window's bar.
     pub fn short(&self) -> &'static str {
         match self {
             Route::Relay { .. } => "via relay",
+            Route::Direct { peer, .. } if crate::direct::is_lan(peer.ip()) => "direct (LAN)",
+            Route::Direct { .. } => "direct (p2p)",
             Route::Demo => "local demo",
         }
+    }
+
+    pub fn is_direct(&self) -> bool {
+        matches!(self, Route::Direct { .. })
     }
 
     /// One line for the hover text.
     pub fn describe(&self) -> String {
         match self {
-            Route::Relay { server, encrypted } => format!(
-                "Connection: all traffic goes through the relay {server} ({}), no direct peer-to-peer path",
-                if *encrypted { "encrypted, HTTPS" } else { "NOT encrypted, plain HTTP" }
+            Route::Relay { server, encrypted, why } => format!(
+                "Connection: all traffic goes through the relay {server} ({}){}",
+                if *encrypted { "encrypted, HTTPS" } else { "NOT encrypted, plain HTTP" },
+                why.as_ref().map_or(String::new(), |w| format!("\nNo direct path: {w}"))
+            ),
+            Route::Direct { server, peer, .. } => format!(
+                "Connection: direct peer-to-peer to {peer} ({}), encrypted (QUIC, certificates exchanged through {server}). \
+                 The server only watches over the session",
+                if crate::direct::is_lan(peer.ip()) { "same local network" } else { "across the internet" }
             ),
             Route::Demo => "Connection: pretend computer inside this program (no network)".into(),
         }
@@ -841,41 +868,126 @@ async fn network_task(
         }
     };
     let (mut sink, mut stream) = ws.split();
+    let (mut direct, mut direct_events) = crate::direct::DirectState::new(true);
+    let server = Route::for_url(Some(&url));
+    let server_url = url.replacen("wss://", "https://", 1).replacen("ws://", "http://", 1);
+    let mut relay_ping = tokio::time::interval(crate::direct::RELAY_PING);
     loop {
+        // What to send (through `direct.send`: the direct path when in use).
+        let mut out: Vec<Message> = Vec::new();
+        // Signalling for the relay only.
+        let mut relay: Vec<SessionMsg> = Vec::new();
+        // From the host (either path): acked at once, then decoded.
+        let mut inbox: Vec<Message> = Vec::new();
+        let mut relay_ping_due = false;
         tokio::select! {
+            _ = relay_ping.tick() => relay_ping_due = true,
             msg = stream.next() => {
                 let msg = match msg {
                     Some(Ok(m)) => m,
                     Some(Err(_)) | None => { close("Connection lost".into()); break; }
                 };
                 if let Message::Close(_) = msg { close("Connection closed".into()); break; }
-                if let Some(ack) = ack_for(&msg)
-                    && sink.send(Message::Text(serde_json::to_string(&ack).unwrap().into())).await.is_err()
-                {
-                    close("Connection lost".into()); break;
+                match direct_signal(&msg) {
+                    Some(SessionMsg::DirectInfo { stun_port, stun_servers }) => direct.allowed(&server_url, stun_port, stun_servers),
+                    Some(SessionMsg::DirectOffer { fp, addrs, hard_nat, attempt }) => relay.extend(direct.offer(fp, addrs, hard_nat, attempt)),
+                    Some(SessionMsg::PathSwitch { direct: d }) => {
+                        if let Some(m) = direct.peer_switched(d) {
+                            relay.push(m);
+                            out.push(crate::direct::json(&SessionMsg::Refresh));
+                        }
+                    }
+                    _ => inbox.push(msg),
                 }
-                let replies = receive(&shared, &msg, &quality);
-                for r in replies {
-                    if sink.send(Message::Text(serde_json::to_string(&r).unwrap().into())).await.is_err() { break; }
+            }
+            msg = direct.recv() => match msg {
+                // Only pictures and the host's own messages: the relay's never come this way.
+                Ok(msg) => if direct_signal(&msg).is_none() && !relay_message(&msg) {
+                    inbox.push(msg);
+                },
+                Err(e) => {
+                    log::info!("direct connection lost: {e:#}");
+                    relay.extend(direct.broken());
+                    out.push(crate::direct::json(&SessionMsg::Refresh)); // pictures on the way are lost
                 }
-                repaint();
-                if matches!(shared.lock().unwrap().state, ConnState::Closed(_)) { break; }
+            },
+            Some(ev) = direct_events.recv() => {
+                relay.extend(match ev {
+                    crate::direct::Event::Bound(n, ep) => direct.bound(n, ep),
+                    crate::direct::Event::Linked(n, link) => direct.linked(n, link),
+                    crate::direct::Event::Retry(n) => { direct.retry(n); None }
+                    crate::direct::Event::NoAnswer(n) => { direct.no_answer(n); None }
+                });
             }
             cmd = rx.recv() => match cmd {
+                // From this program: leave the direct path, as if it broke
+                // (it is tried again later).
+                Some(SessionMsg::PathSwitch { direct: false }) => {
+                    relay.extend(direct.broken());
+                    out.push(crate::direct::json(&SessionMsg::Refresh));
+                }
                 Some(m) => {
                     if let SessionMsg::Quality { quality: q } = &m { quality = *q; }
-                    if sink.send(Message::Text(serde_json::to_string(&m).unwrap().into())).await.is_err() {
-                        close("Connection lost".into()); break;
-                    }
+                    out.push(crate::direct::json(&m));
                 }
                 None => { let _ = sink.close().await; break; }
             },
-            Some(m) = raw_rx.recv() => {
-                if sink.send(m).await.is_err() { close("Connection lost".into()); break; }
+            Some(m) = raw_rx.recv() => out.push(m),
+        }
+        let mut ok = true;
+        if relay_ping_due {
+            ok &= sink.send(Message::Ping(Default::default())).await.is_ok();
+        }
+        for m in &relay {
+            ok &= sink.send(crate::direct::json(m)).await.is_ok();
+        }
+        // Acks go out before decoding, so the host's round trip is the network's.
+        let acks: Vec<Message> = inbox.iter().filter_map(ack_for).map(|a| crate::direct::json(&a)).collect();
+        for m in acks.into_iter().chain(out) {
+            for m in direct.send(m).await {
+                ok &= sink.send(m).await.is_ok();
             }
         }
+        for msg in &inbox {
+            let replies = receive(&shared, msg, &quality);
+            for r in &replies {
+                for m in direct.send(crate::direct::json(r)).await {
+                    ok &= sink.send(m).await.is_ok();
+                }
+            }
+        }
+        if !ok {
+            close("Connection lost".into());
+            break;
+        }
+        let route = server.with(&direct);
+        {
+            let mut sh = shared.lock().unwrap();
+            if sh.route != route {
+                sh.route = route;
+            }
+        }
+        repaint();
+        if matches!(shared.lock().unwrap().state, ConnState::Closed(_)) { break; }
     }
+    direct.broken();
     repaint();
+}
+
+/// The direct-path messages the relay passes on (`None` for anything else).
+fn direct_signal(msg: &Message) -> Option<SessionMsg> {
+    let Message::Text(t) = msg else { return None };
+    let t = t.as_str();
+    if !(t.contains(r#""t":"direct_"#) || t.contains(r#""t":"path_switch""#)) {
+        return None;
+    }
+    serde_json::from_str(t).ok().filter(|m| matches!(m, SessionMsg::DirectInfo { .. } | SessionMsg::DirectOffer { .. } | SessionMsg::PathSwitch { .. }))
+}
+
+/// Messages only the relay sends (never taken from the direct path).
+fn relay_message(msg: &Message) -> bool {
+    let Message::Text(t) = msg else { return false };
+    matches!(serde_json::from_str::<SessionMsg>(t.as_str()), Ok(SessionMsg::Closed { .. } | SessionMsg::ViewMode { .. }))
 }
 
 /// Same as a network session but talking to a pretend two-screen computer
@@ -957,11 +1069,22 @@ mod tests {
     fn route_tells_relay_and_encryption() {
         assert_eq!(
             Route::for_url(Some("wss://rd.example.com/ws/view/m1?token=x")),
-            Route::Relay { server: "rd.example.com".into(), encrypted: true }
+            Route::Relay { server: "rd.example.com".into(), encrypted: true, why: None }
         );
-        assert_eq!(Route::for_url(Some("ws://10.0.0.5:8470/ws/guest/ab")), Route::Relay { server: "10.0.0.5:8470".into(), encrypted: false });
+        assert_eq!(
+            Route::for_url(Some("ws://10.0.0.5:8470/ws/guest/ab")),
+            Route::Relay { server: "10.0.0.5:8470".into(), encrypted: false, why: None }
+        );
         assert_eq!(Route::for_url(None), Route::Demo);
         assert!(Route::for_url(Some("ws://h/x")).describe().contains("NOT encrypted"));
+        let why = Route::Relay { server: "s".into(), encrypted: true, why: Some("the remote computer is behind a strict NAT".into()) };
+        assert_eq!(why.short(), "via relay");
+        assert!(why.describe().contains("No direct path: the remote computer is behind a strict NAT"));
+        let lan = Route::Direct { server: "s".into(), encrypted: true, peer: "192.168.1.9:4000".parse().unwrap() };
+        assert_eq!(lan.short(), "direct (LAN)");
+        assert!(lan.describe().contains("same local network"));
+        let p2p = Route::Direct { server: "s".into(), encrypted: true, peer: "203.0.113.9:4000".parse().unwrap() };
+        assert_eq!(p2p.short(), "direct (p2p)");
     }
 
     #[test]

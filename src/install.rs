@@ -275,6 +275,8 @@ pub fn server_linux_plan(
         releases_dir: data.join("releases"),
         tls,
         update_from_github: github.map(str::to_string),
+        stun_port: crate::stun::DEFAULT_PORT,
+        extra_stun_servers: crate::config::default_extra_stun(),
     };
     let mut steps = vec![
         Step::Mkdir("/opt/farlink-server".into()),
@@ -315,6 +317,8 @@ pub fn server_linux_plan(
         Step::run("systemctl", &["enable", "--now", "farlink-server.service"]),
         Step::run("systemctl", &["restart", "farlink-server.service"]),
         Step::try_run("ufw", &["allow", &format!("{port}/tcp")]),
+        // Direct connections: viewers and helpers ask here for their public address.
+        Step::try_run("ufw", &["allow", &format!("{}/udp", crate::stun::DEFAULT_PORT)]),
     ]);
     steps.extend(notes);
     if let Some(repo) = github {

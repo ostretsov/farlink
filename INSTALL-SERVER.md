@@ -14,7 +14,7 @@ Time needed: about 20 minutes.
 |---|---|
 | **A server** | Any small cloud server (VPS) with **Ubuntu 24.04** or **Debian 12**, 1 CPU, 1 GB memory, 10 GB disk is enough. You need to be able to log in to it with `ssh` as a user who can use `sudo`. |
 | **A domain name** | For example `remote.example.com`. You must be able to add a DNS record for it. |
-| **Open ports** | 443 (HTTPS). Nothing else — port 80 is not used. The remote computers never need open ports. If 443 is already taken, see *Port 443 is already in use* below. |
+| **Open ports** | 443 (HTTPS), and UDP 3478 for direct connections (optional, see *Direct connections* below). Port 80 is not used. The remote computers never need open ports. If 443 is already taken, see *Port 443 is already in use* below. |
 | **The Farlink release folder** | Built once on a Linux computer (step 2). |
 
 > Ubuntu 22.04 also works.
@@ -76,7 +76,7 @@ The installer:
 3. creates a `farlink` system user and a background service that starts with the server,
 4. sets the server up to speak **HTTPS itself**: on first start it gets a free Let's Encrypt certificate
    for your domain and renews it on its own (no Caddy or nginx needed),
-5. opens port 443 in the firewall (`ufw`).
+5. opens port 443 and UDP port 3478 in the firewall (`ufw`).
 
 ### Port 443 is already in use
 
@@ -137,6 +137,21 @@ control → how long. *Withdraw* ends it immediately.
 **Desktop app.** Download it from `https://remote.example.com/app`, enter the
 server address and your sign-in.
 
+**Direct connections.** Every session starts through this server. The desktop app and the computer
+then try to reach each other directly (same network, or through both routers: "hole punching") over
+encrypted QUIC; if that works the pictures stop going through the server. The bar of a screen window
+shows `direct (LAN)`, `direct (p2p)` or `via relay` (hover for why), and *Sessions* in the web admin
+shows the path. If no direct path works (strict NAT, UDP blocked) or it breaks later, everything simply
+stays on / goes back to the server. The server still decides who may connect and can end any session.
+
+* For this the server answers address questions on **UDP port 3478** (`"stun_port"` in
+  `/etc/farlink-server/config.json`; set it to `0` to switch direct connections off).
+* To tell a strict ("hard") NAT apart, the apps also ask `"extra_stun_servers"` (default:
+  `stun.cloudflare.com:3478`, `stun.l.google.com:19302`). Those companies then see the public addresses
+  of your computers and app users. Set it to `[]` to ask only your own server: direct connections still
+  work, only the reason shown for staying on the server is less exact.
+* The browser viewer always goes through the server.
+
 ---
 
 ## Updating everything
@@ -185,6 +200,7 @@ Everything (computers, people, links, passwords as secure hashes) is one file:
 | "Certificate" error in the browser | The certificate can only be fetched when the domain already points to the server and port 443 is open. Fix DNS/firewall, then `sudo systemctl restart farlink-server` and watch `journalctl -u farlink-server -f`. |
 | Server won't start: "listening on 0.0.0.0:443" | Something else uses port 443 (`sudo ss -ltnp 'sport = :443'`). Stop it, or see *Port 443 is already in use*. |
 | Logs | Server: `journalctl -u farlink-server -f`. Windows computers: `C:\ProgramData\Farlink\host.log`. Ubuntu computers: `~/.config/farlink/host.log`. |
+| Sessions never show `direct` | Open UDP 3478 on the server (`sudo ufw allow 3478/udp`, and in your hosting provider's firewall). Hover `via relay` in the app's screen window for the reason. Strict NATs (many mobile networks) can't connect directly: those sessions stay on the server. |
 | A computer shows *offline* | It is switched off, not connected to the internet, or (Ubuntu) nobody is signed in to the desktop. |
 | Install link stopped working | You pressed *New link*. Copy the current one from the web page. |
 

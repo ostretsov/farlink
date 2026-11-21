@@ -62,6 +62,10 @@ pub struct SessionView {
     pub who: String,
     pub view_only: bool,
     pub started: u64,
+    /// Pictures go straight from the computer to the viewer (peer-to-peer),
+    /// not through this relay.
+    #[serde(default)]
+    pub direct: bool,
     #[serde(skip)]
     pub grant: Option<String>,
     /// Person (user id) who opened it, if not the admin or a link.
@@ -88,6 +92,8 @@ pub struct Relay {
     update_status: Mutex<crate::server_update::UpdateStatus>,
     /// Wakes the update loop for a check right now.
     pub update_now: tokio::sync::Notify,
+    /// UDP port the STUN answerer runs on (0: not running = no direct connections).
+    stun_live: std::sync::atomic::AtomicU16,
     /// Preview requests waiting for the host: req -> (machine, answer).
     previews: Mutex<HashMap<u32, (String, oneshot::Sender<Vec<PreviewShot>>)>>,
     preview_seq: AtomicU32,
@@ -175,6 +181,7 @@ impl Relay {
             sha_cache: Mutex::new(HashMap::new()),
             update_status: Mutex::new(update_status),
             update_now: tokio::sync::Notify::new(),
+            stun_live: std::sync::atomic::AtomicU16::new(0),
             previews: Mutex::new(HashMap::new()),
             preview_seq: AtomicU32::new(1),
             preview_cache: Mutex::new(HashMap::new()),
@@ -382,7 +389,7 @@ impl Relay {
         };
         let (kill_tx, kill_rx) = watch::channel(None);
         let view =
-            SessionView { id: session_id.clone(), machine_id: machine_id.into(), who, view_only, started: now_secs(), grant, user };
+            SessionView { id: session_id.clone(), machine_id: machine_id.into(), who, view_only, started: now_secs(), direct: false, grant, user };
         self.sessions.lock().unwrap().insert(session_id.clone(), SessionEntry { view, kill: kill_tx });
         Ok((session_id, host, kill_rx))
     }
@@ -581,6 +588,15 @@ where
     ClientAddr: for<'a> axum::extract::connect_info::Connected<axum::serve::IncomingStream<'a, L>>,
 {
     spawn_housekeeping(relay.clone());
+    if relay.cfg.stun_port != 0 {
+        match tokio::net::UdpSocket::bind(("0.0.0.0", relay.cfg.stun_port)).await {
+            Ok(sock) => {
+                relay.stun_live.store(relay.cfg.stun_port, Ordering::Relaxed);
+                tokio::spawn(crate::stun::serve(sock));
+            }
+            Err(e) => log::warn!("direct connections off: cannot use UDP port {}: {e}", relay.cfg.stun_port),
+        }
+    }
     if let Some(repo) = relay.cfg.update_from_github.clone().filter(|r| !r.trim().is_empty()) {
         crate::server_update::spawn(relay.clone(), repo.trim().to_string());
     }
@@ -1547,6 +1563,7 @@ pub fn viewer_message_allowed(text: &str, view_only: bool) -> bool {
                         | SessionMsg::SetViewOnly { .. }
                         | SessionMsg::ViewMode { .. }
                         | SessionMsg::Timing { .. }
+                        | SessionMsg::DirectInfo { .. }
                 )
         }
         Err(_) => false,
@@ -1582,11 +1599,20 @@ async fn viewer_loop(
     let mode = |v: bool| Message::Text(serde_json::to_string(&SessionMsg::ViewMode { view_only: v, locked }).unwrap().into());
     let _ = vs.send(mode(view_only)).await;
     let (mut hs, mut hr) = host.split();
+    // Direct connections allowed: both sides learn where to ask for their address.
+    let stun_port = r.stun_live.load(Ordering::Relaxed);
+    if stun_port != 0 {
+        let info = SessionMsg::DirectInfo { stun_port, stun_servers: r.cfg.extra_stun_servers.clone() };
+        let info = Message::Text(serde_json::to_string(&info).unwrap().into());
+        let _ = vs.send(info.clone()).await;
+        let _ = hs.send(info).await;
+    }
     let view_only_now = Arc::new(std::sync::atomic::AtomicBool::new(view_only));
     let down_view_only = view_only_now.clone();
     // Pictures (host → viewer) flow in their own task: a big picture on its
     // way to a slow viewer never holds up mouse, keys and acks going back.
     let (to_viewer, mut to_viewer_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    let (down_r, down_session) = (r.clone(), session_id.clone());
     let mut down = tokio::spawn(async move {
         let reason = loop {
             tokio::select! {
@@ -1596,6 +1622,14 @@ async fn viewer_loop(
                             && !host_message_allowed(t.as_str(), down_view_only.load(std::sync::atomic::Ordering::Relaxed))
                         {
                             continue;
+                        }
+                        // The pictures' path, for the sessions list.
+                        if let Message::Text(t) = &msg
+                            && t.as_str().starts_with(r#"{"t":"path_switch""#)
+                            && let Ok(SessionMsg::PathSwitch { direct }) = serde_json::from_str(t.as_str())
+                            && let Some(e) = down_r.sessions.lock().unwrap().get_mut(&down_session)
+                        {
+                            e.view.direct = direct;
                         }
                         if vs.send(msg).await.is_err() { break String::new(); }
                     }
@@ -1702,6 +1736,10 @@ mod tests {
         assert!(viewer_message_allowed(&quality, true));
         assert!(!viewer_message_allowed("not json", false));
         assert!(!viewer_message_allowed(r#"{"t":"closed","reason":"x"}"#, false), "viewer can't fake relay messages");
+        assert!(!viewer_message_allowed(r#"{"t":"direct_info","stun_port":1}"#, false), "only the relay allows direct connections");
+        let offer = r#"{"t":"direct_offer","fp":"ab","addrs":["192.168.1.2:5000"]}"#;
+        assert!(viewer_message_allowed(offer, true), "view-only sessions may go direct too (pictures only)");
+        assert!(viewer_message_allowed(r#"{"t":"path_switch","direct":true}"#, true));
         let ping = r#"{"t":"input","event":{"k":"ping","mon":0,"x":0.5,"y":0.5}}"#;
         assert!(!viewer_message_allowed(ping, true), "view-only can't ping");
         assert!(viewer_message_allowed(ping, false));

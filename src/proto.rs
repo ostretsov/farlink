@@ -132,6 +132,38 @@ pub enum SessionMsg {
     /// scale + compress it (`encode_ms`), and the round trip from sending a
     /// picture to its ack arriving (`rtt_ms`; `None` before the first ack).
     Timing { capture_ms: f32, encode_ms: f32, rtt_ms: Option<f32> },
+
+    // ---- direct (peer-to-peer) path, see `crate::direct` ----
+    /// relay -> viewer and host at the start of a session: direct
+    /// connections are allowed; ask the relay's STUN answerer on this UDP
+    /// port for your public address. Never sent when the relay has them off.
+    /// `stun_servers`: more STUN servers (`host:port`) to ask from the same
+    /// socket; different answers = a hard NAT, so no hole punching.
+    DirectInfo {
+        stun_port: u16,
+        #[serde(default)]
+        stun_servers: Vec<String>,
+    },
+    /// viewer <-> host through the relay: try me at `addrs` (at most
+    /// [`crate::direct::MAX_ADDRS`]); my certificate's SHA-256 is `fp`.
+    /// `hard_nat`: my NAT gives every destination its own port (only my
+    /// LAN address is offered). A newer `attempt` replaces the direct
+    /// connection (if any) and everything about earlier attempts.
+    DirectOffer {
+        fp: String,
+        addrs: Vec<std::net::SocketAddr>,
+        #[serde(default)]
+        hard_nat: bool,
+        /// Which try this is (0 = the first, at the start of the session;
+        /// the viewer counts up when it tries again).
+        #[serde(default)]
+        attempt: u32,
+    },
+    /// viewer <-> host through the relay: from now on my messages come on
+    /// the direct connection (`direct`), or on the relay again (the direct
+    /// connection broke). The last message of this direction on the relay
+    /// before switching, so nothing arrives out of order.
+    PathSwitch { direct: bool },
 }
 
 /// One entry of a folder listing.
@@ -416,6 +448,14 @@ mod tests {
             SessionMsg::Closed { reason: "Access withdrawn".into() },
             SessionMsg::Timing { capture_ms: 4.5, encode_ms: 9.25, rtt_ms: Some(31.0) },
             SessionMsg::Timing { capture_ms: 0.0, encode_ms: 0.0, rtt_ms: None },
+            SessionMsg::DirectInfo { stun_port: 3478, stun_servers: vec!["stun.cloudflare.com:3478".into()] },
+            SessionMsg::DirectOffer {
+                fp: "ab01".into(),
+                addrs: vec!["192.168.1.5:40000".parse().unwrap(), "203.0.113.4:61000".parse().unwrap()],
+                hard_nat: false,
+                attempt: 2,
+            },
+            SessionMsg::PathSwitch { direct: true },
         ];
         for m in msgs {
             let s = serde_json::to_string(&m).unwrap();
