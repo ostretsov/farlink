@@ -78,6 +78,7 @@
   let monitors = [];
   let chain = Promise.resolve();
   let bytes = 0, frames = 0;
+  let timing = null; // last `timing` message from the helper
 
   function buildScreens(list) {
     monitors = list;
@@ -269,6 +270,9 @@
         // (browsers allow that only while the page has focus).
         remoteClip = m.text;
         if (navigator.clipboard) navigator.clipboard.writeText(m.text).catch(() => {});
+      } else if (m.t === 'timing') {
+        // The helper's share (read + compress) plus the round trip there and back.
+        timing = m;
       } else if (m.t === 'notice') {
         $('status').textContent = m.text;
       } else if (m.t.startsWith('fs_')) {
@@ -384,7 +388,8 @@
 
   setInterval(() => {
     if (monitors.length && ws.readyState === 1) {
-      $('status').textContent = `${monitors.length} screen(s) · ${frames} fps · ${Math.round(bytes / 1024)} KB/s` + (cfg.mode === 'guest' ? ` · link ends ${new Date(cfg.expires * 1000).toLocaleTimeString()}` : '');
+      const ms = timing && timing.rtt_ms != null ? ` · ${Math.round(timing.capture_ms + timing.encode_ms + timing.rtt_ms)} ms` : '';
+      $('status').textContent = `${monitors.length} screen(s) · ${frames} fps · ${Math.round(bytes / 1024)} KB/s${ms} · via relay` + (cfg.mode === 'guest' ? ` · link ends ${new Date(cfg.expires * 1000).toLocaleTimeString()}` : '');
     }
     bytes = 0; frames = 0;
   }, 1000);

@@ -415,6 +415,7 @@ pub fn run_screen(
     let mut idle = IdleTracker::new(Instant::now());
     let mut seq: u32 = 0;
     let mut flow = FlowControl::new(Instant::now());
+    let mut timing = TimingStats::default();
     let mut spare = SpareCpu::new(Instant::now());
     let mut last_monitor_check = Instant::now();
     let mut errors = 0u32;
@@ -592,11 +593,16 @@ pub fn run_screen(
 
         seq = seq.wrapping_add(1).max(1);
         let mut sent_any = false;
+        let (mut capture_time, mut encode_time) = (Duration::ZERO, Duration::ZERO);
         for (i, m) in monitors.iter().enumerate() {
             if watch.as_ref().is_some_and(|w| !w.contains(&m.index)) {
                 continue; // nobody is looking at this screen
             }
-            let frame = match desk.capture(m) {
+            let t_capture = Instant::now();
+            let captured = desk.capture(m);
+            capture_time += t_capture.elapsed();
+            let t_encode = Instant::now();
+            let frame = match captured {
                 Ok(f) => {
                     errors = 0;
                     f
@@ -636,7 +642,9 @@ pub fn run_screen(
             } else {
                 encoders[i].palette = None;
             }
-            match encoders[i].encode(prepared, &quality, m.index, seq) {
+            let encoded = encoders[i].encode(prepared, &quality, m.index, seq);
+            encode_time += t_encode.elapsed();
+            match encoded {
                 Ok(msgs) => {
                     if !msgs.is_empty() {
                         last_change[i] = Instant::now();
@@ -654,6 +662,12 @@ pub fn run_screen(
         if sent_any {
             flow.sent(seq, Instant::now());
             idle.activity(Instant::now());
+            timing.picture(capture_time, encode_time);
+            if let Some(t) = timing.report(Instant::now(), &mut flow)
+                && !send_json(&t)
+            {
+                return;
+            }
         }
         let now = Instant::now();
         let regular = idle.interval(&quality, now);
@@ -703,6 +717,40 @@ impl SpareCpu {
     }
 }
 
+/// Host-side time per picture, reported to the viewer as
+/// [`SessionMsg::Timing`] about once a second while pictures go out.
+#[derive(Default)]
+pub struct TimingStats {
+    capture: Duration,
+    encode: Duration,
+    pictures: u32,
+    last_report: Option<Instant>,
+}
+
+impl TimingStats {
+    pub const EVERY: Duration = Duration::from_secs(1);
+
+    /// One picture went out: it took `capture` to read and `encode` to
+    /// scale + compress (all monitors together).
+    pub fn picture(&mut self, capture: Duration, encode: Duration) {
+        self.capture += capture;
+        self.encode += encode;
+        self.pictures += 1;
+    }
+
+    /// The message to send now, if one is due (nothing while no pictures go).
+    pub fn report(&mut self, now: Instant, flow: &mut FlowControl) -> Option<SessionMsg> {
+        if self.pictures == 0 || self.last_report.is_some_and(|t| now.duration_since(t) < Self::EVERY) {
+            return None;
+        }
+        let ms = |d: Duration| d.as_secs_f32() * 1000.0;
+        let n = self.pictures;
+        let msg = SessionMsg::Timing { capture_ms: ms(self.capture / n), encode_ms: ms(self.encode / n), rtt_ms: flow.take_rtt().map(ms) };
+        *self = TimingStats { last_report: Some(now), ..TimingStats::default() };
+        Some(msg)
+    }
+}
+
 /// How many pictures may be on the way to the viewer (sent, not yet
 /// acknowledged). Too few wastes a long link (the host waits a whole round
 /// trip per picture); too many lets pictures queue up, so what the viewer
@@ -719,6 +767,10 @@ pub struct FlowControl {
     changed: Instant,
     /// A picture was held back or sent into a full window since the last change.
     limited: bool,
+    /// Round trips measured since the last [`Self::take_rtt`] (sum, count),
+    /// and the latest one.
+    rtt_sum: (Duration, u32),
+    last_rtt: Option<Duration>,
 }
 
 impl FlowControl {
@@ -732,11 +784,26 @@ impl FlowControl {
     const BASE_FOR: Duration = Duration::from_secs(30);
 
     pub fn new(now: Instant) -> FlowControl {
-        FlowControl { in_flight: Default::default(), window: Self::MIN, base_rtt: None, changed: now, limited: false }
+        FlowControl {
+            in_flight: Default::default(),
+            window: Self::MIN,
+            base_rtt: None,
+            changed: now,
+            limited: false,
+            rtt_sum: (Duration::ZERO, 0),
+            last_rtt: None,
+        }
     }
 
     pub fn window(&self) -> usize {
         self.window
+    }
+
+    /// Average round trip (picture sent → its ack back) since the last call,
+    /// or the latest one if no ack came since. `None` before the first ack.
+    pub fn take_rtt(&mut self) -> Option<Duration> {
+        let (sum, n) = std::mem::replace(&mut self.rtt_sum, (Duration::ZERO, 0));
+        if n > 0 { Some(sum / n) } else { self.last_rtt }
     }
 
     /// The viewer is far away (round trip of [`Self::FAR`] or more): bytes
@@ -776,6 +843,8 @@ impl FlowControl {
         }
         let Some(sent_at) = sent_at else { return };
         let rtt = now.duration_since(sent_at);
+        self.rtt_sum = (self.rtt_sum.0 + rtt, self.rtt_sum.1 + 1);
+        self.last_rtt = Some(rtt);
         let base = match self.base_rtt {
             Some((b, set)) if rtt >= b && now.duration_since(set) < Self::BASE_FOR => b,
             _ => {
@@ -1423,6 +1492,28 @@ mod tests {
         assert!(!f.can_send(t0 + Duration::from_secs(1)));
         assert!(f.can_send(t0 + FlowControl::LOST_AFTER), "lost acks don't freeze the session");
         f.acked(1, t0 + Duration::from_secs(4)); // stale ack: harmless
+    }
+
+    #[test]
+    fn timing_reports_once_a_second_with_averages() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut f = FlowControl::new(t0);
+        let mut t = TimingStats::default();
+        assert_eq!(t.report(t0, &mut f), None, "nothing sent: nothing to say");
+        f.sent(1, t0);
+        f.acked(1, t0 + ms(20));
+        f.sent(2, t0);
+        f.acked(2, t0 + ms(40));
+        t.picture(ms(2), ms(10));
+        t.picture(ms(4), ms(20));
+        let Some(SessionMsg::Timing { capture_ms, encode_ms, rtt_ms }) = t.report(t0, &mut f) else { panic!() };
+        assert!((capture_ms - 3.0).abs() < 0.01 && (encode_ms - 15.0).abs() < 0.01);
+        assert!((rtt_ms.unwrap() - 30.0).abs() < 0.01, "average round trip");
+        t.picture(ms(1), ms(1));
+        assert_eq!(t.report(t0 + ms(500), &mut f), None, "at most once a second");
+        let Some(SessionMsg::Timing { rtt_ms, .. }) = t.report(t0 + ms(1000), &mut f) else { panic!() };
+        assert!((rtt_ms.unwrap() - 40.0).abs() < 0.01, "no new ack: the latest round trip");
     }
 
     #[test]

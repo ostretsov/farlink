@@ -254,6 +254,15 @@ pub struct SessionShared {
     pub notice: Option<String>,
     pub fps: f32,
     pub kbps: f32,
+    /// How the pictures get here (shown with the latency).
+    pub route: Route,
+    /// Where the time goes from screen to screen (see [`Latency`]).
+    pub latency: Latency,
+    /// Decode / draw times of the current one-second window (sum ms, count).
+    window_decode: (f32, u32),
+    window_draw: (f32, u32),
+    /// Monitors with a complete picture not drawn yet, and when it arrived.
+    undrawn: HashMap<u8, Instant>,
     window_start: Instant,
     window_bytes: usize,
     window_frames: usize,
@@ -394,6 +403,11 @@ impl SessionShared {
             notice: None,
             fps: 0.0,
             kbps: 0.0,
+            route: Route::Demo,
+            latency: Latency::default(),
+            window_decode: (0.0, 0),
+            window_draw: (0.0, 0),
+            undrawn: HashMap::new(),
             window_start: Instant::now(),
             window_bytes: 0,
             window_frames: 0,
@@ -449,6 +463,10 @@ impl SessionShared {
                     }
                 }
                 Ok(SessionMsg::Pointer { x, y, shape }) => self.pointer = Some((x, y, shape)),
+                Ok(SessionMsg::Timing { capture_ms, encode_ms, rtt_ms }) => {
+                    let clean = |v: f32| if v.is_finite() { v.clamp(0.0, 60_000.0) } else { 0.0 };
+                    self.latency.host = Some(HostTiming { capture_ms: clean(capture_ms), encode_ms: clean(encode_ms), rtt_ms: rtt_ms.map(clean) });
+                }
                 Ok(m @ (SessionMsg::FsListing { .. } | SessionMsg::FsBegin { .. } | SessionMsg::FsDone { .. })) => self.file_message(m),
                 _ => {}
             },
@@ -463,6 +481,7 @@ impl SessionShared {
                     }
                     if h.is_last() {
                         self.window_frames += 1; // acked on arrival: see `ack_for`
+                        self.undrawn.entry(h.monitor).or_insert_with(Instant::now);
                     }
                 }
             }
@@ -473,11 +492,131 @@ impl SessionShared {
             let mons = self.monitors.len().max(1) as f32;
             self.fps = self.window_frames as f32 / secs / mons;
             self.kbps = self.window_bytes as f32 / 1024.0 / secs;
+            let avg = |(sum, n): (f32, u32), old: Option<f32>| if n > 0 { Some(sum / n as f32) } else { old };
+            self.latency.decode_ms = avg(std::mem::take(&mut self.window_decode), self.latency.decode_ms);
+            self.latency.draw_ms = avg(std::mem::take(&mut self.window_draw), self.latency.draw_ms);
             self.window_start = Instant::now();
             self.window_bytes = 0;
             self.window_frames = 0;
         }
         replies
+    }
+}
+
+impl SessionShared {
+    /// A picture part took `d` to decode.
+    pub fn note_decode(&mut self, d: std::time::Duration) {
+        self.window_decode.0 += d.as_secs_f32() * 1000.0;
+        self.window_decode.1 += 1;
+    }
+
+    /// The viewer just put monitor `mon`'s picture on screen.
+    pub fn drawn(&mut self, mon: u8) {
+        if let Some(t) = self.undrawn.remove(&mon) {
+            self.window_draw.0 += t.elapsed().as_secs_f32() * 1000.0;
+            self.window_draw.1 += 1;
+        }
+    }
+}
+
+/// Decode `msg` (timed, outside the lock) and apply it.
+fn receive(shared: &Mutex<SessionShared>, msg: &Message, quality: &Quality) -> Vec<SessionMsg> {
+    let t = Instant::now();
+    let decoded = decode_picture(msg);
+    let took = t.elapsed();
+    let mut sh = shared.lock().unwrap();
+    if decoded.is_some() {
+        sh.note_decode(took);
+    }
+    sh.apply_decoded(msg, decoded, quality)
+}
+
+/// How pictures reach this viewer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    /// Through the Farlink server (the only way today: nothing goes
+    /// straight between the computers). `encrypted` = wss (HTTPS).
+    Relay { server: String, encrypted: bool },
+    /// The pretend computer inside this program.
+    Demo,
+}
+
+impl Route {
+    pub fn for_url(url: Option<&str>) -> Route {
+        let Some(url) = url else { return Route::Demo };
+        let encrypted = url.starts_with("wss://");
+        let rest = url.split_once("://").map_or(url, |(_, r)| r);
+        let server = rest.split(['/', '?']).next().unwrap_or(rest).to_string();
+        Route::Relay { server, encrypted }
+    }
+
+    /// Short text for the screen window's bar.
+    pub fn short(&self) -> &'static str {
+        match self {
+            Route::Relay { .. } => "via relay",
+            Route::Demo => "local demo",
+        }
+    }
+
+    /// One line for the hover text.
+    pub fn describe(&self) -> String {
+        match self {
+            Route::Relay { server, encrypted } => format!(
+                "Connection: all traffic goes through the relay {server} ({}), no direct peer-to-peer path",
+                if *encrypted { "encrypted, HTTPS" } else { "NOT encrypted, plain HTTP" }
+            ),
+            Route::Demo => "Connection: pretend computer inside this program (no network)".into(),
+        }
+    }
+}
+
+/// What the host says about its share of the time (see `SessionMsg::Timing`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct HostTiming {
+    pub capture_ms: f32,
+    pub encode_ms: f32,
+    pub rtt_ms: Option<f32>,
+}
+
+/// Where the time goes from the remote screen changing to this screen
+/// showing it, in milliseconds (one-second averages).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Latency {
+    /// From the host; `None` = an older helper that doesn't tell.
+    pub host: Option<HostTiming>,
+    pub decode_ms: Option<f32>,
+    /// Complete picture arrived → put on screen here.
+    pub draw_ms: Option<f32>,
+}
+
+impl Latency {
+    /// Roughly what a click costs until its result is seen: the round trip
+    /// stands for the input going there plus the picture coming back.
+    /// `None` until the host has sent a round trip.
+    pub fn total_ms(&self) -> Option<f32> {
+        let h = self.host?;
+        Some(h.capture_ms + h.encode_ms + h.rtt_ms? + self.decode_ms.unwrap_or(0.0) + self.draw_ms.unwrap_or(0.0))
+    }
+
+    /// The breakdown, one part per line.
+    pub fn describe(&self) -> String {
+        let ms = |v: Option<f32>| v.map_or("–".to_string(), |v| format!("{v:.0} ms"));
+        let Some(h) = self.host else {
+            return format!(
+                "The remote helper doesn't report its times (older version)\nDecode here: {}\nOn screen here: {}",
+                ms(self.decode_ms),
+                ms(self.draw_ms)
+            );
+        };
+        format!(
+            "≈ {} from a click to seeing its result\n\nRead screen (remote): {}\nCompress (remote): {}\nNetwork round trip: {}\nDecode here: {}\nOn screen here: {}",
+            ms(self.total_ms()),
+            ms(Some(h.capture_ms)),
+            ms(Some(h.encode_ms)),
+            ms(h.rtt_ms),
+            ms(self.decode_ms),
+            ms(self.draw_ms),
+        )
     }
 }
 
@@ -512,6 +651,7 @@ impl SessionHandle {
     /// Start connecting. `repaint` is called whenever something changed.
     pub fn start(target: Target, quality: Quality, view_only: bool, repaint: Arc<dyn Fn() + Send + Sync>) -> SessionHandle {
         let shared = Arc::new(Mutex::new(SessionShared::new(view_only)));
+        shared.lock().unwrap().route = Route::for_url(target.url().as_deref());
         let (tx, rx) = mpsc::unbounded_channel();
         let (raw, raw_rx) = mpsc::channel(4);
         let s2 = shared.clone();
@@ -714,8 +854,7 @@ async fn network_task(
                 {
                     close("Connection lost".into()); break;
                 }
-                let decoded = decode_picture(&msg);
-                let replies = shared.lock().unwrap().apply_decoded(&msg, decoded, &quality);
+                let replies = receive(&shared, &msg, &quality);
                 for r in replies {
                     if sink.send(Message::Text(serde_json::to_string(&r).unwrap().into())).await.is_err() { break; }
                 }
@@ -763,8 +902,7 @@ async fn demo_task(
             out = out_rx.recv() => match out {
                 Some(msg) => {
                     if let Some(ack) = ack_for(&msg) { let _ = cmd_tx.send(ack); }
-                    let decoded = decode_picture(&msg);
-                    let replies = shared.lock().unwrap().apply_decoded(&msg, decoded, &quality);
+                    let replies = receive(&shared, &msg, &quality);
                     for r in replies { let _ = cmd_tx.send(r); }
                     repaint();
                 }
@@ -814,6 +952,46 @@ async fn demo_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_tells_relay_and_encryption() {
+        assert_eq!(
+            Route::for_url(Some("wss://rd.example.com/ws/view/m1?token=x")),
+            Route::Relay { server: "rd.example.com".into(), encrypted: true }
+        );
+        assert_eq!(Route::for_url(Some("ws://10.0.0.5:8470/ws/guest/ab")), Route::Relay { server: "10.0.0.5:8470".into(), encrypted: false });
+        assert_eq!(Route::for_url(None), Route::Demo);
+        assert!(Route::for_url(Some("ws://h/x")).describe().contains("NOT encrypted"));
+    }
+
+    #[test]
+    fn latency_adds_up_host_network_and_viewer_parts() {
+        let mut s = SessionShared::new(false);
+        assert_eq!(s.latency.total_ms(), None);
+        let t = serde_json::to_string(&SessionMsg::Timing { capture_ms: 3.0, encode_ms: 7.0, rtt_ms: Some(30.0) }).unwrap();
+        s.apply(&Message::Text(t.into()), &Quality::default());
+        assert_eq!(s.latency.total_ms(), Some(40.0), "nothing measured here yet");
+        s.latency.decode_ms = Some(2.0);
+        s.latency.draw_ms = Some(8.0);
+        assert_eq!(s.latency.total_ms(), Some(50.0));
+        assert!(s.latency.describe().contains("Network round trip: 30 ms"));
+        // A host that sends nonsense can't break the numbers.
+        let bad = r#"{"t":"timing","capture_ms":-5.0,"encode_ms":1e30,"rtt_ms":null}"#;
+        s.apply(&Message::Text(bad.into()), &Quality::default());
+        let h = s.latency.host.unwrap();
+        assert_eq!((h.capture_ms, h.encode_ms, h.rtt_ms), (0.0, 60_000.0, None));
+        assert_eq!(s.latency.total_ms(), None, "no round trip yet");
+    }
+
+    #[test]
+    fn drawn_measures_arrival_to_screen() {
+        let mut s = SessionShared::new(false);
+        s.undrawn.insert(0, Instant::now() - std::time::Duration::from_millis(12));
+        s.drawn(0);
+        s.drawn(1); // nothing waiting: ignored
+        assert_eq!(s.window_draw.1, 1);
+        assert!(s.window_draw.0 >= 12.0);
+    }
 
     #[test]
     fn parses_temporary_links() {

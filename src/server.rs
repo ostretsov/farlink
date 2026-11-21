@@ -1542,7 +1542,11 @@ pub fn viewer_message_allowed(text: &str, view_only: bool) -> bool {
             !(view_only && m.is_control())
                 && !matches!(
                     m,
-                    SessionMsg::Hello { .. } | SessionMsg::Closed { .. } | SessionMsg::SetViewOnly { .. } | SessionMsg::ViewMode { .. }
+                    SessionMsg::Hello { .. }
+                        | SessionMsg::Closed { .. }
+                        | SessionMsg::SetViewOnly { .. }
+                        | SessionMsg::ViewMode { .. }
+                        | SessionMsg::Timing { .. }
                 )
         }
         Err(_) => false,

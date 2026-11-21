@@ -633,11 +633,13 @@ impl OpenSession {
 impl OpenSession {
     fn update_textures(&mut self, ctx: &egui::Context) {
         let mut shared = self.handle.shared.lock().unwrap();
+        let mut drawn = Vec::new();
         for (mon, canvas) in shared.canvases.iter_mut() {
             let current = self.textures.get(mon).map(|t| t.1);
             if canvas.frame.is_none() || current == Some(canvas.generation) {
                 continue;
             }
+            drawn.push(*mon);
             let dirty = canvas.take_dirty();
             let Some(frame) = &canvas.frame else { continue };
             let size = [frame.width as usize, frame.height as usize];
@@ -664,6 +666,9 @@ impl OpenSession {
                     self.textures.insert(*mon, (tex, canvas.generation));
                 }
             }
+        }
+        for mon in drawn {
+            shared.drawn(mon);
         }
         for (id, img) in &shared.pointer_shapes {
             if !self.pointer_textures.contains_key(id) {
@@ -1561,7 +1566,9 @@ impl ViewerApp {
                     let (dot, status) = match &shared.state {
                         ConnState::Connecting => (AMBER, "connecting...".to_string()),
                         ConnState::Live => {
-                            (OK, format!("{} screen(s) · {:.0} fps · {:.0} KB/s", shared.monitors.len(), shared.fps, shared.kbps))
+                            let ms = shared.latency.total_ms().map_or(String::new(), |t| format!(" · {t:.0} ms"));
+                            let route = shared.route.short();
+                            (OK, format!("{} screen(s) · {:.0} fps · {:.0} KB/s{ms} · {route}", shared.monitors.len(), shared.fps, shared.kbps))
                         }
                         ConnState::Closed(r) => (DANGER, r.clone()),
                     };
@@ -2683,9 +2690,9 @@ fn monitor_window(ui: &mut egui::Ui, s: &mut OpenSession, mon: &MonitorInfo, key
     if info.close_requested() {
         return MonitorResult::Closed;
     }
-    let (view_only, locked, fps, kbps) = {
+    let (view_only, locked, stats) = {
         let sh = s.handle.shared.lock().unwrap();
-        (sh.view_only, sh.view_locked, sh.fps, sh.kbps)
+        (sh.view_only, sh.view_locked, LinkStats { fps: sh.fps, kbps: sh.kbps, latency: sh.latency, route: sh.route.clone() })
     };
     let screen = ui.max_rect();
     let overlay = if s.controls_hidden {
@@ -2704,14 +2711,14 @@ fn monitor_window(ui: &mut egui::Ui, s: &mut OpenSession, mon: &MonitorInfo, key
         egui::Panel::top("bar")
             .exact_size(BAR_HEIGHT)
             .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(10, 5)))
-            .show(ui, |ui| monitor_bar(ui, s, mon, view_only, locked, fps, kbps, &mut result));
+            .show(ui, |ui| monitor_bar(ui, s, mon, view_only, locked, &stats, &mut result));
     } else if let Some(bar) = overlay {
         egui::Area::new(egui::Id::unique(("farlink-bar", mon.index))).order(egui::Order::Foreground).fixed_pos(bar.min).show(&ctx, |ui| {
             egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(10, 5)).show(ui, |ui| {
                 let size = Vec2::new(bar.width() - 20.0, BAR_HEIGHT - 10.0);
                 ui.allocate_ui_with_layout(size, Layout::left_to_right(Align::Center), |ui| {
                     ui.set_min_size(size);
-                    monitor_bar(ui, s, mon, view_only, locked, fps, kbps, &mut result);
+                    monitor_bar(ui, s, mon, view_only, locked, &stats, &mut result);
                 });
             });
         });
@@ -2758,17 +2765,36 @@ fn monitor_window(ui: &mut egui::Ui, s: &mut OpenSession, mon: &MonitorInfo, key
     result
 }
 
+/// Speed of a session, for the screen window's bar.
+struct LinkStats {
+    fps: f32,
+    kbps: f32,
+    latency: crate::net::Latency,
+    route: crate::net::Route,
+}
+
+impl LinkStats {
+    /// "30 fps · 512 KB/s · 45 ms · via relay"
+    fn line(&self) -> String {
+        let ms = self.latency.total_ms().map_or(String::new(), |t| format!(" · {t:.0} ms"));
+        format!("{:.0} fps · {:.0} KB/s{ms} · {}", self.fps, self.kbps, self.route.short())
+    }
+
+    fn hover(&self) -> String {
+        format!("{}\n\n{}", self.latency.describe(), self.route.describe())
+    }
+}
+
 /// The controls of a screen window (top bar, or shown over the picture
 /// while hidden).
-#[allow(clippy::too_many_arguments)]
-fn monitor_bar(ui: &mut egui::Ui, s: &mut OpenSession, mon: &MonitorInfo, view_only: bool, locked: bool, fps: f32, kbps: f32, result: &mut MonitorResult) {
+fn monitor_bar(ui: &mut egui::Ui, s: &mut OpenSession, mon: &MonitorInfo, view_only: bool, locked: bool, stats: &LinkStats, result: &mut MonitorResult) {
     let ctx = ui.ctx().clone();
     ui.horizontal_centered(|ui| {
         if let Some(v) = view_only_toggle(ui, view_only, locked) {
             s.handle.set_view_only(v);
         }
         ui.label(RichText::new(format!("{} · {}", s.name, mon.label())).strong());
-        ui.label(RichText::new(format!("{fps:.0} fps · {kbps:.0} KB/s")).color(MUTED).size(12.0));
+        ui.label(RichText::new(stats.line()).color(MUTED).size(12.0)).on_hover_text(stats.hover());
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if ui.button("Disconnect").clicked() {
                 *result = MonitorResult::Disconnect;

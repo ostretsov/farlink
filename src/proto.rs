@@ -126,6 +126,12 @@ pub enum SessionMsg {
     /// host -> viewer: the pointer's hot spot in virtual-desktop pixels (as
     /// [`MonitorInfo`] positions) and its shape (`0` = hidden).
     Pointer { x: i32, y: i32, shape: u32 },
+
+    /// host -> viewer, about once a second while pictures go out: average
+    /// milliseconds per picture to read the screen (`capture_ms`) and to
+    /// scale + compress it (`encode_ms`), and the round trip from sending a
+    /// picture to its ack arriving (`rtt_ms`; `None` before the first ack).
+    Timing { capture_ms: f32, encode_ms: f32, rtt_ms: Option<f32> },
 }
 
 /// One entry of a folder listing.
@@ -408,6 +414,8 @@ mod tests {
             SessionMsg::Ack { seq: 9 },
             SessionMsg::Refresh,
             SessionMsg::Closed { reason: "Access withdrawn".into() },
+            SessionMsg::Timing { capture_ms: 4.5, encode_ms: 9.25, rtt_ms: Some(31.0) },
+            SessionMsg::Timing { capture_ms: 0.0, encode_ms: 0.0, rtt_ms: None },
         ];
         for m in msgs {
             let s = serde_json::to_string(&m).unwrap();
