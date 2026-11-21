@@ -1476,6 +1476,40 @@ async fn a_broken_direct_path_falls_back_to_the_relay_and_comes_back() {
     wait_for(&h, "pictures over the new direct path", |sh| sh.canvases.values().filter(|c| c.frame.is_some()).count() == 2).await;
 }
 
+/// Mouse input while big pictures arrive used to cut pictures apart on the
+/// direct path, so the session kept dropping to the relay and coming back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_path_stays_up_under_input_and_big_pictures() {
+    use farlink::net::{ConnState, SessionHandle, Target};
+    use farlink::proto::InputEvent;
+    let s = start_server().await;
+    let machine = real_helper(&s).await;
+    let target = Target::Admin { server: s.url.clone(), token: s.admin.clone(), machine_id: machine, view_only: false };
+    let sharp = farlink::quality::Quality::preset(farlink::quality::Preset::Sharp);
+    let h = SessionHandle::start(target, sharp, false, std::sync::Arc::new(|| {}));
+    wait_for(&h, "direct path", |sh| sh.state == ConnState::Live && sh.route.is_direct()).await;
+    let start = std::time::Instant::now();
+    let until = start + Duration::from_secs(6);
+    let (mut i, mut checks) = (0u32, 0u32);
+    while std::time::Instant::now() < until {
+        // Every 5 ms a mouse move; every 100 ms the whole screen again (big pictures).
+        let x = (i % 100) as f32 / 100.0;
+        h.send(SessionMsg::Input { event: InputEvent::MouseMove { mon: (i % 2) as u8, x, y: x } });
+        if i.is_multiple_of(20) {
+            h.send(SessionMsg::Refresh);
+        }
+        i += 1;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        if i.is_multiple_of(4) {
+            let sh = h.shared.lock().unwrap();
+            assert!(sh.route.is_direct(), "left the direct path after {:?}: {:?}", start.elapsed(), sh.route);
+            checks += 1;
+        }
+    }
+    assert!(checks > 100);
+    assert!(h.shared.lock().unwrap().kbps > 100.0, "big pictures were flowing");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn without_stun_everything_stays_on_the_relay() {
     use farlink::net::{ConnState, Route, SessionHandle, Target};

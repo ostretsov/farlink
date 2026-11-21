@@ -79,8 +79,18 @@ pub struct LinkTx {
     _endpoint: quinn::Endpoint,
 }
 
+/// Messages from the other side, whole. A task of its own reads the
+/// stream: waiting here can be interrupted (`select!`) without losing part
+/// of a message, which reading the stream directly can't.
 pub struct LinkRx {
-    recv: quinn::RecvStream,
+    messages: tokio::sync::mpsc::Receiver<Result<Message>>,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for LinkRx {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
 }
 
 pub fn fingerprint(cert: &[u8]) -> String {
@@ -365,7 +375,7 @@ impl DirectEndpoint {
         tasks.abort_all();
         ep.set_server_config(None); // no more connections on this socket
         let remote = conn.remote_address();
-        Ok(Link { tx: LinkTx { send, conn, _endpoint: ep }, rx: LinkRx { recv }, remote })
+        Ok(Link { tx: LinkTx { send, conn, _endpoint: ep }, rx: LinkRx::start(recv), remote })
     }
 }
 
@@ -390,20 +400,40 @@ impl LinkTx {
 }
 
 impl LinkRx {
+    fn start(mut recv: quinn::RecvStream) -> LinkRx {
+        // A few pictures may wait here; beyond that, QUIC holds the sender back.
+        let (tx, messages) = tokio::sync::mpsc::channel(16);
+        let reader = tokio::spawn(async move {
+            loop {
+                let m = read_frame(&mut recv).await;
+                let failed = m.is_err();
+                if tx.send(m).await.is_err() || failed {
+                    return;
+                }
+            }
+        });
+        LinkRx { messages, reader }
+    }
+
+    /// The next message (safe to interrupt). An error: the link broke.
     pub async fn recv(&mut self) -> Result<Message> {
-        let mut head = [0u8; 5];
-        self.recv.read_exact(&mut head).await?;
-        let len = u32::from_le_bytes(head[1..].try_into().unwrap()) as usize;
-        if len > MAX_FRAME {
-            bail!("frame too big");
-        }
-        let mut data = vec![0u8; len];
-        self.recv.read_exact(&mut data).await?;
-        match head[0] {
-            KIND_TEXT => Ok(Message::Text(String::from_utf8(data)?.into())),
-            KIND_BINARY => Ok(Message::Binary(data.into())),
-            k => bail!("unknown frame {k}"),
-        }
+        self.messages.recv().await.unwrap_or_else(|| Err(anyhow!("direct connection closed")))
+    }
+}
+
+async fn read_frame(recv: &mut quinn::RecvStream) -> Result<Message> {
+    let mut head = [0u8; 5];
+    recv.read_exact(&mut head).await?;
+    let len = u32::from_le_bytes(head[1..].try_into().unwrap()) as usize;
+    if len > MAX_FRAME {
+        bail!("frame too big");
+    }
+    let mut data = vec![0u8; len];
+    recv.read_exact(&mut data).await?;
+    match head[0] {
+        KIND_TEXT => Ok(Message::Text(String::from_utf8(data)?.into())),
+        KIND_BINARY => Ok(Message::Binary(data.into())),
+        k => bail!("unknown frame {k}"),
     }
 }
 
@@ -765,6 +795,41 @@ mod tests {
         assert_eq!(v.rx.recv().await.unwrap(), Message::Binary(big.into()));
         v.tx.close();
         assert!(h.rx.recv().await.is_err(), "closing ends the other side too");
+    }
+
+    /// Reading must survive being interrupted: in the session loops the
+    /// read races the relay, input and timers, and a frame arrives in many
+    /// pieces. Losing a piece once made the link look broken (the session
+    /// flapped between direct and relay).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reading_survives_interruptions_mid_frame() {
+        let (v, h) = (local(), local());
+        let (vfp, hfp, vaddrs, haddrs) = (v.fingerprint.clone(), h.fingerprint.clone(), v.addrs.clone(), h.addrs.clone());
+        let viewer = tokio::spawn(async move { v.establish(true, &hfp, &haddrs, Duration::from_secs(5)).await });
+        let host = tokio::spawn(async move { h.establish(false, &vfp, &vaddrs, Duration::from_secs(5)).await });
+        let (mut v, mut h) = (viewer.await.unwrap().unwrap(), host.await.unwrap().unwrap());
+        const N: usize = 40;
+        let sender = tokio::spawn(async move {
+            for i in 0..N {
+                let pic: Vec<u8> = (0..500_000u32).map(|j| (j as usize + i) as u8).collect();
+                h.tx.send(&Message::Binary(pic.into())).await.unwrap();
+            }
+            h
+        });
+        let mut tick = tokio::time::interval(Duration::from_micros(200));
+        let mut got = 0;
+        while got < N {
+            tokio::select! {
+                m = v.rx.recv() => {
+                    let Message::Binary(b) = m.expect("frame intact") else { panic!("not a picture") };
+                    assert_eq!(b.len(), 500_000);
+                    assert!(b.iter().enumerate().all(|(j, &x)| x == (j + got) as u8), "picture {got} intact");
+                    got += 1;
+                }
+                _ = tick.tick() => {} // something else needs attention meanwhile
+            }
+        }
+        let _h = sender.await.unwrap();
     }
 
     #[tokio::test]
