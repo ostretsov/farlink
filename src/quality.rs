@@ -104,12 +104,23 @@ impl Preset {
 pub struct Quality {
     /// Size of the picture compared with the real screen, 25..=100 %.
     pub scale_pct: u8,
-    /// Highest pictures per second, 1..=30.
+    /// Highest pictures per second, 1..=30. With [`Quality::auto_fps`] the
+    /// most the helper may send; it picks the pace itself below that.
     pub max_fps: u8,
+    /// The helper chooses the pictures per second from how quickly the remote
+    /// computer and the link answer (`host::AutoPace`): it starts at 10 and
+    /// goes faster only while pictures arrive without queueing. Missing in
+    /// settings from older viewers = on (they only sent the highest rate).
+    #[serde(default = "yes")]
+    pub auto_fps: bool,
     pub codec: Codec,
     /// JPEG quality 10..=95 (ignored for PNG; used by Auto for photos).
     pub jpeg_quality: u8,
     pub color: ColorDepth,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Default for Quality {
@@ -121,11 +132,11 @@ impl Default for Quality {
 impl Quality {
     pub fn preset(p: Preset) -> Quality {
         match p {
-            Preset::Fast => Quality { scale_pct: 75, max_fps: 20, codec: Codec::Jpeg, jpeg_quality: 50, color: ColorDepth::Full },
+            Preset::Fast => Quality { scale_pct: 75, max_fps: 20, auto_fps: true, codec: Codec::Jpeg, jpeg_quality: 50, color: ColorDepth::Full },
             Preset::Balanced | Preset::Custom => {
-                Quality { scale_pct: 100, max_fps: 30, codec: Codec::Auto, jpeg_quality: 75, color: ColorDepth::Optimized }
+                Quality { scale_pct: 100, max_fps: 30, auto_fps: true, codec: Codec::Auto, jpeg_quality: 75, color: ColorDepth::Optimized }
             }
-            Preset::Sharp => Quality { scale_pct: 100, max_fps: 30, codec: Codec::Png, jpeg_quality: 90, color: ColorDepth::Full },
+            Preset::Sharp => Quality { scale_pct: 100, max_fps: 30, auto_fps: true, codec: Codec::Png, jpeg_quality: 90, color: ColorDepth::Full },
         }
     }
 
@@ -133,9 +144,9 @@ impl Quality {
     /// settings equal to one of them are moved to the new preset of that name.
     pub fn upgraded(self) -> Quality {
         let old = [
-            (Quality { scale_pct: 60, max_fps: 12, codec: Codec::Jpeg, jpeg_quality: 35, color: ColorDepth::Low }, Preset::Fast),
-            (Quality { scale_pct: 85, max_fps: 20, codec: Codec::Jpeg, jpeg_quality: 65, color: ColorDepth::High }, Preset::Balanced),
-            (Quality { scale_pct: 100, max_fps: 25, codec: Codec::Png, jpeg_quality: 85, color: ColorDepth::High }, Preset::Sharp),
+            (Quality { scale_pct: 60, max_fps: 12, auto_fps: true, codec: Codec::Jpeg, jpeg_quality: 35, color: ColorDepth::Low }, Preset::Fast),
+            (Quality { scale_pct: 85, max_fps: 20, auto_fps: true, codec: Codec::Jpeg, jpeg_quality: 65, color: ColorDepth::High }, Preset::Balanced),
+            (Quality { scale_pct: 100, max_fps: 25, auto_fps: true, codec: Codec::Png, jpeg_quality: 85, color: ColorDepth::High }, Preset::Sharp),
         ];
         old.into_iter().find(|(q, _)| *q == self).map(|(_, p)| Quality::preset(p)).unwrap_or(self)
     }
@@ -166,7 +177,8 @@ impl Quality {
         (((w * pct) / 100).max(1), ((h * pct) / 100).max(1))
     }
 
-    /// Time between pictures in milliseconds.
+    /// Shortest time between pictures in milliseconds (the fixed pace, or
+    /// the fastest [`Quality::auto_fps`] may go).
     pub fn frame_interval_ms(&self) -> u64 {
         1000 / self.clamped().max_fps as u64
     }
@@ -186,7 +198,8 @@ impl Quality {
             ColorDepth::Low => "8-bit",
             ColorDepth::Gray => "grey",
         };
-        format!("{}% · {} fps · {} · {}", q.scale_pct, q.max_fps, codec, color)
+        let fps = if q.auto_fps { format!("auto ≤{} fps", q.max_fps) } else { format!("{} fps", q.max_fps) };
+        format!("{}% · {} · {} · {}", q.scale_pct, fps, codec, color)
     }
 }
 
@@ -209,7 +222,7 @@ mod tests {
 
     #[test]
     fn clamps_hostile_values() {
-        let q = Quality { scale_pct: 0, max_fps: 200, codec: Codec::Png, jpeg_quality: 1, color: ColorDepth::Gray }.clamped();
+        let q = Quality { scale_pct: 0, max_fps: 200, auto_fps: false, codec: Codec::Png, jpeg_quality: 1, color: ColorDepth::Gray }.clamped();
         assert_eq!(q.scale_pct, 25);
         assert_eq!(q.max_fps, 30);
         assert_eq!(q.jpeg_quality, 10);
@@ -229,17 +242,23 @@ mod tests {
         assert!(s.contains("\"codec\":\"png\""));
         let back: Quality = serde_json::from_str(&s).unwrap();
         assert_eq!(back, q);
+        // Viewers before automatic pacing don't send it: the helper picks the pace.
+        let old: Quality = serde_json::from_str(r#"{"scale_pct":100,"max_fps":30,"codec":"auto","jpeg_quality":75,"color":"optimized"}"#).unwrap();
+        assert!(old.auto_fps);
+        assert_eq!(old, Quality::preset(Preset::Balanced));
     }
 
     #[test]
     fn summary_text() {
-        assert_eq!(Quality::preset(Preset::Fast).summary(), "75% · 20 fps · JPEG 50 · 24-bit");
-        assert_eq!(Quality::preset(Preset::Balanced).summary(), "100% · 30 fps · Auto · optimised");
+        assert_eq!(Quality::preset(Preset::Fast).summary(), "75% · auto ≤20 fps · JPEG 50 · 24-bit");
+        assert_eq!(Quality::preset(Preset::Balanced).summary(), "100% · auto ≤30 fps · Auto · optimised");
+        let fixed = Quality { auto_fps: false, ..Quality::preset(Preset::Balanced) };
+        assert_eq!(fixed.summary(), "100% · 30 fps · Auto · optimised");
     }
 
     #[test]
     fn old_presets_are_upgraded() {
-        let old_balanced = Quality { scale_pct: 85, max_fps: 20, codec: Codec::Jpeg, jpeg_quality: 65, color: ColorDepth::High };
+        let old_balanced = Quality { scale_pct: 85, max_fps: 20, auto_fps: true, codec: Codec::Jpeg, jpeg_quality: 65, color: ColorDepth::High };
         assert_eq!(old_balanced.upgraded(), Quality::preset(Preset::Balanced));
         let mine = Quality { scale_pct: 50, ..Quality::default() };
         assert_eq!(mine.upgraded(), mine, "own settings are kept");

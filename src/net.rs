@@ -463,9 +463,14 @@ impl SessionShared {
                     }
                 }
                 Ok(SessionMsg::Pointer { x, y, shape }) => self.pointer = Some((x, y, shape)),
-                Ok(SessionMsg::Timing { capture_ms, encode_ms, rtt_ms }) => {
+                Ok(SessionMsg::Timing { capture_ms, encode_ms, rtt_ms, pace_fps }) => {
                     let clean = |v: f32| if v.is_finite() { v.clamp(0.0, 60_000.0) } else { 0.0 };
-                    self.latency.host = Some(HostTiming { capture_ms: clean(capture_ms), encode_ms: clean(encode_ms), rtt_ms: rtt_ms.map(clean) });
+                    self.latency.host = Some(HostTiming {
+                        capture_ms: clean(capture_ms),
+                        encode_ms: clean(encode_ms),
+                        rtt_ms: rtt_ms.map(clean),
+                        pace_fps: pace_fps.map(|v| clean(v).min(1000.0)),
+                    });
                 }
                 Ok(m @ (SessionMsg::FsListing { .. } | SessionMsg::FsBegin { .. } | SessionMsg::FsDone { .. })) => self.file_message(m),
                 _ => {}
@@ -603,6 +608,8 @@ pub struct HostTiming {
     pub capture_ms: f32,
     pub encode_ms: f32,
     pub rtt_ms: Option<f32>,
+    /// Pictures per second the helper chose itself (automatic pace).
+    pub pace_fps: Option<f32>,
 }
 
 /// Where the time goes from the remote screen changing to this screen
@@ -635,8 +642,9 @@ impl Latency {
                 ms(self.draw_ms)
             );
         };
+        let pace = h.pace_fps.map_or(String::new(), |f| format!("\nPictures per second (automatic): up to {f:.0}"));
         format!(
-            "≈ {} from a click to seeing its result\n\nRead screen (remote): {}\nCompress (remote): {}\nNetwork round trip: {}\nDecode here: {}\nOn screen here: {}",
+            "≈ {} from a click to seeing its result\n\nRead screen (remote): {}\nCompress (remote): {}\nNetwork round trip: {}\nDecode here: {}\nOn screen here: {}{pace}",
             ms(self.total_ms()),
             ms(Some(h.capture_ms)),
             ms(Some(h.encode_ms)),
@@ -1091,13 +1099,14 @@ mod tests {
     fn latency_adds_up_host_network_and_viewer_parts() {
         let mut s = SessionShared::new(false);
         assert_eq!(s.latency.total_ms(), None);
-        let t = serde_json::to_string(&SessionMsg::Timing { capture_ms: 3.0, encode_ms: 7.0, rtt_ms: Some(30.0) }).unwrap();
+        let t = serde_json::to_string(&SessionMsg::Timing { capture_ms: 3.0, encode_ms: 7.0, rtt_ms: Some(30.0), pace_fps: Some(14.0) }).unwrap();
         s.apply(&Message::Text(t.into()), &Quality::default());
         assert_eq!(s.latency.total_ms(), Some(40.0), "nothing measured here yet");
         s.latency.decode_ms = Some(2.0);
         s.latency.draw_ms = Some(8.0);
         assert_eq!(s.latency.total_ms(), Some(50.0));
         assert!(s.latency.describe().contains("Network round trip: 30 ms"));
+        assert!(s.latency.describe().contains("automatic): up to 14"));
         // A host that sends nonsense can't break the numbers.
         let bad = r#"{"t":"timing","capture_ms":-5.0,"encode_ms":1e30,"rtt_ms":null}"#;
         s.apply(&Message::Text(bad.into()), &Quality::default());

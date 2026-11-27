@@ -131,7 +131,15 @@ pub enum SessionMsg {
     /// milliseconds per picture to read the screen (`capture_ms`) and to
     /// scale + compress it (`encode_ms`), and the round trip from sending a
     /// picture to its ack arriving (`rtt_ms`; `None` before the first ack).
-    Timing { capture_ms: f32, encode_ms: f32, rtt_ms: Option<f32> },
+    /// `pace_fps`: the pictures per second the helper chose itself
+    /// (`Quality::auto_fps`; `None` = fixed pace or an older helper).
+    Timing {
+        capture_ms: f32,
+        encode_ms: f32,
+        rtt_ms: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pace_fps: Option<f32>,
+    },
 
     // ---- direct (peer-to-peer) path, see `crate::direct` ----
     /// relay -> viewer and host at the start of a session: direct
@@ -446,8 +454,8 @@ mod tests {
             SessionMsg::Ack { seq: 9 },
             SessionMsg::Refresh,
             SessionMsg::Closed { reason: "Access withdrawn".into() },
-            SessionMsg::Timing { capture_ms: 4.5, encode_ms: 9.25, rtt_ms: Some(31.0) },
-            SessionMsg::Timing { capture_ms: 0.0, encode_ms: 0.0, rtt_ms: None },
+            SessionMsg::Timing { capture_ms: 4.5, encode_ms: 9.25, rtt_ms: Some(31.0), pace_fps: Some(12.5) },
+            SessionMsg::Timing { capture_ms: 0.0, encode_ms: 0.0, rtt_ms: None, pace_fps: None },
             SessionMsg::DirectInfo { stun_port: 3478, stun_servers: vec!["stun.cloudflare.com:3478".into()] },
             SessionMsg::DirectOffer {
                 fp: "ab01".into(),

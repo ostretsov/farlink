@@ -2881,7 +2881,15 @@ fn quality_controls(ui: &mut egui::Ui, q: &mut Quality) {
         ui.add(egui::Slider::new(&mut q.scale_pct, 25..=100).suffix(" %"));
         ui.end_row();
         ui.label("Pictures per second");
-        ui.add(egui::Slider::new(&mut q.max_fps, 1..=30));
+        ui.vertical(|ui| {
+            ui.checkbox(&mut q.auto_fps, "Automatic")
+                .on_hover_text("Starts at 10 a second and goes faster only while the remote computer and the link keep up, so clicks and keys stay quick");
+            let label = if q.auto_fps { "at most" } else { "always up to" };
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(label).color(MUTED).size(12.0));
+                ui.add(egui::Slider::new(&mut q.max_fps, 1..=30));
+            });
+        });
         ui.end_row();
         ui.label("Compression");
         ui.horizontal(|ui| {

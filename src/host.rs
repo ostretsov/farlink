@@ -513,6 +513,7 @@ pub fn run_screen(
     // Monitors the viewer has on screen (None = all).
     let mut watch: Option<Vec<u8>> = None;
     let mut idle = IdleTracker::new(Instant::now());
+    let mut pace = AutoPace::new(Instant::now());
     let mut seq: u32 = 0;
     let mut flow = FlowControl::new(Instant::now());
     let mut timing = TimingStats::default();
@@ -707,8 +708,9 @@ pub fn run_screen(
                 .any(|(m, e)| e.is_reset() && watch.as_ref().is_none_or(|w| w.contains(&m.index)));
             let changed = desk.changed() || reset;
             if !changed && !idle.recheck_due(now) {
-                let regular = idle.interval(&quality, now);
-                next_look = next_after(start, look_interval(regular, last_input.map(|t| now.duration_since(t)), None), &pointer);
+                pace.step(now, &quality, &mut flow);
+                let regular = idle.interval(pace.regular(&quality), now);
+                next_look = next_after(start, look_interval(regular, last_input.map(|t| now.duration_since(t)), None, Duration::ZERO), &pointer);
                 continue;
             }
             idle.checked(now);
@@ -786,15 +788,19 @@ pub fn run_screen(
                 flow.sent(seq, Instant::now());
                 idle.activity(Instant::now());
                 timing.picture(capture_time, encode_time);
-                if let Some(t) = timing.report(Instant::now(), &mut flow)
+                pace.picture(capture_time + encode_time);
+                let pace_fps = quality.auto_fps.then(|| pace.pictures_per_second(&quality));
+                if let Some(t) = timing.report(Instant::now(), &mut flow, pace_fps)
                     && !send_json(&t)
                 {
                     return;
                 }
             }
             let now = Instant::now();
-            let regular = idle.interval(&quality, now);
-            let interval = look_interval(regular, last_input.map(|t| now.duration_since(t)), Some(now.duration_since(start)));
+            pace.step(now, &quality, &mut flow);
+            let regular = idle.interval(pace.regular(&quality), now);
+            let interval =
+                look_interval(regular, last_input.map(|t| now.duration_since(t)), Some(now.duration_since(start)), pace.burst_gap(&quality));
             next_look = next_after(start, interval, &pointer);
         }
     };
@@ -917,13 +923,19 @@ impl TimingStats {
     }
 
     /// The message to send now, if one is due (nothing while no pictures go).
-    pub fn report(&mut self, now: Instant, flow: &mut FlowControl) -> Option<SessionMsg> {
+    /// `pace_fps`: the automatic pace now ([`AutoPace`]), if on.
+    pub fn report(&mut self, now: Instant, flow: &mut FlowControl, pace_fps: Option<f32>) -> Option<SessionMsg> {
         if self.pictures == 0 || self.last_report.is_some_and(|t| now.duration_since(t) < Self::EVERY) {
             return None;
         }
         let ms = |d: Duration| d.as_secs_f32() * 1000.0;
         let n = self.pictures;
-        let msg = SessionMsg::Timing { capture_ms: ms(self.capture / n), encode_ms: ms(self.encode / n), rtt_ms: flow.take_rtt().map(ms) };
+        let msg = SessionMsg::Timing {
+            capture_ms: ms(self.capture / n),
+            encode_ms: ms(self.encode / n),
+            rtt_ms: flow.take_rtt().map(ms),
+            pace_fps,
+        };
         *self = TimingStats { last_report: Some(now), ..TimingStats::default() };
         Some(msg)
     }
@@ -949,6 +961,9 @@ pub struct FlowControl {
     /// and the latest one.
     rtt_sum: (Duration, u32),
     last_rtt: Option<Duration>,
+    /// Since the last [`Self::take_pressure`]: pictures queued on the way
+    /// (round trip grew), or were held back with the window at its largest.
+    pressure: bool,
 }
 
 impl FlowControl {
@@ -970,6 +985,7 @@ impl FlowControl {
             limited: false,
             rtt_sum: (Duration::ZERO, 0),
             last_rtt: None,
+            pressure: false,
         }
     }
 
@@ -989,6 +1005,11 @@ impl FlowControl {
         if n > 0 { Some(sum / n) } else { self.last_rtt }
     }
 
+    /// Did pictures pile up on the way since the last call? (See [`AutoPace`].)
+    pub fn take_pressure(&mut self) -> bool {
+        std::mem::take(&mut self.pressure)
+    }
+
     /// The viewer is far away (round trip of [`Self::FAR`] or more): bytes
     /// cost more than CPU there, so lossless parts are compressed harder.
     pub fn far(&self) -> bool {
@@ -1003,6 +1024,7 @@ impl FlowControl {
         let ok = self.in_flight.len() < self.window;
         if !ok {
             self.limited = true;
+            self.pressure |= self.window >= Self::MAX;
         }
         ok
     }
@@ -1035,10 +1057,11 @@ impl FlowControl {
                 rtt
             }
         };
+        let queueing = rtt > base + (base / 2).max(Duration::from_millis(20));
+        self.pressure |= queueing;
         if now.duration_since(self.changed) < rtt.max(Duration::from_millis(10)) {
             return;
         }
-        let queueing = rtt > base + (base / 2).max(Duration::from_millis(20));
         if queueing && self.window > Self::MIN {
             self.window -= 1;
             self.changed = now;
@@ -1047,6 +1070,77 @@ impl FlowControl {
             self.changed = now;
         }
         self.limited = false;
+    }
+}
+
+/// Automatic pictures per second ([`Quality::auto_fps`]): the pace follows
+/// how responsive the session is. Pictures that can't get through in time
+/// only queue up in front of the next reaction to a click or key, so the
+/// helper starts at [`Self::START`] (10 a second) and goes faster only while
+/// every picture arrives without queueing and the computer reads and
+/// compresses them easily. As soon as pictures pile up on the way, it slows
+/// down again (down to [`Self::SLOWEST`]).
+#[derive(Debug)]
+pub struct AutoPace {
+    gap: Duration,
+    /// Capture + compress time of the pictures since the last step (sum, count).
+    cost: (Duration, u32),
+    next: Instant,
+}
+
+impl AutoPace {
+    pub const START: Duration = Duration::from_millis(100);
+    pub const SLOWEST: Duration = Duration::from_millis(250);
+    /// The pace is reconsidered this often.
+    pub const EVERY: Duration = Duration::from_millis(500);
+
+    pub fn new(now: Instant) -> AutoPace {
+        AutoPace { gap: Self::START, cost: (Duration::ZERO, 0), next: now + Self::EVERY }
+    }
+
+    /// A picture went out; reading and compressing it took `cost`.
+    pub fn picture(&mut self, cost: Duration) {
+        self.cost = (self.cost.0 + cost, self.cost.1 + 1);
+    }
+
+    /// Reconsider the pace (every [`Self::EVERY`]). `pressure`: pictures
+    /// piled up on the way since the last step ([`FlowControl::take_pressure`]).
+    pub fn step(&mut self, now: Instant, q: &Quality, flow: &mut FlowControl) {
+        if now < self.next {
+            return;
+        }
+        self.next = now + Self::EVERY;
+        let pressure = flow.take_pressure();
+        let (sum, n) = std::mem::take(&mut self.cost);
+        if pressure {
+            self.gap = self.gap * 3 / 2;
+        } else if n > 0 {
+            self.gap = self.gap * 4 / 5;
+        }
+        // Leave the computer at least half of the time for its own work.
+        if n > 0 {
+            self.gap = self.gap.max(sum / n * 2);
+        }
+        self.gap = self.gap.clamp(Self::fastest(q), Self::SLOWEST.max(Self::fastest(q)));
+    }
+
+    fn fastest(q: &Quality) -> Duration {
+        Duration::from_millis(q.frame_interval_ms())
+    }
+
+    /// Time between pictures while the screen changes.
+    pub fn regular(&self, q: &Quality) -> Duration {
+        if q.auto_fps { self.gap.max(Self::fastest(q)) } else { Self::fastest(q) }
+    }
+
+    /// Pictures right after input may come twice as fast as [`Self::regular`]
+    /// (the reaction to a click matters most), never faster than this.
+    pub fn burst_gap(&self, q: &Quality) -> Duration {
+        if q.auto_fps { self.gap / 2 } else { Duration::ZERO }
+    }
+
+    pub fn pictures_per_second(&self, q: &Quality) -> f32 {
+        1.0 / self.regular(q).as_secs_f32()
     }
 }
 
@@ -1072,13 +1166,15 @@ pub const BURST_FRAME: Duration = Duration::from_millis(16);
 /// long ago mouse / keyboard input arrived; `cost`: how long this look took
 /// when the screen was read (`None`: the system said nothing changed, which
 /// costs nothing). A slow capture is never repeated faster than it can go.
-pub fn look_interval(regular: Duration, since_input: Option<Duration>, cost: Option<Duration>) -> Duration {
+/// `burst_gap`: pictures after input never come faster than this
+/// ([`AutoPace::burst_gap`]).
+pub fn look_interval(regular: Duration, since_input: Option<Duration>, cost: Option<Duration>, burst_gap: Duration) -> Duration {
     if since_input.is_none_or(|t| t >= INPUT_BURST) {
         return regular;
     }
     match cost {
         None => regular.min(BURST_POLL),
-        Some(cost) => regular.min(BURST_FRAME.max(cost * 2)),
+        Some(cost) => regular.min(BURST_FRAME.max(cost * 2).max(burst_gap)),
     }
 }
 
@@ -1194,9 +1290,9 @@ impl IdleTracker {
         now.duration_since(self.last_activity) >= Self::IDLE_AFTER
     }
 
-    /// Time between screen checks right now.
-    pub fn interval(&self, q: &Quality, now: Instant) -> Duration {
-        let busy = Duration::from_millis(q.frame_interval_ms());
+    /// Time between screen checks right now; `busy` = the pace while the
+    /// screen changes ([`AutoPace::regular`]).
+    pub fn interval(&self, busy: Duration, now: Instant) -> Duration {
         if self.is_idle(now) { busy.max(Self::IDLE_INTERVAL) } else { busy }
     }
 }
@@ -1440,13 +1536,13 @@ mod tests {
     fn idle_sessions_slow_down_and_wake_on_activity() {
         let t0 = Instant::now();
         let mut idle = IdleTracker::new(t0);
-        let q = Quality { max_fps: 20, ..Quality::preset(Preset::Balanced) };
-        assert_eq!(idle.interval(&q, t0), Duration::from_millis(50), "busy: full speed");
+        let q = Duration::from_millis(50);
+        assert_eq!(idle.interval(q, t0), Duration::from_millis(50), "busy: full speed");
         let later = t0 + Duration::from_secs(3);
         assert!(idle.is_idle(later));
-        assert_eq!(idle.interval(&q, later), IdleTracker::IDLE_INTERVAL, "idle: 4 checks a second");
+        assert_eq!(idle.interval(q, later), IdleTracker::IDLE_INTERVAL, "idle: 4 checks a second");
         idle.activity(later);
-        assert_eq!(idle.interval(&q, later), Duration::from_millis(50), "mouse use wakes it up");
+        assert_eq!(idle.interval(q, later), Duration::from_millis(50), "mouse use wakes it up");
         assert!(!idle.recheck_due(t0 + Duration::from_millis(500)));
         assert!(idle.recheck_due(t0 + IdleTracker::RECHECK));
     }
@@ -1745,15 +1841,15 @@ mod tests {
         let ms = Duration::from_millis;
         let regular = ms(33);
         // No input lately: the normal pace.
-        assert_eq!(look_interval(regular, None, None), regular);
-        assert_eq!(look_interval(regular, Some(INPUT_BURST), Some(ms(2))), regular);
+        assert_eq!(look_interval(regular, None, None, ms(0)), regular);
+        assert_eq!(look_interval(regular, Some(INPUT_BURST), Some(ms(2)), ms(0)), regular);
         // Just after input: cheap checks every few ms, pictures at 60 per second.
-        assert_eq!(look_interval(regular, Some(ms(10)), None), BURST_POLL);
-        assert_eq!(look_interval(regular, Some(ms(10)), Some(ms(3))), BURST_FRAME);
+        assert_eq!(look_interval(regular, Some(ms(10)), None, ms(0)), BURST_POLL);
+        assert_eq!(look_interval(regular, Some(ms(10)), Some(ms(3)), ms(0)), BURST_FRAME);
         // A slow capture gets room to breathe, and a faster regular pace wins.
-        assert_eq!(look_interval(regular, Some(ms(10)), Some(ms(12))), ms(24));
-        assert_eq!(look_interval(regular, Some(ms(10)), Some(ms(40))), regular);
-        assert_eq!(look_interval(ms(5), Some(ms(10)), None), ms(5));
+        assert_eq!(look_interval(regular, Some(ms(10)), Some(ms(12)), ms(0)), ms(24));
+        assert_eq!(look_interval(regular, Some(ms(10)), Some(ms(40)), ms(0)), regular);
+        assert_eq!(look_interval(ms(5), Some(ms(10)), None, ms(0)), ms(5));
     }
 
     #[test]
@@ -1781,19 +1877,20 @@ mod tests {
         let ms = Duration::from_millis;
         let mut f = FlowControl::new(t0);
         let mut t = TimingStats::default();
-        assert_eq!(t.report(t0, &mut f), None, "nothing sent: nothing to say");
+        assert_eq!(t.report(t0, &mut f, None), None, "nothing sent: nothing to say");
         f.sent(1, t0);
         f.acked(1, t0 + ms(20));
         f.sent(2, t0);
         f.acked(2, t0 + ms(40));
         t.picture(ms(2), ms(10));
         t.picture(ms(4), ms(20));
-        let Some(SessionMsg::Timing { capture_ms, encode_ms, rtt_ms }) = t.report(t0, &mut f) else { panic!() };
+        let Some(SessionMsg::Timing { capture_ms, encode_ms, rtt_ms, pace_fps }) = t.report(t0, &mut f, Some(10.0)) else { panic!() };
+        assert_eq!(pace_fps, Some(10.0));
         assert!((capture_ms - 3.0).abs() < 0.01 && (encode_ms - 15.0).abs() < 0.01);
         assert!((rtt_ms.unwrap() - 30.0).abs() < 0.01, "average round trip");
         t.picture(ms(1), ms(1));
-        assert_eq!(t.report(t0 + ms(500), &mut f), None, "at most once a second");
-        let Some(SessionMsg::Timing { rtt_ms, .. }) = t.report(t0 + ms(1000), &mut f) else { panic!() };
+        assert_eq!(t.report(t0 + ms(500), &mut f, None), None, "at most once a second");
+        let Some(SessionMsg::Timing { rtt_ms, .. }) = t.report(t0 + ms(1000), &mut f, None) else { panic!() };
         assert!((rtt_ms.unwrap() - 40.0).abs() < 0.01, "no new ack: the latest round trip");
     }
 

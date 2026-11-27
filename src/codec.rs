@@ -884,7 +884,7 @@ mod tests {
     fn jpeg_is_close_and_quality_matters() {
         let raw = gradient(128, 128);
         let enc = |jq| {
-            let q = Quality { codec: Codec::Jpeg, jpeg_quality: jq, color: ColorDepth::Full, scale_pct: 100, max_fps: 10 };
+            let q = Quality { codec: Codec::Jpeg, jpeg_quality: jq, color: ColorDepth::Full, scale_pct: 100, max_fps: 10, auto_fps: false };
             encode_rect(&raw, Rect { x: 0, y: 0, w: 128, h: 128 }, &q).unwrap()
         };
         let (fmt, hi) = enc(95);
