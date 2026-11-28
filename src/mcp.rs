@@ -45,6 +45,10 @@ const MAX_TIMEOUT: u64 = 3600;
 const CONNECT_WAIT: f32 = 20.0;
 /// A transfer that moves no bytes for this long has failed.
 const STALL: Duration = Duration::from_secs(60);
+/// `wait_until_still`: time between two looks at the screen…
+const STILL_GAP: Duration = Duration::from_millis(300);
+/// …and the longest it waits before handing back the latest picture.
+const STILL_LIMIT: Duration = Duration::from_secs(5);
 
 /// How to sign in to the relay.
 #[derive(Debug, Clone, Default)]
@@ -241,7 +245,9 @@ impl Mcp {
                 }
                 // Give the computer a moment to react before the next look.
                 std::thread::sleep(Duration::from_millis(150));
-                Ok(vec![text("Done. Take a screenshot to see the result.")])
+                Ok(vec![text(
+                    "Done. Take a screenshot to see the result (wait_until_still: true if something is still opening or loading).",
+                )])
             }
             "run_command" => self.run_command(&machine, &a),
             "list_files" => self.list_files(&machine, a.opt_str("path").unwrap_or("")),
@@ -313,18 +319,39 @@ impl Mcp {
             .map(|v| v as u32)
             .unwrap_or(SHOT_SIZE)
             .clamp(256, 4096);
-        let frame = self.api.screenshot(&m.machine.id, mon.index)?;
+        let (frame, waited) = if a.bool("wait_until_still") {
+            let (f, s) = wait_until_still(
+                || self.api.screenshot(&m.machine.id, mon.index),
+                STILL_GAP,
+                STILL_LIMIT,
+            )?;
+            (f, Some(s))
+        } else {
+            (self.api.screenshot(&m.machine.id, mon.index)?, None)
+        };
         let (w, h, jpeg) = crate::codec::thumbnail_jpeg(&frame, max, 85)?;
         self.shot_size
             .insert((m.machine.id.clone(), mon.index), (w, h));
         let screens = m.machine.monitors.len();
-        let about = format!(
+        let mut about = format!(
             "{}, screen {} of {screens} ({}×{}), picture {w}×{h}. Click coordinates are pixels of this picture.",
             m.machine.name,
             mon.index + 1,
             frame.width,
             frame.height,
         );
+        match waited {
+            Some(Still::Stopped(t)) => {
+                about += &format!(" The screen stopped changing after {:.1} s.", t.as_secs_f32())
+            }
+            Some(Still::KeptChanging(t)) => {
+                about += &format!(
+                    " The screen kept changing for {:.0} s; this is the latest picture.",
+                    t.as_secs_f32()
+                )
+            }
+            None => {}
+        }
         Ok(vec![
             json!({ "type": "image", "data": crate::util::base64_encode(&jpeg), "mimeType": "image/jpeg" }),
             text(&about),
@@ -748,6 +775,7 @@ fn tool_list() -> Vec<Value> {
             json!({
                 "computer": computer, "screen": screen,
                 "max_size": { "type": "integer", "minimum": 256, "maximum": 4096, "description": format!("Longest side of the picture (default {SHOT_SIZE})") },
+                "wait_until_still": { "type": "boolean", "description": format!("Wait (up to {} s) until the screen stops changing, e.g. after a click opened a window or a page is loading. A blinking cursor or a small spinner does not count as a change", STILL_LIMIT.as_secs()) },
             }),
             &["computer"],
             true,
@@ -1210,6 +1238,54 @@ pub fn split_path(path: &str) -> Option<(String, String)> {
     Some((parent, name.to_string()))
 }
 
+/// How a `wait_until_still` screenshot went (time since the first look).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Still {
+    Stopped(Duration),
+    KeptChanging(Duration),
+}
+
+/// Look at the screen (`take`) every `gap` until two pictures in a row are
+/// [`nearly_same`], at most `limit` long; the last picture and how it went.
+pub fn wait_until_still(
+    mut take: impl FnMut() -> Result<crate::codec::Frame>,
+    gap: Duration,
+    limit: Duration,
+) -> Result<(crate::codec::Frame, Still)> {
+    let start = Instant::now();
+    let mut prev = take()?;
+    loop {
+        if start.elapsed() + gap > limit {
+            return Ok((prev, Still::KeptChanging(start.elapsed())));
+        }
+        std::thread::sleep(gap);
+        let cur = take()?;
+        if nearly_same(&prev, &cur) {
+            return Ok((cur, Still::Stopped(start.elapsed())));
+        }
+        prev = cur;
+    }
+}
+
+/// Same size and at most 0.01 % of the pixels different (at least 64):
+/// a blinking text cursor or a small spinner is not "changing".
+pub fn nearly_same(a: &crate::codec::Frame, b: &crate::codec::Frame) -> bool {
+    if (a.width, a.height) != (b.width, b.height) {
+        return false;
+    }
+    let allowed = (a.width as usize * a.height as usize / 10_000).max(64);
+    let mut differ = 0;
+    for (pa, pb) in a.rgba.chunks_exact(4).zip(b.rgba.chunks_exact(4)) {
+        if pa[..3] != pb[..3] {
+            differ += 1;
+            if differ > allowed {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// The size a screenshot of a `w`×`h` screen gets with longest side `max`
 /// (the same rounding as [`crate::codec::thumbnail_jpeg`]).
 pub fn scaled_size(w: u32, h: u32, max: u32) -> (u32, u32) {
@@ -1336,7 +1412,71 @@ fn press(names: &[String]) -> Vec<InputEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::{Frame, Rect};
     use crate::server::MachineSummary;
+
+    /// A 1000×500 screen with a `w`×`h` block drawn in the corner.
+    fn screen_with_block(w: u32, h: u32) -> Frame {
+        let mut f = Frame::new(1000, 500);
+        f.fill_rect(Rect { x: 0, y: 0, w, h }, [255, 0, 0, 255]);
+        f
+    }
+
+    #[test]
+    fn a_blinking_cursor_is_not_a_change() {
+        let empty = screen_with_block(0, 0);
+        // 2×20 cursor = 40 pixels; 0.01 % of 500 000 = 50, at least 64.
+        assert!(nearly_same(&empty, &screen_with_block(2, 20)));
+        assert!(nearly_same(&empty, &screen_with_block(8, 8)));
+        assert!(!nearly_same(&empty, &screen_with_block(9, 8)));
+        // A window opening is.
+        assert!(!nearly_same(&empty, &screen_with_block(300, 200)));
+        // So is another screen size.
+        assert!(!nearly_same(&empty, &Frame::new(500, 1000)));
+    }
+
+    #[test]
+    fn waits_until_two_looks_agree() {
+        // A window opening over three looks, then staying.
+        let mut looks = [0, 100, 200, 300, 300, 300].into_iter();
+        let mut taken = 0;
+        let (f, how) = wait_until_still(
+            || {
+                taken += 1;
+                Ok(screen_with_block(looks.next().unwrap(), 100))
+            },
+            Duration::ZERO,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(matches!(how, Still::Stopped(_)));
+        assert_eq!(taken, 5);
+        assert_eq!(f.rgba, screen_with_block(300, 100).rgba);
+    }
+
+    #[test]
+    fn gives_up_on_a_screen_that_keeps_changing() {
+        let mut n = 0;
+        let (f, how) = wait_until_still(
+            || {
+                n += 50;
+                Ok(screen_with_block(n % 1000, 100))
+            },
+            Duration::from_millis(20),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        assert!(matches!(how, Still::KeptChanging(t) if t < Duration::from_millis(400)));
+        // The latest picture comes back.
+        assert_eq!(f.rgba, screen_with_block(n % 1000, 100).rgba);
+        // A failed look ends it.
+        let err = wait_until_still(
+            || bail!("offline"),
+            Duration::ZERO,
+            Duration::from_secs(1),
+        );
+        assert!(err.is_err());
+    }
 
     fn mcp() -> Mcp {
         Mcp::new(

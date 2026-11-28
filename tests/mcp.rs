@@ -305,6 +305,16 @@ async fn shell_files_and_screenshots_on_a_real_helper() {
         let jpeg = farlink::util::base64_decode(img["data"].as_str().unwrap()).unwrap();
         let f = farlink::codec::decode_image(&jpeg).unwrap();
         assert_eq!((f.width, f.height), (640, 512));
+        // Waiting until the screen is still: the demo screen only moves a
+        // small progress bar, which does not count.
+        let (t, err, result) = call(
+            &mut m,
+            "screenshot",
+            json!({"computer": id, "wait_until_still": true}),
+        );
+        assert!(!err, "{t}");
+        assert!(t.contains("The screen stopped changing after"), "{t}");
+        assert_eq!(result["content"][0]["mimeType"], "image/jpeg");
         let (t, err, _) = call(&mut m, "screenshot", json!({"computer": id, "screen": 5}));
         assert!(err && t.contains("no screen 5"), "{t}");
         let (t, err, _) = call(&mut m, "screenshot", json!({"computer": "no-such-pc"}));
