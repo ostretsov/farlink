@@ -367,10 +367,12 @@ fn shell_window(ui: &mut egui::Ui, s: &mut OpenSession) -> bool {
                         .hint_text(hint)
                         .desired_width(f32::INFINITY);
                     let resp = ui.add_enabled(live && cwd_known, edit);
-                    if std::mem::take(&mut view.focus) || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                    // Read once: refocusing below makes `lost_focus()` false again.
+                    let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if std::mem::take(&mut view.focus) || entered {
                         resp.request_focus();
                     }
-                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    if entered {
                         if running {
                             let text = format!("{}\n", std::mem::take(&mut view.input));
                             s.handle.shell_input(&text);
