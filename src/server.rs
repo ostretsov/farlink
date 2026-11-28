@@ -434,6 +434,7 @@ impl Relay {
         self: &Arc<Self>,
         machine_id: &str,
         view_only: bool,
+        shell: bool,
         grant: Option<String>,
         user: Option<String>,
         who: String,
@@ -458,6 +459,7 @@ impl Relay {
             .send(AgentMsg::OpenSession {
                 session_id: session_id.clone(),
                 view_only,
+                shell,
             })
             .is_err()
         {
@@ -2055,12 +2057,14 @@ async fn send_closed(sink: &mut futures_util::stream::SplitSink<WebSocket, Messa
     let _ = sink.close().await;
 }
 
-/// Should a message from the viewer reach the host?
-pub fn viewer_message_allowed(text: &str, view_only: bool) -> bool {
+/// Should a message from the viewer reach the host? `shell`: the viewer is
+/// the administrator (only they may use the remote shell).
+pub fn viewer_message_allowed(text: &str, view_only: bool, shell: bool) -> bool {
     match serde_json::from_str::<SessionMsg>(text) {
         // Mode changes go through the relay's own check, never straight to the host.
         Ok(m) => {
             !(view_only && m.is_control())
+                && !(!shell && m.is_shell_request())
                 && !matches!(
                     m,
                     SessionMsg::Hello { .. }
@@ -2093,9 +2097,11 @@ async fn viewer_loop(
     let (mut vs, mut vr) = viewer.split();
     // A view-only temporary link stays view-only; everyone else may switch.
     let locked = grant.is_some() && view_only;
+    // The remote shell: the administrator only (no person, no temporary link).
+    let shell = grant.is_none() && user.is_none();
     let mut view_only = view_only;
     let (session_id, host, mut kill) =
-        match r.open_session(&machine, view_only, grant, user, who).await {
+        match r.open_session(&machine, view_only, shell, grant, user, who).await {
             Ok(x) => x,
             Err(reason) => {
                 send_closed(&mut vs, &reason).await;
@@ -2183,7 +2189,7 @@ async fn viewer_loop(
                         let _ = to_viewer.send(mode(view_only));
                         continue;
                     }
-                    if viewer_message_allowed(t.as_str(), view_only) && hs.send(Message::Text(t)).await.is_err() {
+                    if viewer_message_allowed(t.as_str(), view_only, shell) && hs.send(Message::Text(t)).await.is_err() {
                         break "The remote computer disconnected".to_string();
                     }
                 }
@@ -2242,8 +2248,8 @@ mod tests {
             text: "secret".into(),
         })
         .unwrap();
-        assert!(!viewer_message_allowed(&clip, true));
-        assert!(viewer_message_allowed(&clip, false));
+        assert!(!viewer_message_allowed(&clip, true, true));
+        assert!(viewer_message_allowed(&clip, false, true));
         assert!(!host_message_allowed(&clip, true));
         assert!(host_message_allowed(&clip, false));
         let notice = serde_json::to_string(&SessionMsg::Notice { text: "hi".into() }).unwrap();
@@ -2258,31 +2264,43 @@ mod tests {
             quality: crate::quality::Quality::default(),
         })
         .unwrap();
-        assert!(!viewer_message_allowed(input, true));
-        assert!(viewer_message_allowed(input, false));
-        assert!(viewer_message_allowed(ack, true));
-        assert!(viewer_message_allowed(&quality, true));
-        assert!(!viewer_message_allowed("not json", false));
+        assert!(!viewer_message_allowed(input, true, true));
+        assert!(viewer_message_allowed(input, false, true));
+        assert!(viewer_message_allowed(ack, true, true));
+        assert!(viewer_message_allowed(&quality, true, true));
+        assert!(!viewer_message_allowed("not json", false, true));
         assert!(
-            !viewer_message_allowed(r#"{"t":"closed","reason":"x"}"#, false),
+            !viewer_message_allowed(r#"{"t":"closed","reason":"x"}"#, false, true),
             "viewer can't fake relay messages"
         );
         assert!(
-            !viewer_message_allowed(r#"{"t":"direct_info","stun_port":1}"#, false),
+            !viewer_message_allowed(r#"{"t":"direct_info","stun_port":1}"#, false, true),
             "only the relay allows direct connections"
         );
         let offer = r#"{"t":"direct_offer","fp":"ab","addrs":["192.168.1.2:5000"]}"#;
         assert!(
-            viewer_message_allowed(offer, true),
+            viewer_message_allowed(offer, true, true),
             "view-only sessions may go direct too (pictures only)"
         );
         assert!(viewer_message_allowed(
             r#"{"t":"path_switch","direct":true}"#,
+            true,
             true
         ));
         let ping = r#"{"t":"input","event":{"k":"ping","mon":0,"x":0.5,"y":0.5}}"#;
-        assert!(!viewer_message_allowed(ping, true), "view-only can't ping");
-        assert!(viewer_message_allowed(ping, false));
+        assert!(!viewer_message_allowed(ping, true, true), "view-only can't ping");
+        assert!(viewer_message_allowed(ping, false, true));
+    }
+
+    #[test]
+    fn only_the_administrator_reaches_the_shell() {
+        let run = r#"{"t":"shell_run","req":1,"command":"whoami"}"#;
+        let stop = r#"{"t":"shell_stop","req":1}"#;
+        assert!(viewer_message_allowed(run, false, true));
+        assert!(viewer_message_allowed(stop, false, true));
+        assert!(!viewer_message_allowed(run, false, false), "people and links get no shell");
+        assert!(!viewer_message_allowed(stop, false, false));
+        assert!(!viewer_message_allowed(run, true, true), "not while watching only");
     }
 
     #[test]

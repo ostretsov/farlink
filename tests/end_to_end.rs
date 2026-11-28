@@ -127,7 +127,7 @@ async fn fake_host_with(s: &TestServer, token: &str, hostname: &str) -> (Ws, Str
 
 /// Fake host answers an OpenSession by opening its session socket.
 async fn accept_session(s: &TestServer, agent: &mut Ws, id: &str, secret: &str) -> (Ws, bool) {
-    let AgentMsg::OpenSession { session_id, view_only } = next_json::<AgentMsg>(agent).await else { panic!("expected open_session") };
+    let AgentMsg::OpenSession { session_id, view_only, .. } = next_json::<AgentMsg>(agent).await else { panic!("expected open_session") };
     let url = s.ws(&format!("/ws/host-session/{session_id}?machine={id}&secret={secret}"));
     let (mut host, _) = connect_async(url).await.unwrap();
     send(
@@ -1578,4 +1578,131 @@ async fn when_no_direct_path_works_the_session_stays_on_the_relay() {
 
 fn rand_f() -> f32 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos() as f32 / 1e9
+}
+
+/// Wait for a real (demo) helper enrolled with `token` to come online.
+async fn helper_with(s: &TestServer, token: String, name: &str) -> String {
+    let cfg_dir = farlink::util::unique_temp_dir(name);
+    let cfg = HostConfig { server_url: s.url.clone(), enroll_token: Some(token), machine_id: None, secret: None };
+    let before: Vec<String> = s.overview().await.machines.iter().map(|m| m.machine.id.clone()).collect();
+    tokio::spawn(run_agent(cfg_dir.join("host.json"), cfg, HostOptions { demo: true, no_update: true }));
+    for _ in 0..100 {
+        if let Some(m) = s.overview().await.machines.iter().find(|m| m.online && !before.contains(&m.machine.id)) {
+            return m.machine.id.clone();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("helper never came online");
+}
+
+/// Run one shell command; its output and the final answer (`None`: no
+/// answer within `wait`).
+async fn shell(ws: &mut Ws, req: u32, command: &str, wait: Duration) -> (String, Option<SessionMsg>) {
+    send(ws, &SessionMsg::ShellRun { req, command: command.into(), powershell: false }).await;
+    let mut out = String::new();
+    let answer = tokio::time::timeout(wait, async {
+        loop {
+            let Some(Ok(msg)) = ws.next().await else { return None };
+            let Message::Text(t) = msg else { continue };
+            match serde_json::from_str::<SessionMsg>(&t) {
+                Ok(SessionMsg::ShellOutput { req: r, text, .. }) if r == req => out.push_str(&text),
+                Ok(m @ SessionMsg::ShellDone { req: r, .. }) if r == req => return Some(m),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+    (out, answer)
+}
+
+async fn open_view(s: &TestServer, path: &str) -> Ws {
+    let (mut ws, _) = connect_async(s.ws(path)).await.unwrap();
+    let _hello: SessionMsg = next_json(&mut ws).await;
+    send(&mut ws, &SessionMsg::Watch { monitors: vec![] }).await; // no pictures needed
+    ws
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_the_administrator_gets_a_shell() {
+    let s = start_server().await;
+    let id = helper_with(&s, s.relay.enroll_token(), "farlink-e2e-shell").await;
+
+    // The administrator: commands run, output streams back, cd is remembered.
+    let mut admin = open_view(&s, &format!("/ws/view/{id}?token={}", s.admin)).await;
+    let (_, hello) = shell(&mut admin, 1, "", Duration::from_secs(10)).await;
+    let Some(SessionMsg::ShellDone { code: None, error: None, cwd, .. }) = hello else { panic!("{hello:?}") };
+    assert!(!cwd.is_empty(), "the first answer names the folder");
+    let dir = farlink::util::unique_temp_dir("farlink-e2e-shell-cd").canonicalize().unwrap();
+    let (_, done) = shell(&mut admin, 2, &format!("cd '{}'", dir.display()), Duration::from_secs(10)).await;
+    assert!(matches!(&done, Some(SessionMsg::ShellDone { code: Some(0), cwd, .. }) if *cwd == dir.display().to_string()), "{done:?}");
+    let (out, done) = shell(&mut admin, 3, "pwd; echo done; exit 4", Duration::from_secs(10)).await;
+    assert_eq!(out, format!("{}\ndone\n", dir.display()));
+    assert!(matches!(done, Some(SessionMsg::ShellDone { code: Some(4), .. })), "{done:?}");
+
+    // Several shells on one computer, each with its own folder.
+    let mut second = open_view(&s, &format!("/ws/view/{id}?token={}", s.admin)).await;
+    let (out, _) = shell(&mut second, 1, "pwd", Duration::from_secs(10)).await;
+    assert_ne!(out.trim(), dir.display().to_string(), "the second shell starts at home");
+
+    // A view-only session of the administrator: the relay drops it.
+    let mut watcher = open_view(&s, &format!("/ws/view/{id}?token={}&view_only=1", s.admin)).await;
+    let (out, done) = shell(&mut watcher, 1, "echo nope", Duration::from_millis(1500)).await;
+    assert!(out.is_empty() && done.is_none(), "{done:?}");
+
+    // A temporary link with control: no shell either.
+    let api = s.api();
+    let id2 = id.clone();
+    let link = blocking(move || api.create_grant(&id2, 30, false, "").unwrap()).await;
+    let guest = farlink::net::parse_link(&link).unwrap();
+    let mut guest = open_view(&s, &format!("/ws/guest/{}", guest.token)).await;
+    let (out, done) = shell(&mut guest, 1, "echo nope", Duration::from_millis(1500)).await;
+    assert!(out.is_empty() && done.is_none(), "{done:?}");
+
+    // A person on their own computer: the relay drops it, and the helper
+    // (which hears the session isn't the administrator's) would refuse too.
+    let (base, admin_token) = (s.url.clone(), s.admin.clone());
+    let created: serde_json::Value = blocking(move || {
+        ureq::post(&format!("{base}/api/users"))
+            .header("Authorization", &format!("Bearer {admin_token}"))
+            .send_json(serde_json::json!({"name": "Anna", "login": "anna", "password": "anna-pass-1"}))
+            .unwrap()
+            .body_mut()
+            .read_json()
+            .unwrap()
+    })
+    .await;
+    let anna_enroll = created["install_url"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
+    let anna_pc = helper_with(&s, anna_enroll, "farlink-e2e-shell-anna").await;
+    let url = s.url.clone();
+    let anna = blocking(move || farlink::net::Api::login(&url, "anna", "anna-pass-1").unwrap()).await;
+    let mut person = open_view(&s, &format!("/ws/view/{anna_pc}?token={anna}")).await;
+    let (out, done) = shell(&mut person, 1, "echo nope", Duration::from_millis(1500)).await;
+    assert!(out.is_empty() && done.is_none(), "{done:?}");
+}
+
+/// The relay tells the helper whether the session may use the shell: only
+/// the administrator's do (the helper's own check on the direct path rests on it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_relay_allows_the_shell_only_in_the_administrators_sessions() {
+    let s = start_server().await;
+    let (mut agent, id, _secret) = fake_host(&s).await;
+    let _admin = tokio::spawn(connect_async(s.ws(&format!("/ws/view/{id}?token={}", s.admin))));
+    let AgentMsg::OpenSession { shell, .. } = next_json::<AgentMsg>(&mut agent).await else { panic!("expected open_session") };
+    assert!(shell, "the administrator's session");
+
+    let api = s.api();
+    let id2 = id.clone();
+    let link = blocking(move || api.create_grant(&id2, 30, false, "").unwrap()).await;
+    let guest = farlink::net::parse_link(&link).unwrap();
+    let _guest = tokio::spawn(connect_async(s.ws(&format!("/ws/guest/{}", guest.token))));
+    let AgentMsg::OpenSession { shell, view_only, .. } = next_json::<AgentMsg>(&mut agent).await else { panic!("expected open_session") };
+    assert!(!view_only);
+    assert!(!shell, "a temporary link with control still gets no shell");
+
+    // Older relays don't send the flag at all: no shell.
+    let old: AgentMsg = serde_json::from_str(r#"{"t":"open_session","session_id":"x","view_only":false}"#).unwrap();
+    assert!(matches!(old, AgentMsg::OpenSession { shell: false, .. }));
 }

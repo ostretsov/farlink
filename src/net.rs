@@ -352,9 +352,182 @@ pub struct SessionShared {
     pub pointer_shapes: HashMap<u32, crate::desktop::PointerImage>,
     /// Where the remote pointer is (virtual-desktop pixels) and its shape id.
     pub pointer: Option<(i32, i32, u32)>,
+    /// The remote shell's transcript (this window's memory only).
+    pub shell: ShellLog,
     next_req: u32,
     /// Download request -> (local folder, open file once it started).
     downloads: HashMap<u32, (PathBuf, Option<std::fs::File>)>,
+}
+
+/// What a piece of the shell transcript is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellText {
+    /// The prompt and what was typed.
+    Command,
+    Out,
+    Err,
+    /// Exit codes and problems.
+    Note,
+}
+
+/// Most transcript text kept per shell window (the oldest goes first).
+pub const MAX_SHELL_TEXT: usize = 512 * 1024;
+
+/// The remote shell's transcript. Never saved anywhere: it goes when the
+/// window closes.
+#[derive(Debug)]
+pub struct ShellLog {
+    pub parts: Vec<(ShellText, String)>,
+    /// The shell's folder on the remote computer (`None` until it answered).
+    pub cwd: Option<String>,
+    /// The command running now.
+    pub running: Option<u32>,
+    /// When the first question ("which folder?") went out.
+    pub asked: Option<Instant>,
+    /// Something changed: scroll to the end.
+    pub changed: bool,
+    /// Windows computer: run with PowerShell (else cmd). Starts on.
+    pub powershell: bool,
+    len: usize,
+}
+
+impl Default for ShellLog {
+    fn default() -> Self {
+        ShellLog {
+            parts: Vec::new(),
+            cwd: None,
+            running: None,
+            asked: None,
+            changed: false,
+            powershell: true,
+            len: 0,
+        }
+    }
+}
+
+/// Output as the transcript shows it: no colour codes or other terminal
+/// control sequences, no carriage returns.
+pub fn clean_output(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.next() {
+                // CSI: parameters up to a final letter.
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: up to BEL or ESC \.
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' || (c == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            '\n' | '\t' => out.push(c),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+impl ShellLog {
+    /// The remote computer is Windows (its folders start with a drive letter).
+    pub fn windows(&self) -> bool {
+        self.cwd.as_deref().is_some_and(|c| c.as_bytes().get(1) == Some(&b':'))
+    }
+
+    /// The prompt shown before a command.
+    pub fn prompt(&self) -> String {
+        let cwd = self.cwd.as_deref().unwrap_or("");
+        match (self.windows(), self.powershell) {
+            (true, true) => format!("PS {cwd}>"),
+            (true, false) => format!("{cwd}>"),
+            (false, _) => format!("{cwd} $"),
+        }
+    }
+
+    pub fn push(&mut self, kind: ShellText, text: &str) {
+        let text = if kind == ShellText::Command { text.to_string() } else { clean_output(text) };
+        if text.is_empty() {
+            return;
+        }
+        self.len += text.len();
+        match self.parts.last_mut() {
+            Some((k, t)) if *k == kind => t.push_str(&text),
+            _ => self.parts.push((kind, text)),
+        }
+        while self.len > MAX_SHELL_TEXT && !self.parts.is_empty() {
+            let over = self.len - MAX_SHELL_TEXT;
+            let first = &mut self.parts[0].1;
+            if first.len() <= over {
+                self.len -= first.len();
+                self.parts.remove(0);
+            } else {
+                let mut cut = over;
+                while !first.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                first.drain(..cut);
+                self.len -= cut;
+            }
+        }
+        self.changed = true;
+    }
+
+    /// Text that ends the current line first (output may stop mid-line).
+    fn push_line(&mut self, kind: ShellText, text: &str) {
+        if self.parts.last().is_some_and(|(_, t)| !t.ends_with('\n')) {
+            self.push(kind, "\n");
+        }
+        self.push(kind, text);
+    }
+
+    pub fn clear(&mut self) {
+        self.parts.clear();
+        self.len = 0;
+        self.changed = true;
+    }
+
+    /// Everything as plain text (for copying).
+    pub fn text(&self) -> String {
+        self.parts.iter().map(|(_, t)| t.as_str()).collect()
+    }
+
+    fn message(&mut self, m: SessionMsg) {
+        match m {
+            SessionMsg::ShellOutput { text, err, .. } => {
+                self.push(if err { ShellText::Err } else { ShellText::Out }, &text)
+            }
+            SessionMsg::ShellDone { req, code, cwd, error } => {
+                if !cwd.is_empty() {
+                    self.cwd = Some(cwd);
+                }
+                let was_running = self.running == Some(req);
+                if was_running {
+                    self.running = None;
+                }
+                match (code, error) {
+                    (_, Some(e)) => self.push_line(ShellText::Note, &format!("[{e}]\n")),
+                    (Some(c), None) if c != 0 => {
+                        self.push_line(ShellText::Note, &format!("[exit code {c}]\n"))
+                    }
+                    _ if was_running => self.push_line(ShellText::Note, ""),
+                    _ => {}
+                }
+                self.changed = true;
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -472,6 +645,7 @@ impl SessionShared {
             remote_dir: RemoteDir::default(),
             transfers: Vec::new(),
             remote_changed: false,
+            shell: ShellLog::default(),
             clipboard_in: None,
             remote_clipboard: None,
             pointer_shapes: HashMap::new(),
@@ -597,6 +771,9 @@ impl SessionShared {
                     | SessionMsg::FsBegin { .. }
                     | SessionMsg::FsDone { .. }),
                 ) => self.file_message(m),
+                Ok(m @ (SessionMsg::ShellOutput { .. } | SessionMsg::ShellDone { .. })) => {
+                    self.shell.message(m)
+                }
                 _ => {}
             },
             Message::Binary(b) => {
@@ -1068,6 +1245,55 @@ impl SessionHandle {
         });
     }
 
+    /// Ask the remote shell which folder it is in (an empty command).
+    pub fn shell_hello(&self) {
+        let req = {
+            let mut s = self.shared.lock().unwrap();
+            s.shell.asked = Some(Instant::now());
+            s.take_req()
+        };
+        self.send(SessionMsg::ShellRun { req, command: String::new(), powershell: false });
+    }
+
+    /// Run a command in the remote shell (one at a time).
+    pub fn shell_run(&self, command: &str) {
+        let req = {
+            let mut s = self.shared.lock().unwrap();
+            if s.shell.running.is_some() {
+                return;
+            }
+            let req = s.take_req();
+            let line = format!("{} {command}\n", s.shell.prompt());
+            s.shell.push_line(ShellText::Command, &line);
+            s.shell.running = Some(req);
+            (req, s.shell.windows() && s.shell.powershell)
+        };
+        let (req, powershell) = req;
+        self.send(SessionMsg::ShellRun { req, command: command.to_string(), powershell });
+    }
+
+    /// Type into the running command (`""` = end of its input).
+    pub fn shell_input(&self, text: &str) {
+        let req = {
+            let mut s = self.shared.lock().unwrap();
+            let Some(req) = s.shell.running else { return };
+            if text.is_empty() {
+                s.shell.push(ShellText::Note, "[end of input]\n");
+            } else {
+                s.shell.push(ShellText::Command, text);
+            }
+            req
+        };
+        self.send(SessionMsg::ShellInput { req, text: text.to_string() });
+    }
+
+    pub fn shell_stop(&self) {
+        let running = self.shared.lock().unwrap().shell.running;
+        if let Some(req) = running {
+            self.send(SessionMsg::ShellStop { req });
+        }
+    }
+
     pub fn is_closed(&self) -> bool {
         matches!(self.shared.lock().unwrap().state, ConnState::Closed(_))
     }
@@ -1261,6 +1487,8 @@ async fn demo_task(
     let file_out = out_tx.clone();
     // The demo computer's files are this computer's files.
     let mut files = crate::files::FileService::default();
+    // ...and its shell is this computer's shell.
+    let mut shell = crate::shell::ShellService::new(true);
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop2 = stop.clone();
     std::thread::spawn(move || crate::host::screen_loop(true, view_only, cmd_rx, out_tx, stop2));
@@ -1289,6 +1517,8 @@ async fn demo_task(
                     if view_only && m.is_control() { continue; }
                     if m.is_file_request() {
                         files.handle(m, &file_out).await;
+                    } else if m.is_shell_request() {
+                        shell.handle(m, &file_out).await;
                     } else {
                         let _ = cmd_tx.send(m);
                     }
@@ -1558,5 +1788,104 @@ mod tests {
         p.shots[0].jpeg = "not base64!".into();
         p.shots[1].jpeg = crate::util::base64_encode(b"not a jpeg");
         assert!(decode_preview(&p).is_empty());
+    }
+
+    #[test]
+    fn shell_output_loses_terminal_codes_and_carriage_returns() {
+        assert_eq!(clean_output("\x1b[1;31mred\x1b[0m ok\r\n"), "red ok\n");
+        assert_eq!(clean_output("\x1b]0;title\x07after\tTab"), "after\tTab");
+        assert_eq!(clean_output("\x1b]8;;http://x\x1b\\link"), "link");
+        assert_eq!(clean_output("bell\x07 back\x08"), "bell back");
+        assert_eq!(clean_output("Привет"), "Привет");
+    }
+
+    #[test]
+    fn shell_transcript_marks_failures_and_keeps_the_folder() {
+        let mut log = ShellLog::default();
+        assert_eq!(log.cwd, None);
+        log.message(SessionMsg::ShellDone { req: 1, code: None, cwd: "/home/a".into(), error: None });
+        assert_eq!(log.cwd.as_deref(), Some("/home/a"));
+        assert!(log.parts.is_empty(), "the first answer only names the folder");
+        assert_eq!(log.prompt(), "/home/a $");
+        assert!(!log.windows());
+
+        log.running = Some(2);
+        log.message(SessionMsg::ShellOutput { req: 2, text: "partial".into(), err: false });
+        log.message(SessionMsg::ShellOutput { req: 2, text: " line".into(), err: false });
+        log.message(SessionMsg::ShellOutput { req: 2, text: "boom\n".into(), err: true });
+        log.message(SessionMsg::ShellDone { req: 2, code: Some(2), cwd: "/tmp".into(), error: None });
+        assert_eq!(log.running, None);
+        assert_eq!(log.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(
+            log.parts,
+            vec![
+                (ShellText::Out, "partial line".into()),
+                (ShellText::Err, "boom\n".into()),
+                (ShellText::Note, "[exit code 2]\n".into()),
+            ]
+        );
+
+        log.running = Some(3);
+        log.message(SessionMsg::ShellOutput { req: 3, text: "no newline".into(), err: false });
+        log.message(SessionMsg::ShellDone { req: 3, code: Some(0), cwd: "/tmp".into(), error: None });
+        assert!(log.text().ends_with("no newline\n"), "the next prompt starts on its own line");
+        log.message(SessionMsg::ShellDone { req: 4, code: None, cwd: "/tmp".into(), error: Some("Another command is still running".into()) });
+        assert!(log.text().ends_with("[Another command is still running]\n"));
+
+        log.clear();
+        assert!(log.parts.is_empty() && log.text().is_empty());
+    }
+
+    #[test]
+    fn windows_prompts_follow_the_chosen_shell() {
+        let mut log = ShellLog { cwd: Some("C:\\Users\\admin".into()), ..Default::default() };
+        assert!(log.windows());
+        assert!(log.powershell, "PowerShell by default");
+        assert_eq!(log.prompt(), "PS C:\\Users\\admin>");
+        log.powershell = false;
+        assert_eq!(log.prompt(), "C:\\Users\\admin>");
+    }
+
+    #[test]
+    fn shell_transcript_drops_the_oldest_text_past_the_limit() {
+        let mut log = ShellLog::default();
+        log.push(ShellText::Command, "first\n");
+        let chunk = "ж".repeat(1000); // 2 bytes each: cuts must land between characters
+        for i in 0..400 {
+            log.push(if i % 2 == 0 { ShellText::Out } else { ShellText::Err }, &chunk);
+        }
+        let text = log.text();
+        assert!(text.len() <= MAX_SHELL_TEXT);
+        assert!(text.len() > MAX_SHELL_TEXT - 4);
+        assert!(!text.contains("first"), "the oldest went first");
+        assert_eq!(log.len, text.len());
+    }
+
+    /// The demo computer's shell is this computer's: a whole round through
+    /// the session handle, as the shell window does it.
+    #[cfg(unix)]
+    #[test]
+    fn demo_shell_runs_commands_through_the_session() {
+        let handle = SessionHandle::start(Target::Demo, Quality::default(), false, Arc::new(|| {}));
+        let wait = |what: &str, done: &dyn Fn(&ShellLog) -> bool| {
+            let start = Instant::now();
+            while !done(&handle.shared.lock().unwrap().shell) {
+                assert!(start.elapsed() < std::time::Duration::from_secs(10), "waiting for {what}");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        handle.shell_hello();
+        wait("the folder", &|l| l.cwd.is_some());
+        handle.shell_run("echo from-the-shell; echo warn >&2");
+        assert!(handle.shared.lock().unwrap().shell.running.is_some());
+        handle.shell_run("echo ignored while busy");
+        wait("the end", &|l| l.running.is_none());
+        let shared = handle.shared.lock().unwrap();
+        let log = &shared.shell;
+        let text = log.text();
+        assert!(text.contains("$ echo from-the-shell; echo warn >&2\n"), "{text}");
+        assert!(text.contains("from-the-shell\n"), "{text}");
+        assert!(log.parts.iter().any(|(k, t)| *k == ShellText::Err && t.contains("warn")));
+        assert!(!text.contains("ignored"), "one command at a time");
     }
 }

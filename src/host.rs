@@ -147,11 +147,11 @@ async fn agent_connection(
                         tokio::time::sleep(Duration::from_secs(60)).await;
                         return Ok(None);
                     }
-                    AgentMsg::OpenSession { session_id, view_only } => {
+                    AgentMsg::OpenSession { session_id, view_only, shell } => {
                         let (Some(id), Some(secret)) = (cfg.machine_id.clone(), cfg.secret.clone()) else { continue };
                         let server = cfg.server_url.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = run_session(server, id, secret, session_id, view_only, demo).await {
+                            if let Err(e) = run_session(server, id, secret, session_id, view_only, shell, demo).await {
                                 log::warn!("session ended: {e:#}");
                             }
                         });
@@ -322,12 +322,15 @@ async fn run_update(server: &str, force: bool) -> Result<Option<i32>, String> {
 /// to the viewer is tried meanwhile and used once it works (see
 /// [`crate::direct`]). The relay socket stays the authority either way:
 /// mode switches and the end of the session only ever come from it.
+/// `shell`: the relay opened it for the administrator (remote shell allowed).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_session(
     server: String,
     machine_id: String,
     secret: String,
     session_id: String,
     view_only: bool,
+    shell: bool,
     demo: bool,
 ) -> Result<()> {
     let url = ws_url(
@@ -366,6 +369,7 @@ pub async fn run_session(
         clip,
         clip_view_only,
         files: crate::files::FileService::default(),
+        shell: crate::shell::ShellService::new(shell),
         file_out: out_tx.clone(),
         cmd_tx,
     };
@@ -406,6 +410,9 @@ pub async fn run_session(
                             SessionMsg::SetViewOnly { view_only: v } => {
                                 viewer.view_only = v;
                                 viewer.clip_view_only.store(v, Ordering::Relaxed);
+                                if v {
+                                    viewer.shell.stop(None); // watching only: nothing runs
+                                }
                                 let _ = viewer.cmd_tx.send(m);
                             }
                             m => viewer.message(m).await,
@@ -488,6 +495,7 @@ struct ViewerInput {
     clip: Arc<std::sync::Mutex<ClipboardSync>>,
     clip_view_only: Arc<AtomicBool>,
     files: crate::files::FileService,
+    shell: crate::shell::ShellService,
     file_out: tokio::sync::mpsc::Sender<Message>,
     cmd_tx: std::sync::mpsc::Sender<SessionMsg>,
 }
@@ -508,6 +516,13 @@ impl ViewerInput {
             // Files only in control sessions (the relay checks too).
             if !self.view_only {
                 self.files.handle(m, &self.file_out).await;
+            }
+            return;
+        }
+        if m.is_shell_request() {
+            // Control sessions of the administrator only (the relay checks too).
+            if !self.view_only {
+                self.shell.handle(m, &self.file_out).await;
             }
             return;
         }

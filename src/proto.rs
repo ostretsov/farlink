@@ -206,6 +206,40 @@ pub enum SessionMsg {
     /// connection broke). The last message of this direction on the relay
     /// before switching, so nothing arrives out of order.
     PathSwitch { direct: bool },
+
+    // ---- remote shell (the administrator, control sessions only) ----
+    /// viewer -> host: run `command` in this session's shell folder
+    /// (`bash -c` / `cmd /C` / PowerShell, no terminal: full-screen programs don't work).
+    /// `cd <folder>` alone changes the folder. Empty `command`: nothing runs,
+    /// the [`SessionMsg::ShellDone`] answer only names the folder. One
+    /// command at a time per session. `powershell`: on Windows, run it with
+    /// PowerShell instead of cmd (ignored elsewhere).
+    ShellRun {
+        req: u32,
+        command: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        powershell: bool,
+    },
+    /// viewer -> host: text for the running command's standard input.
+    ShellInput { req: u32, text: String },
+    /// viewer -> host: stop the running command and what it started.
+    ShellStop { req: u32 },
+    /// host -> viewer: a piece of the command's output (`err` = standard error).
+    ShellOutput {
+        req: u32,
+        text: String,
+        #[serde(default)]
+        err: bool,
+    },
+    /// host -> viewer: the command ended (`code` = its exit code; `None` when
+    /// it was stopped or never ran, then `error` says why). `cwd` = the
+    /// shell's folder now.
+    ShellDone {
+        req: u32,
+        code: Option<i32>,
+        cwd: String,
+        error: Option<String>,
+    },
 }
 
 /// One entry of a folder listing.
@@ -231,6 +265,18 @@ impl SessionMsg {
                 | SessionMsg::FsUpload { .. }
                 | SessionMsg::FsMkdir { .. }
                 | SessionMsg::Clipboard { .. }
+                | SessionMsg::ShellRun { .. }
+                | SessionMsg::ShellInput { .. }
+                | SessionMsg::ShellStop { .. }
+        )
+    }
+
+    /// Shell requests from the viewer (handled by [`crate::shell`]): only the
+    /// administrator's sessions may send them.
+    pub fn is_shell_request(&self) -> bool {
+        matches!(
+            self,
+            SessionMsg::ShellRun { .. } | SessionMsg::ShellInput { .. } | SessionMsg::ShellStop { .. }
         )
     }
 }
@@ -311,7 +357,14 @@ pub enum AgentMsg {
     /// relay -> host: refused (bad token, machine removed).
     Rejected { reason: String },
     /// relay -> host: someone wants to see this machine; open a session socket.
-    OpenSession { session_id: String, view_only: bool },
+    /// `shell`: the viewer is the administrator, so the remote shell may be
+    /// used (older relays never send it: no shell).
+    OpenSession {
+        session_id: String,
+        view_only: bool,
+        #[serde(default)]
+        shell: bool,
+    },
     /// relay -> host: a newer version is published, update now. `force`
     /// (the administrator pressed "Update"): install the published version
     /// even if it is not newer, and report a failure with

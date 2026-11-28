@@ -4,7 +4,7 @@
 use crate::config::{FilesSide, ScaleMode, ViewerConfig, load_json, save_json, viewer_dir};
 use crate::layout::{LayoutStore, WindowPlace, default_place};
 use crate::codec::Frame;
-use crate::net::{Api, ConnState, SessionHandle, Target, TransferState, decode_preview, demo_preview, parse_link};
+use crate::net::{Api, ConnState, SessionHandle, ShellText, Target, TransferState, decode_preview, demo_preview, parse_link};
 use crate::proto::{InputEvent, MonitorInfo, MouseButton, SessionMsg, monitor_fingerprint};
 use crate::quality::{Codec, ColorDepth, Preset, Quality};
 use crate::server::{MachineSummary, MachineView, Overview};
@@ -192,6 +192,231 @@ struct OpenSession {
     /// while it is open): this computer's side and the remote computer's.
     files_local: FilesSide,
     files_remote: FilesSide,
+    /// Opened with "Shell" (administrator): a shell window instead of
+    /// screens, its own connection (several per computer are fine), ends
+    /// when the window closes.
+    shell: Option<ShellView>,
+}
+
+/// The input line of a shell window. What was typed is remembered only
+/// while the window is open (Up/Down), never saved.
+#[derive(Debug, Default)]
+pub struct ShellView {
+    /// "Shell 2" when a computer has several.
+    number: u32,
+    input: String,
+    history: Vec<String>,
+    /// Position in `history` while going back with Up (`None` = a new line).
+    back: Option<usize>,
+    /// The line being typed before going back in the history.
+    draft: String,
+    /// Put the keyboard on the input line.
+    focus: bool,
+}
+
+/// Most commands one shell window remembers.
+const SHELL_HISTORY: usize = 500;
+
+impl ShellView {
+    fn new(number: u32) -> ShellView {
+        ShellView { number, focus: true, ..Default::default() }
+    }
+
+    fn title(&self) -> String {
+        if self.number > 1 { format!("Shell {}", self.number) } else { "Shell".into() }
+    }
+
+    /// Enter on the input line: the command to run (now remembered), if any.
+    fn submit(&mut self) -> Option<String> {
+        let line = std::mem::take(&mut self.input);
+        self.back = None;
+        self.draft.clear();
+        if line.trim().is_empty() {
+            return None;
+        }
+        if self.history.last() != Some(&line) {
+            self.history.push(line.clone());
+            if self.history.len() > SHELL_HISTORY {
+                self.history.remove(0);
+            }
+        }
+        Some(line)
+    }
+
+    /// Up: the command before.
+    fn older(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let i = match self.back {
+            None => {
+                self.draft = self.input.clone();
+                self.history.len() - 1
+            }
+            Some(i) => i.saturating_sub(1),
+        };
+        self.back = Some(i);
+        self.input = self.history[i].clone();
+    }
+
+    /// Down: the command after, then back to what was being typed.
+    fn newer(&mut self) {
+        let Some(i) = self.back else { return };
+        if i + 1 < self.history.len() {
+            self.back = Some(i + 1);
+            self.input = self.history[i + 1].clone();
+        } else {
+            self.back = None;
+            self.input = std::mem::take(&mut self.draft);
+        }
+    }
+}
+
+/// The shell helper answers the first question within this time, or is too
+/// old to have a shell.
+const SHELL_ANSWER: Duration = Duration::from_secs(6);
+
+/// A shell window: transcript above, input line below. Returns true when closed.
+fn shell_window(ui: &mut egui::Ui, s: &mut OpenSession) -> bool {
+    let ctx = ui.ctx().clone();
+    if ctx.input(|i| i.viewport().close_requested()) {
+        return true;
+    }
+    let Some(view) = s.shell.as_mut() else { return true };
+    let (parts, prompt, running, cwd_known, silent, scroll, live, windows, powershell) = {
+        let mut sh = s.handle.shared.lock().unwrap();
+        let live = sh.state == ConnState::Live;
+        let log = &mut sh.shell;
+        let silent = log.cwd.is_none() && log.asked.is_some_and(|t| t.elapsed() > SHELL_ANSWER);
+        let scroll = std::mem::take(&mut log.changed);
+        (log.parts.clone(), log.prompt(), log.running.is_some(), log.cwd.is_some(), silent, scroll, live, log.windows(), log.powershell)
+    };
+    if live && !cwd_known && s.handle.shared.lock().unwrap().shell.asked.is_none() {
+        s.handle.shell_hello();
+    }
+    if !cwd_known && !silent {
+        ctx.request_repaint_after(Duration::from_millis(500));
+    }
+    let mono = egui::FontId::monospace(13.0);
+    let input_id = egui::Id::unique(("farlink-shell-input", s.id));
+    let focused = ctx.memory(|m| m.has_focus(input_id));
+    let mut stop = false;
+    let mut end_input = false;
+    if focused {
+        ctx.input_mut(|i| {
+            if !running {
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                    view.older();
+                }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                    view.newer();
+                }
+            } else {
+                // Ctrl+C on an empty line stops the command (with text it copies).
+                if view.input.is_empty() && i.events.iter().any(|e| matches!(e, egui::Event::Copy)) {
+                    stop = true;
+                }
+                if i.consume_key(egui::Modifiers::CTRL, egui::Key::D) {
+                    end_input = true;
+                }
+            }
+        });
+    }
+    egui::Panel::bottom("shell-input").frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(10, 8))).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("Clear").on_hover_text("Empty this window (nothing is kept anywhere)").clicked() {
+                    s.handle.shared.lock().unwrap().shell.clear();
+                }
+                if ui.button("Copy all").clicked() {
+                    ctx.copy_text(s.handle.shared.lock().unwrap().shell.text());
+                }
+                // Windows: PowerShell or cmd for the next commands.
+                if windows {
+                    let mut ps = powershell;
+                    let changed = ui
+                        .add_enabled_ui(!running, |ui| {
+                            let a = ui.selectable_value(&mut ps, false, "cmd").on_hover_text("Run the commands with cmd.exe");
+                            let b = ui.selectable_value(&mut ps, true, "PowerShell").on_hover_text("Run the commands with Windows PowerShell");
+                            a.changed() || b.changed()
+                        })
+                        .inner;
+                    if changed {
+                        s.handle.shared.lock().unwrap().shell.powershell = ps;
+                        view.focus = true;
+                    }
+                }
+                if running
+                    && ui
+                        .add(egui::Button::new(RichText::new("Stop").color(Color32::from_rgb(40, 8, 8))).fill(DANGER))
+                        .on_hover_text("End the command and everything it started (Ctrl+C on an empty line)")
+                        .clicked()
+                {
+                    stop = true;
+                }
+                if running {
+                    ui.add(egui::Spinner::new().size(14.0));
+                }
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    let label = if running { "input ›".to_string() } else if cwd_known { prompt.clone() } else { "...".into() };
+                    ui.label(RichText::new(label).font(mono.clone()).color(if running { AMBER } else { ACCENT }));
+                    let hint = if running { "Type input for the command, Enter sends it · Ctrl+D ends input" } else { "Type a command, Enter runs it · Up/Down: earlier commands" };
+                    let edit = egui::TextEdit::singleline(&mut view.input)
+                        .id(input_id)
+                        .font(mono.clone())
+                        .hint_text(hint)
+                        .desired_width(f32::INFINITY);
+                    let resp = ui.add_enabled(live && cwd_known, edit);
+                    if std::mem::take(&mut view.focus) || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                        resp.request_focus();
+                    }
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        if running {
+                            let text = format!("{}\n", std::mem::take(&mut view.input));
+                            s.handle.shell_input(&text);
+                        } else if let Some(cmd) = view.submit() {
+                            s.handle.shell_run(&cmd);
+                        }
+                    }
+                });
+            });
+        });
+    });
+    if stop {
+        s.handle.shell_stop();
+    }
+    if end_input {
+        s.handle.shell_input("");
+    }
+    egui::CentralPanel::default().frame(egui::Frame::new().fill(BG).inner_margin(Margin::symmetric(10, 8))).show(ui, |ui| {
+        if silent {
+            ui.label(RichText::new("The helper on this computer does not answer: update it to use the shell.").color(AMBER));
+        } else if !live || !cwd_known {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(14.0));
+                ui.label(RichText::new("Connecting...").color(MUTED));
+            });
+        }
+        let mut job = egui::text::LayoutJob::default();
+        for (kind, text) in &parts {
+            let color = match kind {
+                ShellText::Command => ACCENT,
+                ShellText::Out => TEXT,
+                ShellText::Err => DANGER,
+                ShellText::Note => AMBER,
+            };
+            job.append(text, 0.0, egui::TextFormat::simple(mono.clone(), color));
+        }
+        job.wrap.max_width = ui.available_width();
+        let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true);
+        if scroll {
+            area = area.vertical_scroll_offset(f32::MAX);
+        }
+        area.show(ui, |ui| {
+            ui.add(egui::Label::new(job).selectable(true));
+        });
+    });
+    false
 }
 
 /// Two-pane file browser: this computer on the left, the remote one on the right.
@@ -1111,6 +1336,10 @@ impl ViewerApp {
                 if std::env::var_os("FARLINK_SHOT_FILES").is_some() {
                     app.sessions[0].open_files();
                 }
+                if std::env::var_os("FARLINK_SHOT_SHELL").is_some() {
+                    app.sessions[0].files_only = true;
+                    app.sessions[0].shell = Some(ShellView::new(1));
+                }
                 // Hidden switch for checking the rename dialog's look.
                 if std::env::var_os("FARLINK_SHOT_RENAME").is_some() {
                     app.renaming = Some(Renaming { machine_id: "demo-office".into(), text: "Office PC".into(), focus: true });
@@ -1242,10 +1471,16 @@ impl ViewerApp {
     }
 
     fn open_session(&mut self, ctx: &egui::Context, target: Target, machine_id: Option<String>, name: String, view_only: bool) {
-        // One session per machine: a new connection replaces the old one.
+        // One session per machine: a new connection replaces the old one
+        // (shell windows have their own and stay).
         if let Some(id) = &machine_id {
-            self.sessions.retain(|s| s.machine_id.as_ref() != Some(id));
+            self.sessions.retain(|s| s.machine_id.as_ref() != Some(id) || s.shell.is_some());
         }
+        self.start_session(ctx, target, machine_id, name, view_only);
+    }
+
+    /// Open a connection next to the ones already open.
+    fn start_session(&mut self, ctx: &egui::Context, target: Target, machine_id: Option<String>, name: String, view_only: bool) {
         let c = ctx.clone();
         let handle = SessionHandle::start(target, self.cfg.quality, view_only, Arc::new(move || c.request_repaint()));
         let remembered_remote = machine_id.as_ref().and_then(|id| self.cfg.files_remote.get(id).cloned()).unwrap_or_default();
@@ -1279,8 +1514,33 @@ impl ViewerApp {
             files_only: false,
             files_local: self.cfg.files_local.clone(),
             files_remote: remembered_remote,
+            shell: None,
         });
         self.next_session += 1;
+    }
+
+    /// A new shell window on a computer (administrator): its own connection,
+    /// no screens; several can be open at once.
+    fn shell_machine(&mut self, ctx: &egui::Context, m: &MachineSummary) {
+        let target = if self.demo {
+            Target::Demo
+        } else {
+            let Some(api) = self.api() else { return };
+            Target::Admin { server: api.server, token: api.token, machine_id: m.id.clone(), view_only: false }
+        };
+        let number = self
+            .sessions
+            .iter()
+            .filter(|s| s.machine_id.as_deref() == Some(m.id.as_str()))
+            .filter_map(|s| s.shell.as_ref().map(|v| v.number))
+            .max()
+            .unwrap_or(0)
+            + 1;
+        self.start_session(ctx, target, Some(m.id.clone()), m.name.clone(), false);
+        if let Some(s) = self.sessions.last_mut() {
+            s.files_only = true; // nothing captured: the helper is told no screens are watched
+            s.shell = Some(ShellView::new(number));
+        }
     }
 
     /// Exchange files with a computer without seeing or controlling its screens.
@@ -1461,7 +1721,7 @@ impl ViewerApp {
             .as_ref()
             .and_then(|o| o.machines.iter().find(|m| Some(&m.machine.id) == self.selected.as_ref()))
             .filter(|m| m.online && (self.signed_in() || self.demo))
-            .filter(|m| !self.sessions.iter().any(|s| s.machine_id.as_ref() == Some(&m.machine.id)))
+            .filter(|m| !self.sessions.iter().any(|s| s.machine_id.as_ref() == Some(&m.machine.id) && s.shell.is_none()))
             .map(|m| (m.machine.id.clone(), m.machine.monitors.clone()));
         let Some((id, monitors)) = wanted else {
             self.remember_preview();
@@ -1623,6 +1883,14 @@ impl ViewerApp {
                         }
                         ConnState::Closed(r) => (DANGER, r.clone()),
                     };
+                    // A shell window's connection: what it runs, not screens.
+                    let status = match (&s.shell, &shared.state) {
+                        (Some(v), ConnState::Live) => {
+                            let busy = if shared.shell.running.is_some() { "running a command" } else { "ready" };
+                            format!("{} · {busy} · {}", v.title(), shared.route.short())
+                        }
+                        _ => status,
+                    };
                     let notice = shared.notice.clone();
                     let mons = shared.monitors.len();
                     let vo = shared.view_only;
@@ -1632,7 +1900,9 @@ impl ViewerApp {
                     ui.horizontal(|ui| {
                         status_dot(ui, dot);
                         ui.label(RichText::new(&s.name).strong());
-                        if live {
+                        if s.shell.is_some() {
+                            // Watching only would stop the shell: no mode switch here.
+                        } else if live {
                             if let Some(v) = view_only_toggle(ui, vo, locked) {
                                 s.handle.set_view_only(v);
                             }
@@ -1650,7 +1920,7 @@ impl ViewerApp {
                             if !vo && mons > 0 && ui.button("Files").clicked() {
                                 s.open_files();
                             }
-                            if (s.files_only || !s.closed.is_empty()) && mons > 0 && ui.button("Show screens").clicked() {
+                            if s.shell.is_none() && (s.files_only || !s.closed.is_empty()) && mons > 0 && ui.button("Show screens").clicked() {
                                 s.files_only = false;
                                 s.closed.clear();
                                 s.builders.clear();
@@ -1983,7 +2253,7 @@ impl ViewerApp {
         ui.horizontal(|ui| {
             // An open connection to this computer: one "Disconnect" instead of
             // the two connect buttons (mode is switched in the bottom bar).
-            if let Some(idx) = self.sessions.iter().position(|s| s.machine_id.as_deref() == Some(m.id.as_str())) {
+            if let Some(idx) = self.sessions.iter().position(|s| s.machine_id.as_deref() == Some(m.id.as_str()) && s.shell.is_none()) {
                 let b = egui::Button::new(RichText::new("Disconnect").size(15.0).strong().color(Color32::from_rgb(40, 8, 8)))
                     .fill(DANGER)
                     .min_size(Vec2::new(130.0, 34.0));
@@ -2009,6 +2279,14 @@ impl ViewerApp {
                 });
             }
             let is_admin = self.overview.as_ref().is_none_or(|o| o.role == "admin");
+            if is_admin
+                && ui
+                    .add_enabled(mv.online, egui::Button::new(RichText::new("Shell").size(15.0)).min_size(Vec2::new(100.0, 34.0)))
+                    .on_hover_text("Run commands on this computer without opening its screens (each click opens another shell)")
+                    .clicked()
+            {
+                self.shell_machine(ctx, m);
+            }
             if is_admin
                 && ui.add(egui::Button::new(RichText::new("Temporary link...").size(15.0)).min_size(Vec2::new(160.0, 34.0))).clicked()
             {
@@ -2178,7 +2456,7 @@ impl ViewerApp {
     /// Returns true when the picture was double-clicked to connect (online, no open connection).
     fn screens_card(&mut self, ui: &mut egui::Ui, m: &MachineSummary, online: bool) -> bool {
         let mut connect = false;
-        let session_idx = self.sessions.iter().position(|s| s.machine_id.as_deref() == Some(m.id.as_str()));
+        let session_idx = self.sessions.iter().position(|s| s.machine_id.as_deref() == Some(m.id.as_str()) && s.shell.is_none());
         let monitors = session_idx
             .map(|i| self.sessions[i].handle.shared.lock().unwrap().monitors.clone())
             .filter(|v| !v.is_empty())
@@ -2426,7 +2704,15 @@ impl ViewerApp {
                 // Another connection's browser may have moved on since.
                 s.files_local.clone_from(&self.cfg.files_local);
             }
-            if (s.files_only || (!monitors.is_empty() && monitors.iter().all(|m| s.closed.contains(&m.index)))) && s.files.is_none() {
+            if s.shell.is_some() {
+                let vid = ViewportId::from_hash_of(("farlink-shell", s.id));
+                let title = format!("{} - {}", s.name, s.shell.as_ref().map(ShellView::title).unwrap_or_default());
+                let builder = ViewportBuilder::default().with_title(title).with_inner_size([960.0, 600.0]).with_min_inner_size([480.0, 260.0]);
+                if ctx.show_viewport_immediate(vid, builder, |ui, _| shell_window(ui, s)) {
+                    s.shell = None;
+                }
+            }
+            if (s.files_only || (!monitors.is_empty() && monitors.iter().all(|m| s.closed.contains(&m.index)))) && s.files.is_none() && s.shell.is_none() {
                 to_close.push(s.id);
             }
         }
@@ -3241,6 +3527,22 @@ impl eframe::App for ViewerApp {
             s.update_textures(&ctx);
         }
         // Hidden switch for checking the file browser's look in a screenshot.
+        if self.opts.screenshot.is_some() && std::env::var_os("FARLINK_SHOT_SHELL").is_some() && !self.sessions.is_empty() {
+            // A few commands once the (local, demo) shell answered.
+            let s = &mut self.sessions[0];
+            let (ready, ran) = {
+                let sh = s.handle.shared.lock().unwrap();
+                (sh.shell.cwd.is_some() && sh.shell.running.is_none(), sh.shell.parts.len())
+            };
+            if ready && ran == 0 {
+                s.handle.shell_run("uname -sr; echo; ls / | head -5");
+            } else if ready && ran <= 2 {
+                s.handle.shell_run("cat /no/such/file");
+            }
+            shell_window(ui, s);
+            self.screenshot_step(&ctx);
+            return;
+        }
         if self.opts.screenshot.is_some() && std::env::var_os("FARLINK_SHOT_FILES").is_some() && !self.sessions.is_empty() {
             files_window(ui, &mut self.sessions[0]);
             self.screenshot_step(&ctx);
@@ -4494,5 +4796,54 @@ mod tests {
         let o = sample_overview();
         assert!(o.machines.iter().any(|m| m.machine.monitors.len() == 2));
         assert!(o.machines.iter().any(|m| !m.online));
+    }
+
+    #[test]
+    fn shell_input_remembers_commands_only_in_the_window() {
+        let mut v = ShellView::new(1);
+        assert_eq!(v.title(), "Shell");
+        assert_eq!(ShellView::new(3).title(), "Shell 3");
+        v.input = "   ".into();
+        assert_eq!(v.submit(), None, "blank lines run nothing");
+        for c in ["ls", "uptime", "uptime", "df -h"] {
+            v.input = c.into();
+            assert_eq!(v.submit().as_deref(), Some(c));
+        }
+        assert_eq!(v.history, vec!["ls", "uptime", "df -h"], "a repeat is kept once");
+        assert!(v.input.is_empty());
+
+        v.input = "half typed".into();
+        v.older();
+        assert_eq!(v.input, "df -h");
+        v.older();
+        v.older();
+        v.older(); // stops at the first
+        assert_eq!(v.input, "ls");
+        v.newer();
+        assert_eq!(v.input, "uptime");
+        v.newer();
+        v.newer();
+        assert_eq!(v.input, "half typed", "back to what was being typed");
+        v.newer();
+        assert_eq!(v.input, "half typed");
+
+        // Running an older command puts it last again.
+        v.older();
+        v.older();
+        assert_eq!(v.submit().as_deref(), Some("uptime"));
+        assert_eq!(v.history.last().map(String::as_str), Some("uptime"));
+    }
+
+    #[test]
+    fn shell_history_is_bounded_and_never_part_of_the_settings() {
+        let mut v = ShellView::new(1);
+        for i in 0..SHELL_HISTORY + 20 {
+            v.input = format!("echo {i}");
+            v.submit();
+        }
+        assert_eq!(v.history.len(), SHELL_HISTORY);
+        assert_eq!(v.history[0], "echo 20");
+        let saved = serde_json::to_string(&ViewerConfig::default()).unwrap();
+        assert!(!saved.contains("shell"), "nothing about shells is saved: {saved}");
     }
 }

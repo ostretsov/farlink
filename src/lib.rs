@@ -28,6 +28,7 @@ pub mod proto;
 pub mod quality;
 pub mod server;
 pub mod server_update;
+pub mod shell;
 pub mod stun;
 pub mod sysstat;
 pub mod tls;
