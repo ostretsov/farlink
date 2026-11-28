@@ -388,7 +388,10 @@ fn shell_ui(ui: &mut egui::Ui, view: &mut ShellView, handle: &SessionHandle, id:
                             let text = format!("{}\n", std::mem::take(&mut view.input));
                             handle.shell_input(&text);
                         } else if let Some(cmd) = view.submit() {
-                            handle.shell_run(&cmd);
+                            match crate::net::needs_terminal(&cmd).filter(|_| !windows) {
+                                Some(why) => handle.shell_not_run(&cmd, &why),
+                                None => handle.shell_run(&cmd),
+                            }
                         }
                     }
                 });
@@ -4879,7 +4882,9 @@ mod tests {
         assert!(!saved.contains("shell"), "nothing about shells is saved: {saved}");
     }
 
-    /// A shell window drawn headless, on the demo session (its shell is this computer's).
+    /// A shell window drawn headless, on the demo session (its shell is this
+    /// computer's: Unix only, as the commands are).
+    #[cfg(unix)]
     struct ShellHarness {
         ctx: egui::Context,
         view: ShellView,
@@ -4888,8 +4893,10 @@ mod tests {
         start: Instant,
     }
 
+    #[cfg(unix)]
     const SHELL_SIZE: Vec2 = Vec2::new(600.0, 300.0);
 
+    #[cfg(unix)]
     impl ShellHarness {
         fn new() -> Self {
             let handle = SessionHandle::start(crate::net::Target::Demo, Quality::default(), false, Arc::new(|| {}));
@@ -4952,6 +4959,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn shell_input_takes_the_keyboard_once_the_shell_answers() {
         let mut h = ShellHarness::new();
@@ -4960,6 +4968,7 @@ mod tests {
         assert!(h.focused(), "the command line has the keyboard as soon as it can be used");
     }
 
+    #[cfg(unix)]
     #[test]
     fn enter_runs_every_command() {
         let mut h = ShellHarness::new().ready();
@@ -4974,6 +4983,22 @@ mod tests {
         assert!(text.find("first-42").unwrap() < text.find("second-43").unwrap(), "output is added below: {text}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn full_screen_programs_are_explained_not_started() {
+        let mut h = ShellHarness::new().ready();
+        h.enter("htop");
+        h.frame(vec![]);
+        {
+            let sh = h.handle.shared.lock().unwrap();
+            assert_eq!(sh.shell.running, None, "htop was not started");
+            assert!(sh.shell.text().contains("[htop needs a full terminal"), "{}", sh.shell.text());
+        }
+        h.enter("echo next-$((1+1))");
+        h.wait("the next command", |l| l.running.is_none() && l.text().contains("next-2\n"));
+    }
+
+    #[cfg(unix)]
     #[test]
     fn enter_shows_the_end_of_the_transcript() {
         let mut h = ShellHarness::new().ready();

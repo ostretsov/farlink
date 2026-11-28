@@ -407,6 +407,43 @@ impl Default for ShellLog {
     }
 }
 
+/// Programs that draw a full screen and need a real terminal: in the shell
+/// window (pipes, `TERM=dumb`) they fail or hang showing nothing. Returns
+/// what to say instead of running the command, or `None` to run it.
+/// Windows commands are never checked.
+pub fn needs_terminal(command: &str) -> Option<String> {
+    for part in command.split(['|', ';', '&', '\n', '(', ')', '`']) {
+        let mut words = part.split_whitespace().skip_while(|w| {
+            matches!(*w, "sudo" | "env" | "nice" | "time" | "exec" | "command" | "nohup") || w.starts_with('-') || w.contains('=')
+        });
+        let Some(first) = words.next() else { continue };
+        let program = first.rsplit('/').next().unwrap_or(first);
+        let args: Vec<&str> = words.collect();
+        // Only the program's own first option: `watch df -h` still needs a terminal.
+        if args.first().is_some_and(|a| matches!(*a, "--help" | "--version")) {
+            continue;
+        }
+        // `top -b`, `top -bn1`, `iotop --batch`: printed once, no terminal needed.
+        let batch = args.iter().any(|a| *a == "--batch" || (a.starts_with('-') && !a.starts_with("--") && a.contains('b')));
+        let instead = match program {
+            "top" | "atop" if batch => continue,
+            "top" | "htop" | "btop" | "atop" | "glances" => "try `top -b -n 1 | head -20` or `ps aux --sort=-%cpu | head`",
+            "iotop" if batch => continue,
+            "iotop" => "try `iotop -b -n 1`",
+            "iftop" | "nload" | "bmon" => "try `ip -s link` or `cat /proc/net/dev`",
+            "emacs" if args.iter().any(|a| matches!(*a, "--batch" | "--script")) => continue,
+            "vi" | "vim" | "nvim" | "nano" | "pico" | "emacs" | "mc" => {
+                "read files with `cat`, change them with `sed`, or download, edit and upload them in Files"
+            }
+            "watch" => "run the command itself; Up and Enter run it again",
+            "tmux" | "screen" => "run the commands here directly",
+            _ => continue,
+        };
+        return Some(format!("{program} needs a full terminal, which this window is not: {instead}"));
+    }
+    None
+}
+
 /// Output as the transcript shows it: no colour codes or other terminal
 /// control sequences, no carriage returns.
 pub fn clean_output(text: &str) -> String {
@@ -1288,6 +1325,14 @@ impl SessionHandle {
         self.send(SessionMsg::ShellRun { req, command: command.to_string(), powershell });
     }
 
+    /// A command that is not run (`why` says so): shown in the transcript only.
+    pub fn shell_not_run(&self, command: &str, why: &str) {
+        let mut s = self.shared.lock().unwrap();
+        let line = format!("{} {command}\n", s.shell.prompt());
+        s.shell.push_line(ShellText::Command, &line);
+        s.shell.push(ShellText::Note, &format!("[{why}]\n"));
+    }
+
     /// Type into the running command (`""` = end of its input).
     pub fn shell_input(&self, text: &str) {
         let req = {
@@ -1807,6 +1852,39 @@ mod tests {
         p.shots[0].jpeg = "not base64!".into();
         p.shots[1].jpeg = crate::util::base64_encode(b"not a jpeg");
         assert!(decode_preview(&p).is_empty());
+    }
+
+    #[test]
+    fn full_screen_programs_are_explained_instead_of_run() {
+        for c in ["htop", "top", "sudo htop", "/usr/bin/top -d 1", "vim notes.txt", "nano", "watch df -h", "watch -n 1 ls -b", "ps aux | less && htop", "LANG=C top", "iftop -i eth0", "tmux", "cd /tmp; vi x"] {
+            assert!(needs_terminal(c).is_some(), "{c}");
+        }
+        assert!(needs_terminal("htop").unwrap().starts_with("htop needs a full terminal"));
+        for c in [
+            "top -b -n 1",
+            "top -bn1 | head",
+            "iotop --batch -n 1",
+            "less /etc/hostname",
+            "man ls",
+            "echo htop",
+            "grep top /etc/services",
+            "vim --version",
+            "emacs --batch -l x.el",
+            "stop",
+            "ls -la",
+            "",
+        ] {
+            assert_eq!(needs_terminal(c), None, "{c}");
+        }
+    }
+
+    #[test]
+    fn a_command_not_run_shows_why() {
+        let handle = SessionHandle::start(Target::Demo, Quality::default(), false, Arc::new(|| {}));
+        handle.shell_not_run("htop", "htop needs a full terminal");
+        let s = handle.shared.lock().unwrap();
+        assert_eq!(s.shell.running, None, "nothing runs, so the next command can");
+        assert_eq!(s.shell.text(), " $ htop\n[htop needs a full terminal]\n");
     }
 
     #[test]
