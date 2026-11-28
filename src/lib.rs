@@ -21,6 +21,7 @@ pub mod install;
 pub mod keygrab;
 pub mod keys;
 pub mod layout;
+pub mod mcp;
 pub mod net;
 pub mod palette;
 pub mod ping;

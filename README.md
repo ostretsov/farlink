@@ -6,7 +6,7 @@ Three programs that work together:
 |---|---|---|
 | **farlink-server** | your public server (Ubuntu/Debian) | Relay between you and your computers, web admin page, install links, temporary access links, update feed |
 | **farlink-host** | every computer you want to reach (Windows 10/11, Windows Server 2016+, Ubuntu X11) | Shows the screens and accepts mouse/keyboard. It can **only be controlled** — it never controls other computers — and it only connects out to your server (no open ports needed) |
-| **farlink** | your own computer | Desktop app: list of computers, one window per remote monitor, quality settings, view-only mode |
+| **farlink** | your own computer | Desktop app: list of computers, one window per remote monitor, quality settings, view-only mode. `farlink mcp` lets Claude (or any MCP client) use your computers: see [5. Let Claude use your computers](#5-let-claude-use-your-computers-mcp) |
 
 There is also a **web version**: open `https://your-domain` in any browser to manage computers, links and to view/control a computer without installing anything.
 
@@ -87,6 +87,83 @@ sudo farlink-server publish 0.2.0 ./releases --config /etc/farlink-server/config
 
 Every connected computer downloads it, checks its fingerprint (SHA-256) and restarts itself — no questions asked.
 The desktop app updates itself on its next start.
+
+## 5. Let Claude use your computers (MCP)
+
+`farlink mcp` is an [MCP](https://modelcontextprotocol.io) server built into the desktop app. With it,
+Claude Code, Claude Desktop or any other MCP client can work on your computers through your relay:
+
+| Tool | What it does |
+|---|---|
+| `list_computers` | Every computer: online or not, OS, who is signed in, IP addresses, screens, CPU/memory, notes. Optional `search` |
+| `screenshot` | A picture of one screen, right now (scaled to 1280 px by default, `max_size` changes it) |
+| `click`, `move_mouse`, `drag`, `scroll` | The mouse, in pixels of the last screenshot of that screen |
+| `type_text`, `press_keys` | Typing, and keys/shortcuts such as `ctrl+c`, `alt+tab`, `win+r`, `ctrl+alt+del` |
+| `run_command` | A shell command (bash on Linux, PowerShell or cmd on Windows) with its output and exit code. The folder is kept between calls. **Administrator only** |
+| `list_files`, `read_file`, `write_file`, `make_folder` | Folders and text files on the remote computer |
+| `upload_file`, `download_file` | Files between the remote computer and the computer the MCP server runs on |
+
+It signs in like the app and goes through the relay's usual checks: a person (`--user anna`) only reaches
+their own computers and never gets the shell. Files are never overwritten (a copy gets "(2)" added).
+`--read-only` keeps only the tools that look: `list_computers`, `screenshot`, `list_files`, `read_file`,
+`download_file`.
+
+**Signing in** (the first one found is used):
+
+1. `FARLINK_PASSWORD` in the environment: the administrator's password, or a person's together with
+   `--user <sign-in name>` (or `FARLINK_USER`).
+2. `FARLINK_TOKEN`: a session token.
+3. The desktop app's own sign-in: sign in once in the app (same server) and nothing else is needed.
+   Pressing *Sign out* in the app ends it, for the MCP server too.
+
+The server address comes from `--server https://remote.example.com`, `FARLINK_SERVER`, or the app's settings.
+
+### Claude Code
+
+Signed in in the app already:
+
+```sh
+claude mcp add farlink -- farlink mcp
+```
+
+With a password instead (`--scope user` makes it available in every project):
+
+```sh
+claude mcp add farlink --scope user -e FARLINK_PASSWORD='your admin password' -- farlink mcp --server https://remote.example.com
+```
+
+Then ask, for example: *"List my Farlink computers"*, *"How much disk space is left on the office PC?"*,
+*"Take a screenshot of Anna's laptop and close the error dialog"*. Run `claude mcp list` to see that it connects;
+in a session `/mcp` shows its tools.
+
+### Claude Desktop
+
+Settings → Developer → *Edit Config* opens `claude_desktop_config.json`. Add:
+
+```json
+{
+  "mcpServers": {
+    "farlink": {
+      "command": "farlink",
+      "args": ["mcp", "--server", "https://remote.example.com"],
+      "env": { "FARLINK_PASSWORD": "your admin password" }
+    }
+  }
+}
+```
+
+On Windows put the full path in `command` (for example `C:\\Users\\you\\farlink.exe`). Restart Claude Desktop;
+Farlink's tools appear under the tools (🔨) button. Leave out `env` if you are signed in in the app on that computer.
+
+### Other MCP clients
+
+Anything that runs a local (stdio) MCP server works: the command is `farlink mcp`, with the options and
+environment above. Messages go one JSON-RPC message per line on stdin/stdout; errors and logs go to stderr
+(`RUST_LOG=info` for more).
+
+**Be careful:** this gives the assistant the same power over your computers as you have — someone may be
+working on them. Clients ask before each tool call unless you allow it; keep that on for `run_command` and
+the input tools, or use `--read-only`.
 
 ## Building
 

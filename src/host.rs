@@ -371,8 +371,22 @@ pub async fn run_session(
         files: crate::files::FileService::default(),
         shell: crate::shell::ShellService::new(shell),
         file_out: out_tx.clone(),
-        cmd_tx,
+        cmd_tx: cmd_tx.clone(),
     };
+    // The viewer's messages are handled in their own task, in order. Their
+    // answers go into `out_tx`, which only this loop empties: awaited here,
+    // a full channel (pictures) would stop the loop for good.
+    let (to_viewer_input, mut viewer_rx) = tokio::sync::mpsc::unbounded_channel::<FromViewer>();
+    let viewer_task = tokio::spawn(async move {
+        while let Some(m) = viewer_rx.recv().await {
+            match m {
+                FromViewer::Text(m) => viewer.message(m).await,
+                FromViewer::Binary(b) => viewer.binary(&b).await,
+                FromViewer::ViewOnly(v) => viewer.set_view_only(v),
+            }
+        }
+    });
+    let viewer = to_viewer_input;
     std::thread::Builder::new()
         .name("screen".into())
         .spawn(move || screen_loop(demo, view_only, cmd_rx, out_tx, stop2))?;
@@ -398,27 +412,22 @@ pub async fn run_session(
                                 // A newer attempt from the viewer replaces a direct path we still had.
                                 if let Some(m) = direct.offer(fp, addrs, hard_nat, attempt) {
                                     sink.send(crate::direct::json(&m)).await?;
-                                    fell_back(&viewer.cmd_tx);
+                                    fell_back(&cmd_tx);
                                 }
                             }
                             SessionMsg::PathSwitch { direct: d } => {
                                 if let Some(m) = direct.peer_switched(d) {
                                     sink.send(crate::direct::json(&m)).await?;
-                                    fell_back(&viewer.cmd_tx);
+                                    fell_back(&cmd_tx);
                                 }
                             }
                             SessionMsg::SetViewOnly { view_only: v } => {
-                                viewer.view_only = v;
-                                viewer.clip_view_only.store(v, Ordering::Relaxed);
-                                if v {
-                                    viewer.shell.stop(None); // watching only: nothing runs
-                                }
-                                let _ = viewer.cmd_tx.send(m);
+                                let _ = viewer.send(FromViewer::ViewOnly(v));
                             }
-                            m => viewer.message(m).await,
+                            m => { let _ = viewer.send(FromViewer::Text(m)); }
                         }
                     }
-                    Some(Ok(Message::Binary(b))) => viewer.binary(&b).await,
+                    Some(Ok(Message::Binary(b))) => { let _ = viewer.send(FromViewer::Binary(b.to_vec())); }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Err(e)) => return Err(e.into()),
                     _ => {}
@@ -428,16 +437,16 @@ pub async fn run_session(
                         if let Ok(m) = serde_json::from_str::<SessionMsg>(&t)
                             && !relay_only(&m)
                         {
-                            viewer.message(m).await;
+                            let _ = viewer.send(FromViewer::Text(m));
                         }
                     }
-                    Ok(Message::Binary(b)) => viewer.binary(&b).await,
+                    Ok(Message::Binary(b)) => { let _ = viewer.send(FromViewer::Binary(b.to_vec())); }
                     Ok(_) => {}
                     Err(e) => {
                         log::info!("direct connection lost: {e:#}");
                         if let Some(m) = direct.broken() {
                             sink.send(crate::direct::json(&m)).await?;
-                            fell_back(&viewer.cmd_tx);
+                            fell_back(&cmd_tx);
                         }
                     }
                 },
@@ -458,7 +467,7 @@ pub async fn run_session(
                             sink.send(m).await?;
                         }
                         if was_direct && direct.remote().is_none() {
-                            fell_back(&viewer.cmd_tx);
+                            fell_back(&cmd_tx);
                         }
                     }
                     None => break,
@@ -469,6 +478,9 @@ pub async fn run_session(
     }
     .await;
     stop.store(true, Ordering::Relaxed);
+    // Ends the viewer task: running commands stop, open files close.
+    drop(viewer);
+    viewer_task.abort();
     direct.broken();
     let _ = sink.close().await;
     result
@@ -488,6 +500,14 @@ fn relay_only(m: &SessionMsg) -> bool {
     )
 }
 
+/// To the task that handles what the viewer sends (see `run_session`).
+enum FromViewer {
+    Text(SessionMsg),
+    Binary(Vec<u8>),
+    /// The relay switched the session's mode.
+    ViewOnly(bool),
+}
+
 /// What the viewer sends, from either path. The helper checks the mode
 /// itself: on the direct path the relay can't.
 struct ViewerInput {
@@ -501,6 +521,15 @@ struct ViewerInput {
 }
 
 impl ViewerInput {
+    fn set_view_only(&mut self, v: bool) {
+        self.view_only = v;
+        self.clip_view_only.store(v, Ordering::Relaxed);
+        if v {
+            self.shell.stop(None); // watching only: nothing runs
+        }
+        let _ = self.cmd_tx.send(SessionMsg::SetViewOnly { view_only: v });
+    }
+
     async fn message(&mut self, m: SessionMsg) {
         if let SessionMsg::Clipboard { text } = m {
             // Done before later messages go on, so the Ctrl+V that follows

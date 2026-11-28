@@ -354,6 +354,8 @@ pub struct SessionShared {
     pub pointer: Option<(i32, i32, u32)>,
     /// The remote shell's transcript (this window's memory only).
     pub shell: ShellLog,
+    /// The last upload / new folder the host finished: (request, error).
+    pub fs_done: Option<(u32, Option<String>)>,
     next_req: u32,
     /// Download request -> (local folder, open file once it started).
     downloads: HashMap<u32, (PathBuf, Option<std::fs::File>)>,
@@ -388,6 +390,8 @@ pub struct ShellLog {
     pub changed: bool,
     /// Windows computer: run with PowerShell (else cmd). Starts on.
     pub powershell: bool,
+    /// The last command that ended: (request, exit code, why it did not run).
+    pub done: Option<(u32, Option<i32>, Option<String>)>,
     len: usize,
 }
 
@@ -400,6 +404,7 @@ impl Default for ShellLog {
             asked: None,
             changed: false,
             powershell: true,
+            done: None,
             len: 0,
         }
     }
@@ -511,6 +516,7 @@ impl ShellLog {
                 if !cwd.is_empty() {
                     self.cwd = Some(cwd);
                 }
+                self.done = Some((req, code, error.clone()));
                 let was_running = self.running == Some(req);
                 if was_running {
                     self.running = None;
@@ -556,6 +562,9 @@ pub struct Transfer {
     pub state: TransferState,
     /// Where it is (or will be) on this computer.
     pub local: PathBuf,
+    /// Upload: where it went on the remote computer (its name may have
+    /// changed, files are never overwritten).
+    pub remote: Option<String>,
 }
 
 impl SessionShared {
@@ -602,9 +611,13 @@ impl SessionShared {
                     }
                 }
             }
-            SessionMsg::FsDone { req, error, .. } => {
+            SessionMsg::FsDone { req, error, path } => {
                 self.downloads.remove(&req);
+                self.fs_done = Some((req, error.clone()));
                 if let Some(t) = self.transfer(req) {
+                    if t.upload && error.is_none() {
+                        t.remote = Some(path);
+                    }
                     t.state = match error {
                         Some(e) => TransferState::Failed(e),
                         None => TransferState::Done,
@@ -646,6 +659,7 @@ impl SessionShared {
             transfers: Vec::new(),
             remote_changed: false,
             shell: ShellLog::default(),
+            fs_done: None,
             clipboard_in: None,
             remote_clipboard: None,
             pointer_shapes: HashMap::new(),
@@ -1133,16 +1147,19 @@ impl SessionHandle {
         });
     }
 
-    pub fn mkdir_remote(&self, path: &str) {
+    /// Make a remote folder. Returns the request (answered by `FsDone`).
+    pub fn mkdir_remote(&self, path: &str) -> u32 {
         let req = self.shared.lock().unwrap().take_req();
         self.send(SessionMsg::FsMkdir {
             req,
             path: path.to_string(),
         });
+        req
     }
 
     /// Copy a remote file into `local_dir` (never overwrites).
-    pub fn download(&self, remote: &FsEntry, local_dir: PathBuf) {
+    /// Returns the request (its [`Transfer`] has the same `req`).
+    pub fn download(&self, remote: &FsEntry, local_dir: PathBuf) -> u32 {
         let req = {
             let mut s = self.shared.lock().unwrap();
             let req = s.take_req();
@@ -1155,6 +1172,7 @@ impl SessionHandle {
                 total: remote.size,
                 state: TransferState::Running,
                 local: local_dir.join(&remote.name),
+                remote: None,
             });
             req
         };
@@ -1162,10 +1180,12 @@ impl SessionHandle {
             req,
             path: remote.path.clone(),
         });
+        req
     }
 
     /// Copy a local file into the remote folder `remote_dir`.
-    pub fn upload(&self, local: PathBuf, remote_dir: String) {
+    /// Returns the request (its [`Transfer`] has the same `req`).
+    pub fn upload(&self, local: PathBuf, remote_dir: String) -> u32 {
         let name = local
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -1182,6 +1202,7 @@ impl SessionHandle {
                 total: size,
                 state: TransferState::Running,
                 local: local.clone(),
+                remote: None,
             });
             req
         };
@@ -1243,6 +1264,7 @@ impl SessionHandle {
                 }
             }
         });
+        req
     }
 
     /// Ask the remote shell which folder it is in (an empty command).
