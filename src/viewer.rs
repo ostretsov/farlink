@@ -212,6 +212,8 @@ pub struct ShellView {
     draft: String,
     /// Put the keyboard on the input line.
     focus: bool,
+    /// Show the end of the transcript (Enter was pressed).
+    scroll_end: bool,
 }
 
 /// Most commands one shell window remembers.
@@ -278,27 +280,32 @@ const SHELL_ANSWER: Duration = Duration::from_secs(6);
 
 /// A shell window: transcript above, input line below. Returns true when closed.
 fn shell_window(ui: &mut egui::Ui, s: &mut OpenSession) -> bool {
-    let ctx = ui.ctx().clone();
-    if ctx.input(|i| i.viewport().close_requested()) {
+    if ui.ctx().input(|i| i.viewport().close_requested()) {
         return true;
     }
     let Some(view) = s.shell.as_mut() else { return true };
-    let (parts, prompt, running, cwd_known, silent, scroll, live, windows, powershell) = {
-        let mut sh = s.handle.shared.lock().unwrap();
+    shell_ui(ui, view, &s.handle, s.id);
+    false
+}
+
+/// The shell window's content (the session's id keeps widget ids apart).
+fn shell_ui(ui: &mut egui::Ui, view: &mut ShellView, handle: &SessionHandle, id: u64) {
+    let ctx = ui.ctx().clone();
+    let (parts, prompt, running, cwd_known, silent, live, windows, powershell) = {
+        let mut sh = handle.shared.lock().unwrap();
         let live = sh.state == ConnState::Live;
         let log = &mut sh.shell;
         let silent = log.cwd.is_none() && log.asked.is_some_and(|t| t.elapsed() > SHELL_ANSWER);
-        let scroll = std::mem::take(&mut log.changed);
-        (log.parts.clone(), log.prompt(), log.running.is_some(), log.cwd.is_some(), silent, scroll, live, log.windows(), log.powershell)
+        (log.parts.clone(), log.prompt(), log.running.is_some(), log.cwd.is_some(), silent, live, log.windows(), log.powershell)
     };
-    if live && !cwd_known && s.handle.shared.lock().unwrap().shell.asked.is_none() {
-        s.handle.shell_hello();
+    if live && !cwd_known && handle.shared.lock().unwrap().shell.asked.is_none() {
+        handle.shell_hello();
     }
     if !cwd_known && !silent {
         ctx.request_repaint_after(Duration::from_millis(500));
     }
     let mono = egui::FontId::monospace(13.0);
-    let input_id = egui::Id::unique(("farlink-shell-input", s.id));
+    let input_id = egui::Id::unique(("farlink-shell-input", id));
     let focused = ctx.memory(|m| m.has_focus(input_id));
     let mut stop = false;
     let mut end_input = false;
@@ -326,10 +333,10 @@ fn shell_window(ui: &mut egui::Ui, s: &mut OpenSession) -> bool {
         ui.horizontal(|ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.button("Clear").on_hover_text("Empty this window (nothing is kept anywhere)").clicked() {
-                    s.handle.shared.lock().unwrap().shell.clear();
+                    handle.shared.lock().unwrap().shell.clear();
                 }
                 if ui.button("Copy all").clicked() {
-                    ctx.copy_text(s.handle.shared.lock().unwrap().shell.text());
+                    ctx.copy_text(handle.shared.lock().unwrap().shell.text());
                 }
                 // Windows: PowerShell or cmd for the next commands.
                 if windows {
@@ -342,7 +349,7 @@ fn shell_window(ui: &mut egui::Ui, s: &mut OpenSession) -> bool {
                         })
                         .inner;
                     if changed {
-                        s.handle.shared.lock().unwrap().shell.powershell = ps;
+                        handle.shared.lock().unwrap().shell.powershell = ps;
                         view.focus = true;
                     }
                 }
@@ -366,18 +373,22 @@ fn shell_window(ui: &mut egui::Ui, s: &mut OpenSession) -> bool {
                         .font(mono.clone())
                         .hint_text(hint)
                         .desired_width(f32::INFINITY);
-                    let resp = ui.add_enabled(live && cwd_known, edit);
+                    let enabled = live && cwd_known;
+                    let resp = ui.add_enabled(enabled, edit);
                     // Read once: refocusing below makes `lost_focus()` false again.
                     let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if std::mem::take(&mut view.focus) || entered {
+                    // A disabled line can't take focus: keep the wish (e.g. the
+                    // window just opened) until the helper has answered.
+                    if (enabled && std::mem::take(&mut view.focus)) || entered {
                         resp.request_focus();
                     }
                     if entered {
+                        view.scroll_end = true;
                         if running {
                             let text = format!("{}\n", std::mem::take(&mut view.input));
-                            s.handle.shell_input(&text);
+                            handle.shell_input(&text);
                         } else if let Some(cmd) = view.submit() {
-                            s.handle.shell_run(&cmd);
+                            handle.shell_run(&cmd);
                         }
                     }
                 });
@@ -385,10 +396,10 @@ fn shell_window(ui: &mut egui::Ui, s: &mut OpenSession) -> bool {
         });
     });
     if stop {
-        s.handle.shell_stop();
+        handle.shell_stop();
     }
     if end_input {
-        s.handle.shell_input("");
+        handle.shell_input("");
     }
     egui::CentralPanel::default().frame(egui::Frame::new().fill(BG).inner_margin(Margin::symmetric(10, 8))).show(ui, |ui| {
         if silent {
@@ -410,15 +421,15 @@ fn shell_window(ui: &mut egui::Ui, s: &mut OpenSession) -> bool {
             job.append(text, 0.0, egui::TextFormat::simple(mono.clone(), color));
         }
         job.wrap.max_width = ui.available_width();
-        let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true);
-        if scroll {
-            area = area.vertical_scroll_offset(f32::MAX);
-        }
-        area.show(ui, |ui| {
+        // Follows new output while at the bottom; Enter always goes there.
+        let scroll_end = std::mem::take(&mut view.scroll_end);
+        egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
             ui.add(egui::Label::new(job).selectable(true));
+            if scroll_end {
+                ui.scroll_to_cursor(Some(Align::BOTTOM));
+            }
         });
     });
-    false
 }
 
 /// Two-pane file browser: this computer on the left, the remote one on the right.
@@ -4866,5 +4877,138 @@ mod tests {
         assert_eq!(v.history[0], "echo 20");
         let saved = serde_json::to_string(&ViewerConfig::default()).unwrap();
         assert!(!saved.contains("shell"), "nothing about shells is saved: {saved}");
+    }
+
+    /// A shell window drawn headless, on the demo session (its shell is this computer's).
+    struct ShellHarness {
+        ctx: egui::Context,
+        view: ShellView,
+        handle: SessionHandle,
+        /// Frames run on a real clock (scrolling is animated).
+        start: Instant,
+    }
+
+    const SHELL_SIZE: Vec2 = Vec2::new(600.0, 300.0);
+
+    impl ShellHarness {
+        fn new() -> Self {
+            let handle = SessionHandle::start(crate::net::Target::Demo, Quality::default(), false, Arc::new(|| {}));
+            ShellHarness { ctx: egui::Context::default(), view: ShellView::new(1), handle, start: Instant::now() }
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) -> Vec<egui::epaint::ClippedShape> {
+            let time = Some(self.start.elapsed().as_secs_f64());
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, SHELL_SIZE)), time, events, ..Default::default() };
+            let mut out = self.ctx.run_ui(raw, |ui| shell_ui(ui, &mut self.view, &self.handle, 7));
+            out.textures_delta.clear();
+            out.shapes
+        }
+
+        /// Draws frames until `done` says so (the demo shell answers on its own thread).
+        fn wait(&mut self, what: &str, done: impl Fn(&crate::net::ShellLog) -> bool) {
+            let until = Instant::now() + Duration::from_secs(15);
+            while !done(&self.handle.shared.lock().unwrap().shell) {
+                assert!(Instant::now() < until, "waited too long for {what}: {:?}", self.handle.shared.lock().unwrap().shell.text());
+                self.frame(vec![]);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            self.frame(vec![]);
+        }
+
+        /// Lets animations (scrolling) finish.
+        fn settle(&mut self) {
+            let until = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < until {
+                self.frame(vec![]);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn ready(mut self) -> Self {
+            self.wait("the shell", |l| l.cwd.is_some() && l.running.is_none());
+            self
+        }
+
+        fn focused(&self) -> bool {
+            self.ctx.memory(|m| m.has_focus(egui::Id::unique(("farlink-shell-input", 7u64))))
+        }
+
+        /// Types a line and presses Enter.
+        fn enter(&mut self, line: &str) {
+            self.frame(vec![egui::Event::Text(line.into())]);
+            self.frame(vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }]);
+        }
+
+        /// Where the transcript ends on screen (its text is one galley).
+        fn transcript_bottom(&mut self) -> f32 {
+            let shapes = self.frame(vec![]);
+            shapes
+                .iter()
+                .find_map(|c| match &c.shape {
+                    egui::Shape::Text(t) if t.galley.text().contains("line 0\n") => Some(t.pos.y + t.galley.size().y),
+                    _ => None,
+                })
+                .expect("transcript drawn")
+        }
+    }
+
+    #[test]
+    fn shell_input_takes_the_keyboard_once_the_shell_answers() {
+        let mut h = ShellHarness::new();
+        h.frame(vec![]);
+        let h = h.ready();
+        assert!(h.focused(), "the command line has the keyboard as soon as it can be used");
+    }
+
+    #[test]
+    fn enter_runs_every_command() {
+        let mut h = ShellHarness::new().ready();
+        h.enter("echo first-$((40+2))");
+        assert!(h.view.input.is_empty(), "the line is emptied");
+        h.wait("the first command", |l| l.running.is_none() && l.text().contains("first-42\n"));
+        assert!(h.focused(), "the line keeps the keyboard after Enter");
+        // The second Enter used to do nothing.
+        h.enter("echo second-$((40+3))");
+        h.wait("the second command", |l| l.running.is_none() && l.text().contains("second-43\n"));
+        let text = h.handle.shared.lock().unwrap().shell.text();
+        assert!(text.find("first-42").unwrap() < text.find("second-43").unwrap(), "output is added below: {text}");
+    }
+
+    #[test]
+    fn enter_shows_the_end_of_the_transcript() {
+        let mut h = ShellHarness::new().ready();
+        {
+            let mut sh = h.handle.shared.lock().unwrap();
+            for i in 0..200 {
+                sh.shell.push(crate::net::ShellText::Out, &format!("line {i}\n"));
+            }
+        }
+        h.settle();
+        assert!(h.transcript_bottom() < SHELL_SIZE.y, "starts at the end");
+        // Scroll up to read earlier lines: new output must not pull the view away.
+        for _ in 0..5 {
+            h.frame(vec![
+                egui::Event::PointerMoved(Pos2::new(300.0, 100.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Page,
+                    delta: Vec2::new(0.0, 1.0),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+        }
+        h.settle();
+        let up = h.transcript_bottom();
+        assert!(up > SHELL_SIZE.y * 3.0, "scrolled up: transcript ends at {up}");
+        h.handle.shared.lock().unwrap().shell.push(crate::net::ShellText::Out, "more\n");
+        h.settle();
+        assert!(h.transcript_bottom() > SHELL_SIZE.y * 3.0, "output arriving keeps the place");
+        // Enter goes to the end, and the command's output stays in view.
+        h.enter("echo after-enter");
+        h.wait("the command", |l| l.running.is_none() && l.text().contains("after-enter\n"));
+        h.settle();
+        let end = h.transcript_bottom();
+        assert!(end < SHELL_SIZE.y, "Enter shows the end: transcript ends at {end}");
     }
 }

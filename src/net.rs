@@ -386,8 +386,6 @@ pub struct ShellLog {
     pub running: Option<u32>,
     /// When the first question ("which folder?") went out.
     pub asked: Option<Instant>,
-    /// Something changed: scroll to the end.
-    pub changed: bool,
     /// Windows computer: run with PowerShell (else cmd). Starts on.
     pub powershell: bool,
     /// The last command that ended: (request, exit code, why it did not run).
@@ -402,7 +400,6 @@ impl Default for ShellLog {
             cwd: None,
             running: None,
             asked: None,
-            changed: false,
             powershell: true,
             done: None,
             len: 0,
@@ -485,7 +482,6 @@ impl ShellLog {
                 self.len -= cut;
             }
         }
-        self.changed = true;
     }
 
     /// Text that ends the current line first (output may stop mid-line).
@@ -499,7 +495,6 @@ impl ShellLog {
     pub fn clear(&mut self) {
         self.parts.clear();
         self.len = 0;
-        self.changed = true;
     }
 
     /// Everything as plain text (for copying).
@@ -529,7 +524,6 @@ impl ShellLog {
                     _ if was_running => self.push_line(ShellText::Note, ""),
                     _ => {}
                 }
-                self.changed = true;
             }
             _ => {}
         }
