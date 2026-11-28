@@ -1462,6 +1462,24 @@ impl ViewerApp {
         self.toast = Some((text.into(), Instant::now()));
     }
 
+    /// Connections the other side ended (the remote computer restarted, access
+    /// was withdrawn, ...) disappear on their own; the reason stays in a toast.
+    /// A shell window stays open so its transcript can still be read.
+    fn drop_ended_sessions(&mut self) {
+        let mut ended = Vec::new();
+        self.sessions.retain(|s| {
+            let ConnState::Closed(reason) = &s.handle.shared.lock().unwrap().state else { return true };
+            if s.shell.is_some() {
+                return true;
+            }
+            ended.push(format!("{}: {reason}", s.name));
+            false
+        });
+        if let Some(last) = ended.pop() {
+            self.toast(last);
+        }
+    }
+
     fn refresh(&mut self, ctx: &egui::Context) {
         if self.demo || self.job_overview.is_some() {
             return;
@@ -3550,6 +3568,7 @@ impl eframe::App for ViewerApp {
             self.screenshot_step(&ctx);
             return;
         }
+        self.drop_ended_sessions();
         self.bottom_bar(ui);
         if self.signed_in() || self.demo {
             self.machine_list(ui);
