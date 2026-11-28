@@ -1482,6 +1482,69 @@ async fn a_broken_direct_path_falls_back_to_the_relay_and_comes_back() {
     wait_for(&h, "pictures over the new direct path", |sh| sh.canvases.values().filter(|c| c.frame.is_some()).count() == 2).await;
 }
 
+/// Switching the mode while on the direct path: the switch must reach the
+/// relay (which tells the helper). It used to go over the direct path, where
+/// the helper ignores it, so a session opened to watch could never control.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn view_only_switches_reach_the_helper_on_the_direct_path() {
+    use farlink::net::{ConnState, SessionHandle, Target};
+    let s = start_server().await;
+    let machine = real_helper(&s).await;
+    let target = Target::Admin { server: s.url.clone(), token: s.admin.clone(), machine_id: machine, view_only: true };
+    let h = SessionHandle::start(target, farlink::quality::Quality::preset(farlink::quality::Preset::Fast), true, std::sync::Arc::new(|| {}));
+    wait_for(&h, "direct path", |sh| sh.state == ConnState::Live && sh.route.is_direct()).await;
+    let relay_mode = async || s.overview().await.sessions.first().map(|x| x["view_only"] == true);
+    assert_eq!(relay_mode().await, Some(true));
+
+    // Only watching: the helper answers no file requests.
+    let dir = farlink::util::unique_temp_dir("farlink-e2e-mode");
+    std::fs::write(dir.join("hello.txt"), "hi").unwrap();
+    let path = dir.to_string_lossy().to_string();
+    h.list_remote(&path);
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(h.shared.lock().unwrap().remote_dir.loading, "view-only: no answer");
+
+    // Control: the relay hears of it...
+    h.set_view_only(false);
+    let mut switched = false;
+    for _ in 0..100 {
+        if relay_mode().await == Some(false) {
+            switched = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(switched, "the relay never got the switch to control");
+    // ... and so does the helper: requests over the direct path are answered.
+    let mut listed = false;
+    for _ in 0..20 {
+        h.list_remote(&path);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let sh = h.shared.lock().unwrap();
+        if !sh.remote_dir.loading && sh.remote_dir.entries.iter().any(|e| e.name == "hello.txt") {
+            listed = true;
+            break;
+        }
+    }
+    assert!(listed, "the helper still treats the session as view-only");
+    assert!(h.shared.lock().unwrap().route.is_direct(), "all of this on the direct path");
+
+    // And back to watching: the helper stops answering again.
+    h.set_view_only(true);
+    for _ in 0..100 {
+        if relay_mode().await == Some(true) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(relay_mode().await, Some(true));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    h.list_remote(&path);
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(h.shared.lock().unwrap().remote_dir.loading, "view-only again: no answer");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Mouse input while big pictures arrive used to cut pictures apart on the
 /// direct path, so the session kept dropping to the relay and coming back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

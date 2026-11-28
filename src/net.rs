@@ -1413,6 +1413,9 @@ async fn network_task(
                     relay.extend(direct.broken());
                     out.push(crate::direct::json(&SessionMsg::Refresh));
                 }
+                // Mode switches go to the relay, never the direct path: the relay
+                // decides and tells the host, which ignores them from the viewer.
+                Some(m @ SessionMsg::SetViewOnly { .. }) => relay.push(m),
                 Some(m) => {
                     if let SessionMsg::Quality { quality: q } = &m { quality = *q; }
                     out.push(crate::direct::json(&m));
