@@ -66,8 +66,8 @@ pub fn run(opts: ViewerOptions) -> eframe::Result<()> {
         viewport: ViewportBuilder::default()
             .with_title(format!("Farlink {}", crate::VERSION))
             .with_app_id("farlink") // X11 WM_CLASS / Wayland app id: matches farlink.desktop
-            .with_inner_size([1180.0, 760.0])
-            .with_min_inner_size([820.0, 520.0])
+            .with_inner_size([MAIN_WIDTH, 760.0])
+            .with_min_inner_size(MAIN_MIN)
             .with_icon(Arc::new(egui::IconData { rgba: crate::tray::icon::rgba(256), width: 256, height: 256 })),
         ..Default::default()
     };
@@ -817,6 +817,8 @@ pub fn fit_rect(avail: Rect, w: f32, h: f32) -> Rect {
 /// An open "Rename computer" dialog.
 /// How often the selected computer's screen pictures are refreshed.
 const PREVIEW_EVERY: Duration = Duration::from_secs(5);
+/// How many computers' last preview pictures stay in memory.
+const PREVIEW_MEMORY: usize = 64;
 
 /// Small pictures of the selected computer's screens.
 struct PreviewState {
@@ -829,6 +831,8 @@ struct PreviewState {
     /// The decoded pictures behind `textures`, for "Take screenshot".
     frames: HashMap<u8, Arc<Frame>>,
     error: Option<String>,
+    /// The computer's screens: only a preview with a picture of each is remembered.
+    screens: Vec<u8>,
 }
 
 type PreviewResult = (String, u64, Vec<(u8, Frame)>);
@@ -863,6 +867,10 @@ impl Default for GrantForm {
 
 pub struct ViewerApp {
     opts: ViewerOptions,
+    /// The main window got its start-up size from the monitor ([`main_window_size`]).
+    sized: bool,
+    /// When [`ViewerApp::size_main_window`] first looked.
+    sized_at: Option<Instant>,
     cfg: ViewerConfig,
     cfg_path: Option<PathBuf>,
     layouts: LayoutStore,
@@ -889,6 +897,9 @@ pub struct ViewerApp {
     last_refresh: Option<Instant>,
     selected: Option<String>,
     preview: Option<PreviewState>,
+    /// The last preview pictures of each computer left (in memory only): drawn
+    /// faded behind the loading animation when it is selected again.
+    preview_memory: HashMap<String, HashMap<u8, egui::TextureHandle>>,
     job_preview: Option<Job<PreviewResult>>,
     search: String,
     sessions: Vec<OpenSession>,
@@ -946,6 +957,12 @@ pub fn sample_overview() -> Overview {
     let mut anna = m("demo-anna", "Anna's laptop", "ANNA-NB", "Windows 11 Home", vec![mon(0, 0, 1920, 1080)], true, 0);
     anna.machine.owner = Some("demo-user-anna".into());
     anna.owner_name = Some("Anna".into());
+    if let Some(s) = anna.stats.as_mut() {
+        s.ifaces = vec![crate::sysstat::NetIface {
+            name: "Wi-Fi".into(),
+            addrs: vec!["192.168.1.34".into()],
+        }];
+    }
     // One helper behind the published version, to show the "Update" button.
     let mut srv = m("demo-srv", "Accounting server", "ACC-SRV16", "Windows Server 2016", vec![mon(0, 0, 1920, 1080)], true, 0);
     srv.machine.version = "0.0.9".into();
@@ -956,6 +973,10 @@ pub fn sample_overview() -> Overview {
         s.mem_used = 15 * G;
         s.disks = vec![disk("C:", 120, 7), disk("D:", 2000, 860)];
         s.user = Some("ACME\\backup".into());
+        s.ifaces = vec![crate::sysstat::NetIface {
+            name: "Ethernet".into(),
+            addrs: vec!["10.0.5.16".into(), "fd00::16".into()],
+        }];
         s.joined = Some(crate::sysstat::Joined::Domain("acme.local".into()));
     }
     let mut office = m("demo-office", "Office PC", "OFFICE-PC", "Windows 11 Pro 23H2 (build 22631)", vec![mon(0, 0, 1600, 900), mon(1, 1600, 1280, 1024)], true, 0);
@@ -963,6 +984,16 @@ pub fn sample_overview() -> Overview {
     if let Some(s) = office.stats.as_mut() {
         s.disks = vec![disk("C:", 476, 212)];
         s.user = Some("Reception".into());
+        s.ifaces = vec![
+            crate::sysstat::NetIface {
+                name: "Ethernet".into(),
+                addrs: vec!["192.168.10.21".into()],
+            },
+            crate::sysstat::NetIface {
+                name: "Wi-Fi".into(),
+                addrs: vec!["192.168.20.57".into()],
+            },
+        ];
         s.joined = Some(crate::sysstat::Joined::Workgroup("WORKGROUP".into()));
     }
     let mut o = Overview {
@@ -1029,6 +1060,8 @@ impl ViewerApp {
         let layouts = layouts_path.as_ref().map(|p| LayoutStore::load(p)).unwrap_or_default();
         let demo = opts.demo || screenshot;
         let mut app = ViewerApp {
+            sized: false,
+            sized_at: None,
             server_input: cfg.server_url.clone(),
             cfg,
             cfg_path,
@@ -1052,6 +1085,7 @@ impl ViewerApp {
             last_refresh: None,
             selected: None,
             preview: None,
+            preview_memory: HashMap::new(),
             job_preview: None,
             search: String::new(),
             sessions: Vec::new(),
@@ -1376,6 +1410,22 @@ impl ViewerApp {
         }
     }
 
+    /// Drop the current preview, keeping its pictures in [`Self::preview_memory`].
+    fn remember_preview(&mut self) {
+        let Some(p) = self.preview.take() else { return };
+        // Only a fully loaded preview replaces the one remembered before.
+        if p.screens.is_empty() || !p.screens.iter().all(|i| p.textures.contains_key(i)) {
+            return;
+        }
+        if self.preview_memory.len() >= PREVIEW_MEMORY
+            && !self.preview_memory.contains_key(&p.machine_id)
+            && let Some(k) = self.preview_memory.keys().next().cloned()
+        {
+            self.preview_memory.remove(&k);
+        }
+        self.preview_memory.insert(p.machine_id, p.textures);
+    }
+
     /// Keep the pictures of the selected computer fresh: one request every
     /// [`PREVIEW_EVERY`] while it is online and not already open (an open
     /// session shows live pictures instead).
@@ -1414,11 +1464,12 @@ impl ViewerApp {
             .filter(|m| !self.sessions.iter().any(|s| s.machine_id.as_ref() == Some(&m.machine.id)))
             .map(|m| (m.machine.id.clone(), m.machine.monitors.clone()));
         let Some((id, monitors)) = wanted else {
-            self.preview = None;
+            self.remember_preview();
             return;
         };
         if self.preview.as_ref().is_none_or(|p| p.machine_id != id) {
-            self.preview = Some(PreviewState { machine_id: id.clone(), fetched: None, taken: 0, textures: HashMap::new(), frames: HashMap::new(), error: None });
+            self.remember_preview();
+            self.preview = Some(PreviewState { machine_id: id.clone(), fetched: None, taken: 0, textures: HashMap::new(), frames: HashMap::new(), error: None, screens: monitors.iter().map(|m| m.index).collect() });
         }
         let p = self.preview.as_ref().unwrap();
         let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
@@ -1651,10 +1702,7 @@ impl ViewerApp {
                 let mut notes_start: Option<NotesEdit> = None;
                 let can_rename = ov.role == "admin";
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    for m in ov.machines.iter().filter(|m| {
-                        q.is_empty()
-                            || format!("{} {} {} {}", m.machine.name, m.machine.hostname, m.machine.os, m.machine.notes).to_lowercase().contains(&q)
-                    }) {
+                    for m in ov.machines.iter().filter(|m| matches_search(m, &q)) {
                         let selected = self.selected.as_deref() == Some(m.machine.id.as_str());
                         let in_session = self.sessions.iter().any(|s| s.machine_id.as_deref() == Some(m.machine.id.as_str()));
                         let mut resp = machine_row(ui, m, selected, in_session, ov.now);
@@ -2154,6 +2202,8 @@ impl ViewerApp {
             let avail_w = ui.available_width().min(760.0);
             let scale = (avail_w / vw as f32).min(260.0 / vh as f32);
             let can_connect = online && session_idx.is_none();
+            let preview_failed = self.preview.as_ref().is_some_and(|p| p.machine_id == m.id && p.error.is_some());
+            let loading = online && (session_idx.is_some() || !preview_failed);
             let (area, _) = ui.allocate_exact_size(Vec2::new(avail_w, vh as f32 * scale + 8.0), Sense::hover());
             let key = m.id.clone();
             let mut forget: Option<String> = None;
@@ -2173,10 +2223,20 @@ impl ViewerApp {
                     let p = self.preview.as_ref().filter(|p| p.machine_id == m.id)?;
                     p.textures.get(&mon.index).map(|t| t.id())
                 });
+                let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
                 if let Some(tex) = tex {
-                    painter.image(tex, r.shrink(2.0), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+                    painter.image(tex, r.shrink(2.0), uv, Color32::WHITE);
                 } else {
-                    painter.rect_filled(r.shrink(2.0), CornerRadius::same(3), Color32::from_rgb(28, 50, 74));
+                    let inner = r.shrink(2.0);
+                    painter.rect_filled(inner, CornerRadius::same(3), Color32::from_rgb(20, 30, 42));
+                    // The picture from last time, faded, until a new one comes.
+                    if let Some(old) = self.preview_memory.get(&m.id).and_then(|t| t.get(&mon.index)) {
+                        painter.image(old.id(), inner, uv, Color32::from_gray(85));
+                    }
+                    if loading {
+                        loading_animation(&painter.with_clip_rect(inner), inner, ui.input(|i| i.time) as f32);
+                        ui.ctx().request_repaint();
+                    }
                 }
                 let border = Stroke::new(1.5, if mon.primary { ACCENT } else { LINE });
                 painter.rect_stroke(r, CornerRadius::same(4), border, StrokeKind::Inside);
@@ -2635,6 +2695,57 @@ fn restart_app(ctx: &egui::Context) {
     match app_exe().and_then(|exe| std::process::Command::new(exe).args(args).spawn()) {
         Ok(_) => quit_app(ctx),
         Err(e) => log::warn!("restart: {e}"),
+    }
+}
+
+/// Start-up size of the main window on a `monitor`-sized screen (points),
+/// with `frame` = title bar and borders: the whole height, and at least 40 %
+/// of the width (never less than the built-in 1180 points, never wider than
+/// the screen).
+fn main_window_size(monitor: Vec2, frame: Vec2) -> Vec2 {
+    let w = (monitor.x * 0.4).max(MAIN_WIDTH).min(monitor.x - frame.x);
+    Vec2::new(w, monitor.y - frame.y).max(MAIN_MIN)
+}
+
+/// Built-in size of the main window before the monitor is known.
+const MAIN_WIDTH: f32 = 1180.0;
+const MAIN_MIN: Vec2 = Vec2::new(820.0, 520.0);
+
+impl ViewerApp {
+    /// Once, as soon as the monitor and the window frame are known: make the
+    /// main window as tall as the screen and at least 40 % of its width,
+    /// at the top, keeping its middle where the window manager put it.
+    fn size_main_window(&mut self, ctx: &egui::Context) {
+        if self.sized || self.opts.screenshot.is_some() {
+            return;
+        }
+        let info = ctx.input(|i| i.viewport().clone());
+        let (Some(monitor), Some(outer), Some(inner)) =
+            (info.monitor_size, info.outer_rect, info.inner_rect)
+        else {
+            return;
+        };
+        // The window manager adds the title bar a moment after the window
+        // appears: wait for it (at most a second, some windows have none).
+        let since = *self.sized_at.get_or_insert_with(Instant::now);
+        if outer.size() == inner.size() && since.elapsed() < Duration::from_secs(1) {
+            ctx.request_repaint_after(Duration::from_millis(30));
+            return;
+        }
+        self.sized = true;
+        if info.maximized.unwrap_or(false)
+            || info.fullscreen.unwrap_or(false)
+            || monitor.min_elem() <= 0.0
+        {
+            return;
+        }
+        let size = main_window_size(monitor, outer.size() - inner.size());
+        let mut x = outer.center().x - (size.x + outer.width() - inner.width()) / 2.0;
+        if outer.min.x >= 0.0 {
+            x = x.max(0.0);
+        }
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+        ctx.send_viewport_cmd(ViewportCommand::OuterPosition(Pos2::new(x, 0.0)));
     }
 }
 
@@ -3116,6 +3227,7 @@ fn draw_remote_pointer(ui: &egui::Ui, s: &OpenSession, mon: &MonitorInfo, rect: 
 impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.size_main_window(&ctx);
         self.tray_step(&ctx);
         self.poll_jobs(&ctx);
         self.preview_step(&ctx);
@@ -3195,6 +3307,37 @@ fn screenshot_name(machine: &str, screen: &str, secs: u64) -> String {
 }
 
 // ------------------------------------------------------------------ widgets
+
+/// "Picture on its way" over a screen preview, kept quiet on purpose: a faint
+/// light sweep across the screen and a small ring of dots slowly turning.
+fn loading_animation(painter: &egui::Painter, r: Rect, t: f32) {
+    let glow = |a: f32| Color32::from_rgba_unmultiplied(ACCENT.r(), ACCENT.g(), ACCENT.b(), (a.clamp(0.0, 1.0) * 255.0) as u8);
+    // Sweep: a slanted band moving left to right every 2.6 s.
+    let band = (r.width() * 0.4).max(30.0);
+    let slant = r.height() * 0.35;
+    let phase = (t / 2.6).fract();
+    let x = r.left() - band - slant + phase * (r.width() + 2.0 * band + 2.0 * slant);
+    let mut mesh = egui::Mesh::default();
+    for (dx, a) in [(0.0, 0.0), (band * 0.5, 0.06), (band, 0.0)] {
+        mesh.colored_vertex(Pos2::new(x + dx + slant, r.top()), glow(a));
+        mesh.colored_vertex(Pos2::new(x + dx, r.bottom()), glow(a));
+    }
+    for i in [0u32, 2] {
+        mesh.add_triangle(i, i + 1, i + 2);
+        mesh.add_triangle(i + 1, i + 2, i + 3);
+    }
+    painter.add(egui::Shape::mesh(mesh));
+    // Centre: 10 small dots, a dimly brighter head going round every 1.6 s.
+    let c = r.center();
+    let radius = (r.width().min(r.height()) * 0.08).clamp(7.0, 16.0);
+    let head = t / 1.6 * std::f32::consts::TAU;
+    for k in 0..10 {
+        let behind = k as f32 / 10.0;
+        let p = c + Vec2::angled(head - behind * std::f32::consts::TAU) * radius;
+        let fade = 1.0 - behind;
+        painter.circle_filled(p, (radius * 0.12).max(1.3), glow(0.12 + 0.43 * fade * fade));
+    }
+}
 
 /// Small "● text" for the status bar, painted as one piece so it reads the
 /// same inside right-to-left rows.
@@ -3297,6 +3440,35 @@ fn paint_os_glyph(p: &egui::Painter, r: Rect, os: &str) {
 
 /// One computer in the list: name, OS, load and disks while online, and
 /// the first line of the administrator's notes.
+/// Whether a computer in the list matches the (lower-case) search text:
+/// name, host name, OS, notes and, while it is online, its IP addresses.
+fn matches_search(m: &MachineView, q: &str) -> bool {
+    if q.is_empty() {
+        return true;
+    }
+    let mi = &m.machine;
+    let addrs = m
+        .stats
+        .as_ref()
+        .filter(|_| m.online)
+        .map(|s| s.addrs().collect::<Vec<_>>().join(" "))
+        .unwrap_or_default();
+    format!("{} {} {} {} {addrs}", mi.name, mi.hostname, mi.os, mi.notes)
+        .to_lowercase()
+        .contains(q)
+}
+
+/// The addresses shown next to a computer's name in the list: its IPv4
+/// ones, or the first IPv6 one when it has no IPv4 address.
+fn list_addrs(s: &crate::sysstat::SystemStats) -> String {
+    let v4: Vec<&str> = s.addrs().filter(|a| !a.contains(':')).collect();
+    if v4.is_empty() {
+        s.addrs().next().unwrap_or_default().to_string()
+    } else {
+        v4.join(", ")
+    }
+}
+
 fn machine_row(ui: &mut egui::Ui, m: &MachineView, selected: bool, in_session: bool, now: u64) -> egui::Response {
     let stats = m.stats.as_ref().filter(|_| m.online);
     let notes = m.machine.notes.lines().map(str::trim).find(|l| !l.is_empty());
@@ -3321,11 +3493,22 @@ fn machine_row(ui: &mut egui::Ui, m: &MachineView, selected: bool, in_session: b
     let name_color = if m.online { TEXT } else { MUTED };
     let text_w = rect.width() - 52.0 - 40.0;
     let x = rect.min.x + 52.0;
-    one_line(p, Pos2::new(x, rect.min.y + 18.0), &m.machine.name, 14.5, name_color, text_w);
-    let screens = m.machine.monitors.len();
+    let mut name = egui::text::LayoutJob::simple_singleline(
+        m.machine.name.clone(),
+        FontId::proportional(14.5),
+        name_color,
+    );
+    if let Some(addrs) = stats.map(list_addrs).filter(|a| !a.is_empty()) {
+        name.append(
+            &format!("   {addrs}"),
+            0.0,
+            egui::TextFormat::simple(FontId::proportional(12.0), MUTED),
+        );
+    }
+    paint_job(p, Pos2::new(x, rect.min.y + 18.0), name, text_w);
     let owner = m.owner_name.as_ref().map(|o| format!("{o} · ")).unwrap_or_default();
     let sub = if m.online {
-        format!("{owner}{} · {} screen{}", m.machine.os, screens, if screens == 1 { "" } else { "s" })
+        format!("{owner}{}", m.machine.os)
     } else {
         format!("offline · {} ago · {}", human_duration(now.saturating_sub(m.machine.last_seen)), m.machine.os)
     };
@@ -3413,6 +3596,16 @@ fn stats_card(ui: &mut egui::Ui, s: &crate::sysstat::SystemStats, load: &[crate:
                     };
                     ui.label(kind);
                     ui.label(RichText::new(name).color(MUTED));
+                    ui.end_row();
+                }
+            });
+            ui.add_space(6.0);
+        }
+        if !s.ifaces.is_empty() {
+            egui::Grid::new("ifaces").num_columns(2).spacing(Vec2::new(14.0, 6.0)).show(ui, |ui| {
+                for i in &s.ifaces {
+                    ui.label(&i.name);
+                    ui.label(RichText::new(i.addrs.join(", ")).color(MUTED));
                     ui.end_row();
                 }
             });
@@ -3672,6 +3865,84 @@ fn relay_details(o: &Overview) -> (String, bool) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn main_window_fills_the_height_and_at_least_40_percent_of_the_width() {
+        let frame = Vec2::new(2.0, 37.0);
+        // Full HD: 40 % would be narrower than the built-in width, which stays.
+        assert_eq!(
+            main_window_size(Vec2::new(1920.0, 1080.0), frame),
+            Vec2::new(1180.0, 1043.0)
+        );
+        // Wide or 4K screens: 40 % of the width.
+        assert_eq!(
+            main_window_size(Vec2::new(3840.0, 2160.0), frame),
+            Vec2::new(1536.0, 2123.0)
+        );
+        assert_eq!(
+            main_window_size(Vec2::new(5120.0, 1440.0), frame),
+            Vec2::new(2048.0, 1403.0)
+        );
+        // Small screen: never wider than the screen, never below the minimum.
+        assert_eq!(
+            main_window_size(Vec2::new(1024.0, 768.0), frame),
+            Vec2::new(1022.0, 731.0)
+        );
+        assert_eq!(main_window_size(Vec2::new(800.0, 480.0), frame), MAIN_MIN);
+    }
+
+    #[test]
+    fn search_finds_online_computers_by_ip_address() {
+        let ov = sample_overview();
+        let find = |q: &str| {
+            ov.machines
+                .iter()
+                .filter(|m| matches_search(m, &q.to_lowercase()))
+                .map(|m| m.machine.id.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(find("192.168.10.21"), ["demo-office"]);
+        assert_eq!(find("10.0.5."), ["demo-srv"]);
+        assert_eq!(find("fd00::16"), ["demo-srv"], "IPv6 addresses count too");
+        assert_eq!(find("reception"), ["demo-office"], "notes still found");
+        assert_eq!(find("").len(), ov.machines.len());
+        // An offline computer's last known addresses are not searched.
+        let mut off = ov
+            .machines
+            .iter()
+            .find(|m| m.machine.id == "demo-office")
+            .unwrap()
+            .clone();
+        off.online = false;
+        assert!(!matches_search(&off, "192.168.10.21"));
+    }
+
+    #[test]
+    fn list_shows_ipv4_addresses_or_else_one_ipv6() {
+        use crate::sysstat::{NetIface, SystemStats};
+        let iface = |name: &str, addrs: &[&str]| NetIface {
+            name: name.into(),
+            addrs: addrs.iter().map(|a| a.to_string()).collect(),
+        };
+        let s = SystemStats {
+            ifaces: vec![
+                iface("eth0", &["192.168.1.5", "2001:db8::5"]),
+                iface("wg0", &["10.8.0.2"]),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(list_addrs(&s), "192.168.1.5, 10.8.0.2");
+        let s = SystemStats {
+            ifaces: vec![iface("eth0", &["2001:db8::5", "2001:db8::6"])],
+            ..Default::default()
+        };
+        assert_eq!(list_addrs(&s), "2001:db8::5");
+        assert_eq!(
+            list_addrs(&SystemStats::default()),
+            "",
+            "older helper: nothing next to the name"
+        );
+    }
 
     #[test]
     fn chart_lines_break_at_pauses_and_unknown_values() {

@@ -802,6 +802,12 @@ async fn notes_are_the_admins_and_heartbeats_bring_load_and_disks() {
     let api = farlink::net::Api { server: s.url.clone(), token: mine_token(&s).await };
     let theirs = blocking(move || api.overview().unwrap()).await;
     assert_eq!(theirs.machines[0].stats, Some(stats.clone()));
+    // ... including the network interfaces and their addresses.
+    assert!(!stats.ifaces.is_empty());
+    assert_eq!(
+        theirs.machines[0].stats.as_ref().unwrap().ifaces,
+        stats.ifaces
+    );
     // ... with the CPU / memory history for the chart.
     let load = &theirs.machines[0].load;
     assert_eq!(load.len(), 1);

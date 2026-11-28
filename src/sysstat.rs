@@ -34,6 +34,99 @@ pub struct SystemStats {
     /// Network traffic since the previous sample (helpers from 0.1.18 on).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub net: Option<NetRate>,
+    /// Network interfaces with their addresses, no loopback, container or
+    /// VM bridges (helpers from 0.1.23 on).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ifaces: Vec<NetIface>,
+}
+
+/// One network interface and its addresses (IPv4 first).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetIface {
+    /// `eth0`, `wlp2s0` / "Ethernet", "Wi-Fi".
+    pub name: String,
+    pub addrs: Vec<String>,
+}
+
+impl SystemStats {
+    /// Every address of every interface, IPv4 ones first.
+    pub fn addrs(&self) -> impl Iterator<Item = &str> {
+        let v4 = |want: bool| {
+            self.ifaces
+                .iter()
+                .flat_map(|i| &i.addrs)
+                .filter(move |a| !a.contains(':') == want)
+        };
+        v4(true).chain(v4(false)).map(String::as_str)
+    }
+}
+
+/// Bridges and links of containers and virtual machines (Docker, libvirt,
+/// LXD, Podman, Kubernetes, WSL / Hyper-V default switch): their addresses
+/// mean nothing outside the computer.
+fn container_link(name: &str) -> bool {
+    const PREFIXES: [&str; 13] = [
+        "lo",
+        "docker",
+        "br-",
+        "veth",
+        "virbr",
+        "vnet",
+        "lxcbr",
+        "lxdbr",
+        "podman",
+        "cni",
+        "flannel",
+        "cali",
+        "vEthernet (WSL",
+    ];
+    PREFIXES.iter().any(|p| name.starts_with(p))
+        || name.contains("Default Switch")
+        || name.contains("DockerNAT")
+}
+
+/// Addresses worth showing: not loopback, link-local or unspecified.
+fn useful_addr(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(a) => !a.is_loopback() && !a.is_link_local() && !a.is_unspecified(),
+        std::net::IpAddr::V6(a) => {
+            !a.is_loopback() && !a.is_unspecified() && (a.segments()[0] & 0xffc0) != 0xfe80
+        }
+    }
+}
+
+/// `(interface, address)` pairs → interfaces in first-seen order, IPv4
+/// addresses before IPv6 ones, unwanted interfaces and addresses left out.
+fn group_ifaces(pairs: impl IntoIterator<Item = (String, std::net::IpAddr)>) -> Vec<NetIface> {
+    let mut out: Vec<(NetIface, Vec<std::net::IpAddr>)> = Vec::new();
+    for (name, ip) in pairs {
+        if container_link(&name) || !useful_addr(&ip) {
+            continue;
+        }
+        let i = match out.iter().position(|(n, _)| n.name == name) {
+            Some(i) => i,
+            None => {
+                out.push((
+                    NetIface {
+                        name,
+                        addrs: Vec::new(),
+                    },
+                    Vec::new(),
+                ));
+                out.len() - 1
+            }
+        };
+        if !out[i].1.contains(&ip) {
+            out[i].1.push(ip);
+        }
+    }
+    out.into_iter()
+        .map(|(mut n, mut ips)| {
+            ips.sort_by_key(|ip| ip.is_ipv6());
+            n.addrs = ips.iter().map(|ip| ip.to_string()).collect();
+            n
+        })
+        .collect()
 }
 
 /// Average network traffic over a while, in bytes per second, of the
@@ -125,6 +218,7 @@ impl Sampler {
             user: signed_in_user(),
             joined: joined(),
             net,
+            ifaces: group_ifaces(interface_addrs()),
         }
     }
 }
@@ -232,6 +326,10 @@ pub fn demo_stats() -> SystemStats {
         user: Some("demo".into()),
         joined: None,
         net: Some(NetRate { rx: 120_000.0, tx: 40_000.0 }),
+        ifaces: vec![NetIface {
+            name: "eth0".into(),
+            addrs: vec!["192.168.1.20".into(), "2001:db8::20".into()],
+        }],
     }
 }
 
@@ -303,6 +401,43 @@ fn parse_net_dev(s: &str, virtual_if: impl Fn(&str) -> bool) -> Option<NetCounte
         t.1 += v[8];
     }
     total
+}
+
+/// Addresses of the interfaces that are up (`getifaddrs`).
+#[cfg(not(windows))]
+fn interface_addrs() -> Vec<(String, std::net::IpAddr)> {
+    let mut out = Vec::new();
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return out;
+    }
+    let mut cur = list;
+    while !cur.is_null() {
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+        if ifa.ifa_addr.is_null() || ifa.ifa_flags & libc::IFF_UP as u32 == 0 {
+            continue;
+        }
+        let ip = unsafe {
+            match (*ifa.ifa_addr).sa_family as i32 {
+                libc::AF_INET => {
+                    let a = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                    std::net::IpAddr::from(u32::from_be(a.sin_addr.s_addr).to_be_bytes())
+                }
+                libc::AF_INET6 => {
+                    let a = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
+                    std::net::IpAddr::from(a.sin6_addr.s6_addr)
+                }
+                _ => continue,
+            }
+        };
+        let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
+        out.push((name, ip));
+    }
+    unsafe { libc::freeifaddrs(list) };
+    out
 }
 
 /// (total, used) bytes.
@@ -514,6 +649,75 @@ fn net_counters() -> Option<NetCounters> {
     total
 }
 
+/// Addresses of the adapters that are up, by their friendly names
+/// ("Ethernet", "Wi-Fi").
+#[cfg(windows)]
+fn interface_addrs() -> Vec<(String, std::net::IpAddr)> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
+        GetAdaptersAddresses, IF_TYPE_SOFTWARE_LOOPBACK, IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+    const AF_UNSPEC: u32 = 0;
+    const AF_INET: u16 = 2;
+    const AF_INET6: u16 = 23;
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    let mut out = Vec::new();
+    // u64 items keep the buffer aligned for the structures written into it.
+    let mut size: u32 = 16 * 1024;
+    let mut buf: Vec<u64>;
+    loop {
+        buf = vec![0u64; (size as usize).div_ceil(8)];
+        let r = unsafe {
+            GetAdaptersAddresses(
+                AF_UNSPEC,
+                flags,
+                std::ptr::null(),
+                buf.as_mut_ptr().cast(),
+                &mut size,
+            )
+        };
+        match r {
+            0 => break,
+            111 /* ERROR_BUFFER_OVERFLOW */ if size as usize > buf.len() * 8 => continue,
+            _ => return out,
+        }
+    }
+    let mut a = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+    while !a.is_null() {
+        let ad = unsafe { &*a };
+        a = ad.Next;
+        if ad.IfType == IF_TYPE_SOFTWARE_LOOPBACK || ad.OperStatus != IfOperStatusUp {
+            continue;
+        }
+        let name = unsafe { wide_to_string(ad.FriendlyName) };
+        let mut u = ad.FirstUnicastAddress;
+        while !u.is_null() {
+            let ua = unsafe { &*u };
+            u = ua.Next;
+            let sa = ua.Address.lpSockaddr as *const u8;
+            if sa.is_null() {
+                continue;
+            }
+            let bytes = unsafe {
+                std::slice::from_raw_parts(sa, ua.Address.iSockaddrLength.max(0) as usize)
+            };
+            let family = bytes.get(..2).map(|b| u16::from_ne_bytes([b[0], b[1]]));
+            let ip = match family {
+                Some(AF_INET) if bytes.len() >= 8 => {
+                    std::net::IpAddr::from(<[u8; 4]>::try_from(&bytes[4..8]).unwrap())
+                }
+                Some(AF_INET6) if bytes.len() >= 24 => {
+                    std::net::IpAddr::from(<[u8; 16]>::try_from(&bytes[8..24]).unwrap())
+                }
+                _ => continue,
+            };
+            out.push((name.clone(), ip));
+        }
+    }
+    out
+}
+
 #[cfg(windows)]
 fn memory() -> Option<(u64, u64)> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -706,6 +910,58 @@ mod tests {
         }
         assert_eq!(human_bytes(512 << 30), "512 GB");
         assert_eq!(human_bytes(7 << 29), "3.5 GB");
+    }
+
+    #[test]
+    fn lists_interfaces_without_loopback_and_containers() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        let got = group_ifaces([
+            ("lo".to_string(), ip("127.0.0.1")),
+            ("eth0".to_string(), ip("fe80::1")),
+            ("eth0".to_string(), ip("2001:db8::5")),
+            ("eth0".to_string(), ip("192.168.1.5")),
+            ("docker0".to_string(), ip("172.17.0.1")),
+            ("br-3f2a".to_string(), ip("172.18.0.1")),
+            (
+                "vEthernet (WSL (Hyper-V firewall))".to_string(),
+                ip("172.20.0.1"),
+            ),
+            ("wg0".to_string(), ip("10.8.0.2")),
+            ("Wi-Fi".to_string(), ip("169.254.3.4")),
+        ]);
+        assert_eq!(
+            got,
+            vec![
+                NetIface {
+                    name: "eth0".into(),
+                    addrs: vec!["192.168.1.5".into(), "2001:db8::5".into()]
+                },
+                NetIface {
+                    name: "wg0".into(),
+                    addrs: vec!["10.8.0.2".into()]
+                },
+            ]
+        );
+        let s = SystemStats {
+            ifaces: got,
+            ..Default::default()
+        };
+        assert_eq!(
+            s.addrs().collect::<Vec<_>>(),
+            ["192.168.1.5", "10.8.0.2", "2001:db8::5"]
+        );
+        // Older helpers send no interfaces; none are sent when there are none.
+        let old: SystemStats =
+            serde_json::from_str(r#"{"cpu":1,"cores":2,"mem_total":3,"mem_used":1,"disks":[]}"#)
+                .unwrap();
+        assert!(old.ifaces.is_empty());
+        assert!(!serde_json::to_string(&old).unwrap().contains("ifaces"));
+        // This computer: at least the call works and never lists loopback.
+        assert!(
+            group_ifaces(interface_addrs())
+                .iter()
+                .all(|i| i.name != "lo")
+        );
     }
 
     #[test]
