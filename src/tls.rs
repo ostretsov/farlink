@@ -88,7 +88,8 @@ pub fn config_from_files(cert: &Path, key: &Path) -> Result<Arc<RustlsConfig>> {
     if certs.is_empty() {
         bail!("no certificate found in {}", cert.display());
     }
-    let key = PrivateKeyDer::from_pem_file(key).with_context(|| format!("reading private key {}", key.display()))?;
+    let key = PrivateKeyDer::from_pem_file(key)
+        .with_context(|| format!("reading private key {}", key.display()))?;
     let cfg = RustlsConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()?
         .with_no_client_auth()
@@ -111,7 +112,11 @@ pub fn listen(listener: TcpListener, tls: &Tls, data_dir: &Path) -> Result<TlsLi
                 async move { Ok(Some(Box::new(acceptor.accept(tcp).await?) as Box<dyn Io>)) }
             });
         }
-        Tls::Auto { domain, email, staging } => {
+        Tls::Auto {
+            domain,
+            email,
+            staging,
+        } => {
             let mut acme = rustls_acme::AcmeConfig::new([domain.as_str()])
                 .cache(rustls_acme::caches::DirCache::new(data_dir.join("acme")))
                 .directory_lets_encrypt(!*staging);
@@ -142,13 +147,19 @@ pub fn listen(listener: TcpListener, tls: &Tls, data_dir: &Path) -> Result<TlsLi
                 let config = config.clone();
                 let challenge = challenge.clone();
                 async move {
-                    let start = tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), tcp).await?;
+                    let start = tokio_rustls::LazyConfigAcceptor::new(
+                        rustls::server::Acceptor::default(),
+                        tcp,
+                    )
+                    .await?;
                     if rustls_acme::is_tls_alpn_challenge(&start.client_hello()) {
                         // Let's Encrypt checking that we own the domain: answer and close.
                         let _ = start.into_stream(challenge).await?;
                         return Ok(None);
                     }
-                    Ok(Some(Box::new(start.into_stream(config).await?) as Box<dyn Io>))
+                    Ok(Some(
+                        Box::new(start.into_stream(config).await?) as Box<dyn Io>
+                    ))
                 }
             });
         }
@@ -156,8 +167,11 @@ pub fn listen(listener: TcpListener, tls: &Tls, data_dir: &Path) -> Result<TlsLi
     Ok(TlsListener { rx, local })
 }
 
-fn accept_loop<F, Fut>(listener: TcpListener, tx: mpsc::Sender<(Box<dyn Io>, SocketAddr)>, handshake: F)
-where
+fn accept_loop<F, Fut>(
+    listener: TcpListener,
+    tx: mpsc::Sender<(Box<dyn Io>, SocketAddr)>,
+    handshake: F,
+) where
     F: Fn(TcpStream) -> Fut + Send + 'static,
     Fut: Future<Output = std::io::Result<Option<Box<dyn Io>>>> + Send + 'static,
 {
@@ -197,7 +211,9 @@ pub async fn run(relay: crate::server::Shared, cfg: ServerConfig) -> Result<()> 
             crate::install::TCP_WARM_FIX
         );
     }
-    let listener = TcpListener::bind(&cfg.bind).await.with_context(|| format!("listening on {}", cfg.bind))?;
+    let listener = TcpListener::bind(&cfg.bind)
+        .await
+        .with_context(|| format!("listening on {}", cfg.bind))?;
     if matches!(cfg.tls, Tls::Auto { .. }) && listener.local_addr()?.port() != 443 {
         log::warn!(
             "automatic certificates need Let's Encrypt to reach this server on port 443, but it listens on {}; \

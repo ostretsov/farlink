@@ -22,7 +22,8 @@ pub struct UpdateInfo {
 /// Ask the server what is published for `app` on this platform.
 /// Returns `Some` only if it is newer than the running version.
 pub fn check(server: &str, app: &str, target: &str, installed: &str) -> Result<Option<UpdateInfo>> {
-    Ok(published(server, app, target)?.filter(|info| crate::version::is_newer(&info.version, installed)))
+    Ok(published(server, app, target)?
+        .filter(|info| crate::version::is_newer(&info.version, installed)))
 }
 
 /// What the server publishes for `app` on `target` (`None`: nothing for this platform).
@@ -57,7 +58,11 @@ pub fn download(server: &str, info: &UpdateInfo) -> Result<Vec<u8>> {
 /// Make sure downloaded bytes are exactly what the server published.
 pub fn verify(bytes: &[u8], info: &UpdateInfo) -> Result<()> {
     if bytes.len() as u64 != info.size {
-        bail!("update has wrong size ({} instead of {})", bytes.len(), info.size);
+        bail!(
+            "update has wrong size ({} instead of {})",
+            bytes.len(),
+            info.size
+        );
     }
     let got = sha256_hex(bytes);
     if !got.eq_ignore_ascii_case(&info.sha256) {
@@ -146,7 +151,9 @@ pub fn installed_from_deb(exe: &Path) -> bool {
 /// installs it, so nobody else may be able to swap the file).
 pub fn download_deb(server: &str, info: &UpdateInfo) -> Result<PathBuf> {
     let bytes = download(server, info)?; // checks size and SHA-256
-    let dir = dirs::cache_dir().context("no cache folder")?.join("farlink");
+    let dir = dirs::cache_dir()
+        .context("no cache folder")?
+        .join("farlink");
     std::fs::create_dir_all(&dir)?;
     // Older downloads are no use any more.
     if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -169,11 +176,19 @@ pub fn install_deb(path: &Path) -> Result<()> {
         .args(["install", "-y", "--no-install-recommends"])
         .arg(path)
         .status()
-        .with_context(|| format!("could not start pkexec; install it with: sudo apt install {}", path.display()))?;
+        .with_context(|| {
+            format!(
+                "could not start pkexec; install it with: sudo apt install {}",
+                path.display()
+            )
+        })?;
     match status.code() {
         Some(0) => Ok(()),
         Some(126) => bail!("cancelled"),
-        Some(127) => bail!("not allowed (no password dialog?); install it with: sudo apt install {}", path.display()),
+        Some(127) => bail!(
+            "not allowed (no password dialog?); install it with: sudo apt install {}",
+            path.display()
+        ),
         _ => bail!("apt-get failed ({status})"),
     }
 }
@@ -183,12 +198,20 @@ mod tests {
     use super::*;
 
     fn info_for(bytes: &[u8]) -> UpdateInfo {
-        UpdateInfo { version: "9.9.9".into(), sha256: sha256_hex(bytes), size: bytes.len() as u64, path: "/x".into() }
+        UpdateInfo {
+            version: "9.9.9".into(),
+            sha256: sha256_hex(bytes),
+            size: bytes.len() as u64,
+            path: "/x".into(),
+        }
     }
 
     #[test]
     fn deb_install_is_recognised_by_its_path() {
-        assert_eq!(installed_from_deb(Path::new("/usr/bin/farlink")), cfg!(target_os = "linux"));
+        assert_eq!(
+            installed_from_deb(Path::new("/usr/bin/farlink")),
+            cfg!(target_os = "linux")
+        );
         assert!(!installed_from_deb(Path::new("/home/a/.local/bin/farlink")));
         assert!(!installed_from_deb(Path::new("/usr/bin/farlink.old")));
     }
@@ -215,7 +238,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&exe).unwrap().permissions().mode() & 0o777, 0o755);
+            assert_eq!(
+                std::fs::metadata(&exe).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
         }
         let _ = std::fs::remove_dir_all(dir);
     }

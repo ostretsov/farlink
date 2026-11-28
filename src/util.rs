@@ -66,7 +66,9 @@ pub fn url_encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -79,7 +81,9 @@ const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 pub fn base64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for c in data.chunks(3) {
-        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
         for i in 0..4 {
             if i <= c.len() {
                 out.push(B64[(n >> (18 - 6 * i) & 63) as usize] as char);
@@ -118,7 +122,11 @@ pub fn human_duration(secs: u64) -> String {
     } else if secs < 86_400 {
         let h = secs / 3600;
         let m = (secs % 3600) / 60;
-        if m == 0 { format!("{h} h") } else { format!("{h} h {m} min") }
+        if m == 0 {
+            format!("{h} h")
+        } else {
+            format!("{h} h {m} min")
+        }
     } else {
         format!("{} d", secs / 86_400)
     }
@@ -144,7 +152,11 @@ pub fn current_target() -> &'static str {
 
 /// File name of a program on the current platform (adds `.exe` on Windows).
 pub fn exe_name(base: &str, target: &str) -> String {
-    if target.contains("windows") { format!("{base}.exe") } else { base.to_string() }
+    if target.contains("windows") {
+        format!("{base}.exe")
+    } else {
+        base.to_string()
+    }
 }
 
 /// The desktop app as a Debian package (Linux only): what an app installed
@@ -167,8 +179,10 @@ pub fn os_label() -> String {
         let pretty = std::fs::read_to_string("/etc/os-release")
             .ok()
             .and_then(|s| {
-                s.lines()
-                    .find_map(|l| l.strip_prefix("PRETTY_NAME=").map(|v| v.trim_matches('"').to_string()))
+                s.lines().find_map(|l| {
+                    l.strip_prefix("PRETTY_NAME=")
+                        .map(|v| v.trim_matches('"').to_string())
+                })
             });
         pretty.unwrap_or_else(|| "Linux".into())
     } else {
@@ -240,7 +254,15 @@ mod tests {
     #[test]
     fn args_parsing() {
         let a = Args::parse(
-            ["install", "--server", "https://x", "--dry-run", "--token=abc", "extra"].map(String::from),
+            [
+                "install",
+                "--server",
+                "https://x",
+                "--dry-run",
+                "--token=abc",
+                "extra",
+            ]
+            .map(String::from),
             &["server", "token"],
         );
         assert_eq!(a.command(), Some("install"));
@@ -252,15 +274,24 @@ mod tests {
 
     #[test]
     fn ws_url_maps_schemes() {
-        assert_eq!(ws_url("https://rd.example.com/", "/ws/agent"), "wss://rd.example.com/ws/agent");
+        assert_eq!(
+            ws_url("https://rd.example.com/", "/ws/agent"),
+            "wss://rd.example.com/ws/agent"
+        );
         assert_eq!(ws_url("http://10.0.0.5:8080", "/x"), "ws://10.0.0.5:8080/x");
         assert_eq!(ws_url("rd.example.com", "/x"), "wss://rd.example.com/x");
     }
 
     #[test]
     fn normalize_adds_https() {
-        assert_eq!(normalize_server_url(" rd.example.com/ "), "https://rd.example.com");
-        assert_eq!(normalize_server_url("http://1.2.3.4:8080"), "http://1.2.3.4:8080");
+        assert_eq!(
+            normalize_server_url(" rd.example.com/ "),
+            "https://rd.example.com"
+        );
+        assert_eq!(
+            normalize_server_url("http://1.2.3.4:8080"),
+            "http://1.2.3.4:8080"
+        );
         assert_eq!(normalize_server_url(""), "");
     }
 
@@ -296,11 +327,23 @@ mod tests {
 
     #[test]
     fn exe_names() {
-        assert_eq!(exe_name("farlink-host", "x86_64-pc-windows-gnu"), "farlink-host.exe");
-        assert_eq!(exe_name("farlink-host", "x86_64-unknown-linux-gnu"), "farlink-host");
-        assert_eq!(published_file(DEB_APP, "aarch64-unknown-linux-gnu").as_deref(), Some("farlink.deb"));
+        assert_eq!(
+            exe_name("farlink-host", "x86_64-pc-windows-gnu"),
+            "farlink-host.exe"
+        );
+        assert_eq!(
+            exe_name("farlink-host", "x86_64-unknown-linux-gnu"),
+            "farlink-host"
+        );
+        assert_eq!(
+            published_file(DEB_APP, "aarch64-unknown-linux-gnu").as_deref(),
+            Some("farlink.deb")
+        );
         assert_eq!(published_file(DEB_APP, "x86_64-pc-windows-gnu"), None);
-        assert_eq!(published_file("farlink", "x86_64-pc-windows-gnu").as_deref(), Some("farlink.exe"));
+        assert_eq!(
+            published_file("farlink", "x86_64-pc-windows-gnu").as_deref(),
+            Some("farlink.exe")
+        );
     }
 
     #[test]

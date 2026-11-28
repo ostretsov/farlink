@@ -62,7 +62,8 @@ impl LoginGuard {
     }
 
     fn forget_old(&mut self, now: u64) {
-        self.failures.retain(|_, q| q.back().is_some_and(|&t| t + WINDOW_SECS > now));
+        self.failures
+            .retain(|_, q| q.back().is_some_and(|&t| t + WINDOW_SECS > now));
         if self.failures.len() >= MAX_KEYS {
             self.failures.clear();
         }
@@ -106,9 +107,20 @@ mod tests {
         }
         let wait = g.blocked("1.2.3.4", "anna", 120).expect("blocked");
         assert!(wait > 0 && wait <= WINDOW_SECS);
-        assert!(g.blocked("1.2.3.4", "bob", 120).is_some(), "the address is blocked for every name");
-        assert_eq!(g.blocked("5.6.7.8", "bob", 120), None, "other addresses are not");
-        assert_eq!(g.blocked("1.2.3.4", "anna", 100 + WINDOW_SECS + 1), None, "old failures expire");
+        assert!(
+            g.blocked("1.2.3.4", "bob", 120).is_some(),
+            "the address is blocked for every name"
+        );
+        assert_eq!(
+            g.blocked("5.6.7.8", "bob", 120),
+            None,
+            "other addresses are not"
+        );
+        assert_eq!(
+            g.blocked("1.2.3.4", "anna", 100 + WINDOW_SECS + 1),
+            None,
+            "old failures expire"
+        );
     }
 
     #[test]
@@ -117,7 +129,10 @@ mod tests {
         for i in 0..PER_LOGIN {
             g.failed(&format!("10.0.0.{i}"), "", 50);
         }
-        assert!(g.blocked("10.9.9.9", "admin", 60).is_some(), "empty name = admin");
+        assert!(
+            g.blocked("10.9.9.9", "admin", 60).is_some(),
+            "empty name = admin"
+        );
         assert_eq!(g.blocked("10.9.9.9", "anna", 60), None);
     }
 

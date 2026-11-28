@@ -137,6 +137,9 @@ mod tests {
         assert_eq!(rx.try_recv(), Ok(TrayEvent::Open));
         assert_eq!(rx.try_recv(), Ok(TrayEvent::Quit));
         shared.set_status(TrayStatus::Failed);
-        assert_eq!(shared.status.load(Ordering::SeqCst), TrayStatus::Failed as u8);
+        assert_eq!(
+            shared.status.load(Ordering::SeqCst),
+            TrayStatus::Failed as u8
+        );
     }
 }

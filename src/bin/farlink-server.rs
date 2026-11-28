@@ -38,9 +38,13 @@ USAGE:
   farlink-server version";
 
 fn load_config(args: &Args) -> Result<ServerConfig> {
-    let path = args.get("config").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(SERVER_CONFIG_PATH));
+    let path = args
+        .get("config")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(SERVER_CONFIG_PATH));
     let mut cfg = if path.exists() {
-        serde_json::from_slice(&std::fs::read(&path)?).with_context(|| format!("reading {}", path.display()))?
+        serde_json::from_slice(&std::fs::read(&path)?)
+            .with_context(|| format!("reading {}", path.display()))?
     } else {
         ServerConfig::default()
     };
@@ -65,7 +69,12 @@ fn load_config(args: &Args) -> Result<ServerConfig> {
         }
     }
     match (args.get("tls-cert"), args.get("tls-key")) {
-        (Some(cert), Some(key)) => cfg.tls = Tls::Files { cert: cert.into(), key: key.into() },
+        (Some(cert), Some(key)) => {
+            cfg.tls = Tls::Files {
+                cert: cert.into(),
+                key: key.into(),
+            }
+        }
         (None, None) => {}
         _ => bail!("--tls-cert and --tls-key go together"),
     }
@@ -73,7 +82,10 @@ fn load_config(args: &Args) -> Result<ServerConfig> {
         cfg.tls = Tls::Off;
     }
     if cfg.tls != Tls::Off && !cfg.public_url.starts_with("https://") {
-        log::warn!("HTTPS is on but the public address {} is not https://", cfg.public_url);
+        log::warn!(
+            "HTTPS is on but the public address {} is not https://",
+            cfg.public_url
+        );
     }
     Ok(cfg)
 }
@@ -95,7 +107,15 @@ fn publish(cfg: &ServerConfig, version: &str, from: &Path) -> Result<()> {
             let f = f?;
             let name = f.file_name();
             let name_s = name.to_string_lossy();
-            if ["farlink", "farlink.exe", "farlink-host", "farlink-host.exe", "farlink.deb"].contains(&name_s.as_ref()) {
+            if [
+                "farlink",
+                "farlink.exe",
+                "farlink-host",
+                "farlink-host.exe",
+                "farlink.deb",
+            ]
+            .contains(&name_s.as_ref())
+            {
                 // Copy then rename so a half-copied file is never served.
                 let tmp = dest.join(format!("{name_s}.part"));
                 std::fs::copy(f.path(), &tmp)?;
@@ -106,7 +126,10 @@ fn publish(cfg: &ServerConfig, version: &str, from: &Path) -> Result<()> {
         }
     }
     if copied == 0 {
-        bail!("no programs found in {} (expected <target>/farlink-host etc.)", from.display());
+        bail!(
+            "no programs found in {} (expected <target>/farlink-host etc.)",
+            from.display()
+        );
     }
     std::fs::write(cfg.releases_dir.join("version.txt"), format!("{version}\n"))?;
     println!("Published {version}. Connected computers update within a minute.");
@@ -115,7 +138,23 @@ fn publish(cfg: &ServerConfig, version: &str, from: &Path) -> Result<()> {
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let args = Args::parse(std::env::args().skip(1), &["config", "bind", "url", "data", "domain", "releases", "tls-domain", "tls-email", "tls-cert", "tls-key", "port", "github"]);
+    let args = Args::parse(
+        std::env::args().skip(1),
+        &[
+            "config",
+            "bind",
+            "url",
+            "data",
+            "domain",
+            "releases",
+            "tls-domain",
+            "tls-email",
+            "tls-cert",
+            "tls-key",
+            "port",
+            "github",
+        ],
+    );
     match args.command().unwrap_or("serve") {
         "serve" => {
             let cfg = load_config(&args)?;
@@ -123,28 +162,47 @@ fn main() -> Result<()> {
             if let Some(pw) = first_password {
                 let note = cfg.data_dir.join("initial-admin-password.txt");
                 let _ = std::fs::write(&note, format!("{pw}\n"));
-                println!("\n  First start. Administrator password: {pw}\n  (also saved in {})\n", note.display());
+                println!(
+                    "\n  First start. Administrator password: {pw}\n  (also saved in {})\n",
+                    note.display()
+                );
             }
             let https = match &cfg.tls {
                 Tls::Off => "plain HTTP".to_string(),
-                Tls::Auto { domain, staging, .. } => {
-                    format!("HTTPS, Let's Encrypt{} certificate for {domain}", if *staging { " (staging)" } else { "" })
+                Tls::Auto {
+                    domain, staging, ..
+                } => {
+                    format!(
+                        "HTTPS, Let's Encrypt{} certificate for {domain}",
+                        if *staging { " (staging)" } else { "" }
+                    )
                 }
                 Tls::Files { cert, .. } => format!("HTTPS, certificate {}", cert.display()),
             };
-            println!("Farlink server {} on {} ({https}) — public address {}", farlink::VERSION, cfg.bind, cfg.public_url);
+            println!(
+                "Farlink server {} on {} ({https}) — public address {}",
+                farlink::VERSION,
+                cfg.bind,
+                cfg.public_url
+            );
             println!("Install link: {}", relay.install_url());
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(farlink::tls::run(relay, cfg))
         }
         "install" => {
-            let domain = args.get("domain").context("--domain is required, e.g. --domain remote.example.com")?;
+            let domain = args
+                .get("domain")
+                .context("--domain is required, e.g. --domain remote.example.com")?;
             let releases = args.get("releases").map(PathBuf::from).or_else(|| {
                 let p = std::env::current_exe().ok()?.parent()?.join("releases");
                 p.is_dir().then_some(p)
             });
             let port: u16 = match args.get("port") {
-                Some(p) => p.parse().ok().filter(|p| *p > 0).with_context(|| format!("--port {p} is not a port number"))?,
+                Some(p) => p
+                    .parse()
+                    .ok()
+                    .filter(|p| *p > 0)
+                    .with_context(|| format!("--port {p} is not a port number"))?,
                 None => 443,
             };
             let cert = match (args.get("tls-cert"), args.get("tls-key")) {
@@ -152,24 +210,38 @@ fn main() -> Result<()> {
                 (None, None) => None,
                 _ => bail!("--tls-cert and --tls-key go together"),
             };
-            let steps = farlink::install::server_linux_plan(domain, port, cert, args.get("github"), releases.as_deref())?;
+            let steps = farlink::install::server_linux_plan(
+                domain,
+                port,
+                cert,
+                args.get("github"),
+                releases.as_deref(),
+            )?;
             farlink::install::execute(&steps, args.has("dry-run"))?;
             if !args.has("dry-run") {
-                println!("\nThe administrator password is in /var/lib/farlink-server/initial-admin-password.txt");
-                println!("(change it with: farlink-server set-password NEW --config {SERVER_CONFIG_PATH})");
+                println!(
+                    "\nThe administrator password is in /var/lib/farlink-server/initial-admin-password.txt"
+                );
+                println!(
+                    "(change it with: farlink-server set-password NEW --config {SERVER_CONFIG_PATH})"
+                );
             }
             Ok(())
         }
         "publish" => {
             let cfg = load_config(&args)?;
-            let (Some(version), Some(dir)) = (args.positional.get(1), args.positional.get(2)) else {
+            let (Some(version), Some(dir)) = (args.positional.get(1), args.positional.get(2))
+            else {
                 bail!("usage: farlink-server publish VERSION DIR");
             };
             publish(&cfg, version, Path::new(dir))
         }
         "set-password" => {
             let cfg = load_config(&args)?;
-            let pw = args.positional.get(1).context("usage: farlink-server set-password NEW_PASSWORD")?;
+            let pw = args
+                .positional
+                .get(1)
+                .context("usage: farlink-server set-password NEW_PASSWORD")?;
             if pw.len() < 8 {
                 bail!("use at least 8 characters");
             }
@@ -184,7 +256,9 @@ fn main() -> Result<()> {
             if restarted {
                 println!("Password changed and the server restarted. Everyone was signed out.");
             } else {
-                println!("Password changed. Restart the running server now so it takes effect (systemctl restart farlink-server).");
+                println!(
+                    "Password changed. Restart the running server now so it takes effect (systemctl restart farlink-server)."
+                );
             }
             Ok(())
         }

@@ -22,8 +22,13 @@ pub enum ColorDepth {
 }
 
 impl ColorDepth {
-    pub const ALL: [ColorDepth; 5] =
-        [ColorDepth::Optimized, ColorDepth::Full, ColorDepth::High, ColorDepth::Low, ColorDepth::Gray];
+    pub const ALL: [ColorDepth; 5] = [
+        ColorDepth::Optimized,
+        ColorDepth::Full,
+        ColorDepth::High,
+        ColorDepth::Low,
+        ColorDepth::Gray,
+    ];
     pub fn label(self) -> &'static str {
         match self {
             ColorDepth::Optimized => "Colour optimised (the screen's own 256)",
@@ -132,11 +137,30 @@ impl Default for Quality {
 impl Quality {
     pub fn preset(p: Preset) -> Quality {
         match p {
-            Preset::Fast => Quality { scale_pct: 75, max_fps: 20, auto_fps: true, codec: Codec::Jpeg, jpeg_quality: 50, color: ColorDepth::Full },
-            Preset::Balanced | Preset::Custom => {
-                Quality { scale_pct: 100, max_fps: 30, auto_fps: true, codec: Codec::Auto, jpeg_quality: 75, color: ColorDepth::Optimized }
-            }
-            Preset::Sharp => Quality { scale_pct: 100, max_fps: 30, auto_fps: true, codec: Codec::Png, jpeg_quality: 90, color: ColorDepth::Full },
+            Preset::Fast => Quality {
+                scale_pct: 75,
+                max_fps: 20,
+                auto_fps: true,
+                codec: Codec::Jpeg,
+                jpeg_quality: 50,
+                color: ColorDepth::Full,
+            },
+            Preset::Balanced | Preset::Custom => Quality {
+                scale_pct: 100,
+                max_fps: 30,
+                auto_fps: true,
+                codec: Codec::Auto,
+                jpeg_quality: 75,
+                color: ColorDepth::Optimized,
+            },
+            Preset::Sharp => Quality {
+                scale_pct: 100,
+                max_fps: 30,
+                auto_fps: true,
+                codec: Codec::Png,
+                jpeg_quality: 90,
+                color: ColorDepth::Full,
+            },
         }
     }
 
@@ -144,23 +168,62 @@ impl Quality {
     /// settings equal to one of them are moved to the new preset of that name.
     pub fn upgraded(self) -> Quality {
         let old = [
-            (Quality { scale_pct: 60, max_fps: 12, auto_fps: true, codec: Codec::Jpeg, jpeg_quality: 35, color: ColorDepth::Low }, Preset::Fast),
-            (Quality { scale_pct: 85, max_fps: 20, auto_fps: true, codec: Codec::Jpeg, jpeg_quality: 65, color: ColorDepth::High }, Preset::Balanced),
-            (Quality { scale_pct: 100, max_fps: 25, auto_fps: true, codec: Codec::Png, jpeg_quality: 85, color: ColorDepth::High }, Preset::Sharp),
+            (
+                Quality {
+                    scale_pct: 60,
+                    max_fps: 12,
+                    auto_fps: true,
+                    codec: Codec::Jpeg,
+                    jpeg_quality: 35,
+                    color: ColorDepth::Low,
+                },
+                Preset::Fast,
+            ),
+            (
+                Quality {
+                    scale_pct: 85,
+                    max_fps: 20,
+                    auto_fps: true,
+                    codec: Codec::Jpeg,
+                    jpeg_quality: 65,
+                    color: ColorDepth::High,
+                },
+                Preset::Balanced,
+            ),
+            (
+                Quality {
+                    scale_pct: 100,
+                    max_fps: 25,
+                    auto_fps: true,
+                    codec: Codec::Png,
+                    jpeg_quality: 85,
+                    color: ColorDepth::High,
+                },
+                Preset::Sharp,
+            ),
         ];
-        old.into_iter().find(|(q, _)| *q == self).map(|(_, p)| Quality::preset(p)).unwrap_or(self)
+        old.into_iter()
+            .find(|(q, _)| *q == self)
+            .map(|(_, p)| Quality::preset(p))
+            .unwrap_or(self)
     }
 
     /// Which preset these settings match (colours aside: they are chosen
     /// separately), or `Custom`.
     pub fn matching_preset(&self) -> Preset {
         let me = self.clamped();
-        Preset::BUTTONS.into_iter().find(|p| self.with_preset(*p) == me).unwrap_or(Preset::Custom)
+        Preset::BUTTONS
+            .into_iter()
+            .find(|p| self.with_preset(*p) == me)
+            .unwrap_or(Preset::Custom)
     }
 
     /// Preset `p`, keeping the colours chosen here.
     pub fn with_preset(&self, p: Preset) -> Quality {
-        Quality { color: self.color, ..Quality::preset(p) }
+        Quality {
+            color: self.color,
+            ..Quality::preset(p)
+        }
     }
 
     /// Keep every value in its allowed range (values come from the network).
@@ -198,7 +261,11 @@ impl Quality {
             ColorDepth::Low => "8-bit",
             ColorDepth::Gray => "grey",
         };
-        let fps = if q.auto_fps { format!("auto ≤{} fps", q.max_fps) } else { format!("{} fps", q.max_fps) };
+        let fps = if q.auto_fps {
+            format!("auto ≤{} fps", q.max_fps)
+        } else {
+            format!("{} fps", q.max_fps)
+        };
         format!("{}% · {} · {} · {}", q.scale_pct, fps, codec, color)
     }
 }
@@ -215,14 +282,29 @@ mod tests {
         let mut q = Quality::preset(Preset::Fast);
         q.max_fps = 7;
         assert_eq!(q.matching_preset(), Preset::Custom);
-        let grey = Quality { color: ColorDepth::Gray, ..Quality::preset(Preset::Sharp) };
-        assert_eq!(grey.matching_preset(), Preset::Sharp, "colours are chosen apart from presets");
+        let grey = Quality {
+            color: ColorDepth::Gray,
+            ..Quality::preset(Preset::Sharp)
+        };
+        assert_eq!(
+            grey.matching_preset(),
+            Preset::Sharp,
+            "colours are chosen apart from presets"
+        );
         assert_eq!(grey.with_preset(Preset::Fast).color, ColorDepth::Gray);
     }
 
     #[test]
     fn clamps_hostile_values() {
-        let q = Quality { scale_pct: 0, max_fps: 200, auto_fps: false, codec: Codec::Png, jpeg_quality: 1, color: ColorDepth::Gray }.clamped();
+        let q = Quality {
+            scale_pct: 0,
+            max_fps: 200,
+            auto_fps: false,
+            codec: Codec::Png,
+            jpeg_quality: 1,
+            color: ColorDepth::Gray,
+        }
+        .clamped();
         assert_eq!(q.scale_pct, 25);
         assert_eq!(q.max_fps, 30);
         assert_eq!(q.jpeg_quality, 10);
@@ -230,7 +312,11 @@ mod tests {
 
     #[test]
     fn scaled_size_and_interval() {
-        let q = Quality { scale_pct: 50, max_fps: 20, ..Quality::default() };
+        let q = Quality {
+            scale_pct: 50,
+            max_fps: 20,
+            ..Quality::default()
+        };
         assert_eq!(q.scaled_size(1920, 1080), (960, 540));
         assert_eq!(q.frame_interval_ms(), 50);
     }
@@ -250,17 +336,36 @@ mod tests {
 
     #[test]
     fn summary_text() {
-        assert_eq!(Quality::preset(Preset::Fast).summary(), "75% · auto ≤20 fps · JPEG 50 · 24-bit");
-        assert_eq!(Quality::preset(Preset::Balanced).summary(), "100% · auto ≤30 fps · Auto · optimised");
-        let fixed = Quality { auto_fps: false, ..Quality::preset(Preset::Balanced) };
+        assert_eq!(
+            Quality::preset(Preset::Fast).summary(),
+            "75% · auto ≤20 fps · JPEG 50 · 24-bit"
+        );
+        assert_eq!(
+            Quality::preset(Preset::Balanced).summary(),
+            "100% · auto ≤30 fps · Auto · optimised"
+        );
+        let fixed = Quality {
+            auto_fps: false,
+            ..Quality::preset(Preset::Balanced)
+        };
         assert_eq!(fixed.summary(), "100% · 30 fps · Auto · optimised");
     }
 
     #[test]
     fn old_presets_are_upgraded() {
-        let old_balanced = Quality { scale_pct: 85, max_fps: 20, auto_fps: true, codec: Codec::Jpeg, jpeg_quality: 65, color: ColorDepth::High };
+        let old_balanced = Quality {
+            scale_pct: 85,
+            max_fps: 20,
+            auto_fps: true,
+            codec: Codec::Jpeg,
+            jpeg_quality: 65,
+            color: ColorDepth::High,
+        };
         assert_eq!(old_balanced.upgraded(), Quality::preset(Preset::Balanced));
-        let mine = Quality { scale_pct: 50, ..Quality::default() };
+        let mine = Quality {
+            scale_pct: 50,
+            ..Quality::default()
+        };
         assert_eq!(mine.upgraded(), mine, "own settings are kept");
     }
 }

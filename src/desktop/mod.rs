@@ -4,12 +4,12 @@ use crate::codec::{Frame, Rect};
 use crate::proto::{InputEvent, MonitorInfo};
 use anyhow::Result;
 
-#[cfg(target_os = "linux")]
-pub mod x11;
 #[cfg(windows)]
 pub mod dxgi;
 #[cfg(windows)]
 pub mod windows;
+#[cfg(target_os = "linux")]
+pub mod x11;
 
 /// One machine's screens, mouse and keyboard.
 pub trait Desktop {
@@ -60,15 +60,32 @@ pub struct PointerImage {
 
 impl PointerImage {
     /// From premultiplied ARGB words (as X11 gives them).
-    pub fn from_premultiplied_argb(width: u32, height: u32, hot_x: u32, hot_y: u32, argb: &[u32]) -> PointerImage {
+    pub fn from_premultiplied_argb(
+        width: u32,
+        height: u32,
+        hot_x: u32,
+        hot_y: u32,
+        argb: &[u32],
+    ) -> PointerImage {
         let mut rgba = Vec::with_capacity((width * height * 4) as usize);
         for i in 0..(width * height) as usize {
             let p = argb.get(i).copied().unwrap_or(0);
             let a = (p >> 24) & 0xff;
             let un = |c: u32| (c * 255).checked_div(a).map_or(0, |v| v.min(255) as u8);
-            rgba.extend_from_slice(&[un((p >> 16) & 0xff), un((p >> 8) & 0xff), un(p & 0xff), a as u8]);
+            rgba.extend_from_slice(&[
+                un((p >> 16) & 0xff),
+                un((p >> 8) & 0xff),
+                un(p & 0xff),
+                a as u8,
+            ]);
         }
-        PointerImage { width, height, hot_x: hot_x.min(width.saturating_sub(1)), hot_y: hot_y.min(height.saturating_sub(1)), rgba }
+        PointerImage {
+            width,
+            height,
+            hot_x: hot_x.min(width.saturating_sub(1)),
+            hot_y: hot_y.min(height.saturating_sub(1)),
+            rgba,
+        }
     }
 
     /// The demo pointer: a white arrow with a dark edge.
@@ -80,11 +97,21 @@ impl PointerImage {
             let width = (y + 1).min(w);
             for x in 0..width {
                 let edge = x == 0 || x + 1 == width || y + 1 == h;
-                let c = if edge { [20, 20, 20, 255] } else { [255, 255, 255, 255] };
+                let c = if edge {
+                    [20, 20, 20, 255]
+                } else {
+                    [255, 255, 255, 255]
+                };
                 rgba[((y * w + x) * 4) as usize..][..4].copy_from_slice(&c);
             }
         }
-        PointerImage { width: w, height: h, hot_x: 0, hot_y: 0, rgba }
+        PointerImage {
+            width: w,
+            height: h,
+            hot_x: 0,
+            hot_y: 0,
+            rgba,
+        }
     }
 
     /// A small number that is the same for the same picture.
@@ -127,8 +154,16 @@ pub fn to_absolute(monitors: &[MonitorInfo], mon: u8, x: f32, y: f32) -> Option<
 pub fn virtual_bounds(monitors: &[MonitorInfo]) -> (i32, i32, i32, i32) {
     let x0 = monitors.iter().map(|m| m.x).min().unwrap_or(0);
     let y0 = monitors.iter().map(|m| m.y).min().unwrap_or(0);
-    let x1 = monitors.iter().map(|m| m.x + m.width as i32).max().unwrap_or(1);
-    let y1 = monitors.iter().map(|m| m.y + m.height as i32).max().unwrap_or(1);
+    let x1 = monitors
+        .iter()
+        .map(|m| m.x + m.width as i32)
+        .max()
+        .unwrap_or(1);
+    let y1 = monitors
+        .iter()
+        .map(|m| m.y + m.height as i32)
+        .max()
+        .unwrap_or(1);
     (x0, y0, x1 - x0, y1 - y0)
 }
 
@@ -145,7 +180,9 @@ pub fn draw_cursor(frame: &mut Frame, left: i32, top: i32, w: u32, h: u32, argb:
             if x < 0 || x >= frame.width as i32 {
                 continue;
             }
-            let Some(&p) = argb.get((cy as u32 * w + cx as u32) as usize) else { return };
+            let Some(&p) = argb.get((cy as u32 * w + cx as u32) as usize) else {
+                return;
+            };
             let a = (p >> 24) & 0xff;
             if a == 0 {
                 continue;
@@ -153,7 +190,16 @@ pub fn draw_cursor(frame: &mut Frame, left: i32, top: i32, w: u32, h: u32, argb:
             let src = [(p >> 16) & 0xff, (p >> 8) & 0xff, p & 0xff];
             let d = frame.pixel(x as u32, y as u32);
             let blend = |s: u32, d: u8| (s + d as u32 * (255 - a) / 255).min(255) as u8;
-            frame.set_pixel(x as u32, y as u32, [blend(src[0], d[0]), blend(src[1], d[1]), blend(src[2], d[2]), 255]);
+            frame.set_pixel(
+                x as u32,
+                y as u32,
+                [
+                    blend(src[0], d[0]),
+                    blend(src[1], d[1]),
+                    blend(src[2], d[2]),
+                    255,
+                ],
+            );
         }
     }
 }
@@ -179,12 +225,27 @@ impl TestPattern {
             .iter()
             .enumerate()
             .map(|(i, &(w, h))| {
-                let m = MonitorInfo { index: i as u8, name: format!("DEMO-{}", i + 1), x, y: 0, width: w, height: h, primary: i == 0 };
+                let m = MonitorInfo {
+                    index: i as u8,
+                    name: format!("DEMO-{}", i + 1),
+                    x,
+                    y: 0,
+                    width: w,
+                    height: h,
+                    primary: i == 0,
+                };
                 x += w as i32;
                 m
             })
             .collect();
-        TestPattern { monitors, tick: 0, pointer: (100, 100), received: Vec::new(), pointer_in_picture: true, pings: Vec::new() }
+        TestPattern {
+            monitors,
+            tick: 0,
+            pointer: (100, 100),
+            received: Vec::new(),
+            pointer_in_picture: true,
+            pings: Vec::new(),
+        }
     }
 
     pub fn dual() -> TestPattern {
@@ -200,23 +261,57 @@ impl TestPattern {
             for x in 0..w {
                 let t = (x + y) as f32 / (w + h) as f32;
                 let c = if m.index == 0 {
-                    [(22.0 + 30.0 * t) as u8, (60.0 + 70.0 * t) as u8, (110.0 + 60.0 * t) as u8, 255]
+                    [
+                        (22.0 + 30.0 * t) as u8,
+                        (60.0 + 70.0 * t) as u8,
+                        (110.0 + 60.0 * t) as u8,
+                        255,
+                    ]
                 } else {
-                    [(70.0 + 50.0 * t) as u8, (40.0 + 30.0 * t) as u8, (90.0 + 50.0 * t) as u8, 255]
+                    [
+                        (70.0 + 50.0 * t) as u8,
+                        (40.0 + 30.0 * t) as u8,
+                        (90.0 + 50.0 * t) as u8,
+                        255,
+                    ]
                 };
                 f.set_pixel(x, y, c);
             }
         }
         // Task bar.
-        f.fill_rect(Rect { x: 0, y: h - h / 22, w, h: h / 22 }, [24, 26, 32, 255]);
-        f.fill_rect(Rect { x: 12, y: h - h / 22 + 6, w: h / 22 - 12, h: h / 22 - 12 }, [80, 160, 240, 255]);
+        f.fill_rect(
+            Rect {
+                x: 0,
+                y: h - h / 22,
+                w,
+                h: h / 22,
+            },
+            [24, 26, 32, 255],
+        );
+        f.fill_rect(
+            Rect {
+                x: 12,
+                y: h - h / 22 + 6,
+                w: h / 22 - 12,
+                h: h / 22 - 12,
+            },
+            [80, 160, 240, 255],
+        );
         // Two "application windows".
         let win = |f: &mut Frame, x: u32, y: u32, ww: u32, hh: u32, accent: [u8; 4]| {
             f.fill_rect(Rect { x, y, w: ww, h: hh }, [245, 246, 248, 255]);
             f.fill_rect(Rect { x, y, w: ww, h: 28 }, accent);
             for line in 0..((hh - 50) / 22) {
                 let lw = ww - 40 - (line * 37 % (ww / 3));
-                f.fill_rect(Rect { x: x + 20, y: y + 44 + line * 22, w: lw, h: 9 }, [190, 195, 205, 255]);
+                f.fill_rect(
+                    Rect {
+                        x: x + 20,
+                        y: y + 44 + line * 22,
+                        w: lw,
+                        h: 9,
+                    },
+                    [190, 195, 205, 255],
+                );
             }
         };
         win(&mut f, w / 12, h / 10, w / 2, h / 2, [52, 120, 220, 255]);
@@ -225,13 +320,37 @@ impl TestPattern {
         let bar_w = w / 3;
         let bx = w / 2 + 20;
         let by = h / 3 + h / 2 - 40;
-        f.fill_rect(Rect { x: bx, y: by, w: bar_w, h: 12 }, [220, 222, 228, 255]);
-        f.fill_rect(Rect { x: bx, y: by, w: (tick * 7) % bar_w + 1, h: 12 }, [40, 160, 110, 255]);
+        f.fill_rect(
+            Rect {
+                x: bx,
+                y: by,
+                w: bar_w,
+                h: 12,
+            },
+            [220, 222, 228, 255],
+        );
+        f.fill_rect(
+            Rect {
+                x: bx,
+                y: by,
+                w: (tick * 7) % bar_w + 1,
+                h: 12,
+            },
+            [40, 160, 110, 255],
+        );
         if let Some((px, py)) = pointer {
             let (lx, ly) = (px - m.x, py - m.y);
             if lx >= 0 && ly >= 0 && (lx as u32) < w && (ly as u32) < h {
                 for i in 0..16u32 {
-                    f.fill_rect(Rect { x: lx as u32, y: ly as u32 + i, w: (i / 2 + 1).min(w - lx as u32), h: 1 }, [255, 255, 255, 255]);
+                    f.fill_rect(
+                        Rect {
+                            x: lx as u32,
+                            y: ly as u32 + i,
+                            w: (i / 2 + 1).min(w - lx as u32),
+                            h: 1,
+                        },
+                        [255, 255, 255, 255],
+                    );
                 }
             }
         }
@@ -246,10 +365,20 @@ impl Desktop for TestPattern {
 
     fn capture(&mut self, mon: &MonitorInfo) -> Result<Frame> {
         self.tick = self.tick.wrapping_add(1);
-        let mut f = TestPattern::render(mon, self.tick, self.pointer_in_picture.then_some(self.pointer));
+        let mut f = TestPattern::render(
+            mon,
+            self.tick,
+            self.pointer_in_picture.then_some(self.pointer),
+        );
         self.pings.retain(|p| p.3.elapsed() < crate::ping::DURATION);
         for &(x, y, r, start) in &self.pings {
-            crate::ping::draw_into(&mut f, x - mon.x, y - mon.y, r, crate::ping::progress(start.elapsed()));
+            crate::ping::draw_into(
+                &mut f,
+                x - mon.x,
+                y - mon.y,
+                r,
+                crate::ping::progress(start.elapsed()),
+            );
         }
         Ok(f)
     }
@@ -259,7 +388,11 @@ impl Desktop for TestPattern {
     }
 
     fn pointer(&mut self) -> Option<PointerPos> {
-        Some(PointerPos { x: self.pointer.0, y: self.pointer.1, shape: 1 })
+        Some(PointerPos {
+            x: self.pointer.0,
+            y: self.pointer.1,
+            shape: 1,
+        })
     }
 
     fn pointer_image(&mut self) -> Option<PointerImage> {
@@ -294,15 +427,30 @@ mod tests {
         let mut t = TestPattern::dual();
         let mons = t.monitors().unwrap();
         let plain = t.capture(&mons[1]).unwrap();
-        t.input(&mons, &InputEvent::Ping { mon: 1, x: 0.25, y: 0.5 }).unwrap();
+        t.input(
+            &mons,
+            &InputEvent::Ping {
+                mon: 1,
+                x: 0.25,
+                y: 0.5,
+            },
+        )
+        .unwrap();
         assert_eq!(t.pings.len(), 1);
         let (cx, cy) = (320, 512);
         let with = t.capture(&mons[1]).unwrap();
         let c = with.pixel(cx, cy);
-        assert!(c[0] > 200 && c[1] < 120 && c[2] < 120, "red dot at the spot, got {c:?}");
+        assert!(
+            c[0] > 200 && c[1] < 120 && c[2] < 120,
+            "red dot at the spot, got {c:?}"
+        );
         assert_ne!(c, plain.pixel(cx, cy));
         let other = t.capture(&mons[0]).unwrap();
-        assert_eq!(other.rgba, TestPattern::render(&mons[0], t.tick, Some(t.pointer)).rgba, "other screen untouched");
+        assert_eq!(
+            other.rgba,
+            TestPattern::render(&mons[0], t.tick, Some(t.pointer)).rgba,
+            "other screen untouched"
+        );
         // Over: removed, picture back to normal.
         t.pings[0].3 = std::time::Instant::now() - crate::ping::DURATION;
         let after = t.capture(&mons[1]).unwrap();
@@ -314,7 +462,15 @@ mod tests {
     fn pings_off_every_screen_are_ignored() {
         let mut t = TestPattern::dual();
         let mons = t.monitors().unwrap();
-        t.input(&mons, &InputEvent::Ping { mon: 9, x: 0.5, y: 0.5 }).unwrap();
+        t.input(
+            &mons,
+            &InputEvent::Ping {
+                mon: 9,
+                x: 0.5,
+                y: 0.5,
+            },
+        )
+        .unwrap();
         assert!(t.pings.is_empty());
         assert_eq!(t.received.len(), 1, "still recorded as received");
     }
@@ -324,16 +480,39 @@ mod tests {
         let t = TestPattern::dual();
         assert_eq!(to_absolute(&t.monitors, 0, 0.0, 0.0), Some((0, 0)));
         assert_eq!(to_absolute(&t.monitors, 0, 1.0, 1.0), Some((1599, 899)));
-        assert_eq!(to_absolute(&t.monitors, 1, 0.5, 0.5), Some((1600 + 640, 512)));
-        assert_eq!(to_absolute(&t.monitors, 1, 7.0, -3.0), Some((1600 + 1279, 0)), "clamped");
+        assert_eq!(
+            to_absolute(&t.monitors, 1, 0.5, 0.5),
+            Some((1600 + 640, 512))
+        );
+        assert_eq!(
+            to_absolute(&t.monitors, 1, 7.0, -3.0),
+            Some((1600 + 1279, 0)),
+            "clamped"
+        );
         assert_eq!(to_absolute(&t.monitors, 5, 0.5, 0.5), None);
     }
 
     #[test]
     fn virtual_bounds_with_negative_left_monitor() {
         let mons = vec![
-            MonitorInfo { index: 0, name: "a".into(), x: 0, y: 0, width: 1920, height: 1080, primary: true },
-            MonitorInfo { index: 1, name: "b".into(), x: -1280, y: -200, width: 1280, height: 1024, primary: false },
+            MonitorInfo {
+                index: 0,
+                name: "a".into(),
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                primary: true,
+            },
+            MonitorInfo {
+                index: 1,
+                name: "b".into(),
+                x: -1280,
+                y: -200,
+                width: 1280,
+                height: 1024,
+                primary: false,
+            },
         ];
         assert_eq!(virtual_bounds(&mons), (-1280, -200, 3200, 1280));
     }
@@ -347,7 +526,11 @@ mod tests {
         assert_eq!(f.pixel(3, 3), [255, 255, 255, 255]);
         let mut g = Frame::filled(4, 4, [0, 0, 200, 255]);
         draw_cursor(&mut g, 0, 0, 2, 2, &cur);
-        assert_eq!(g.pixel(1, 0), [0, 0, 200, 255], "transparent pixel leaves screen as is");
+        assert_eq!(
+            g.pixel(1, 0),
+            [0, 0, 200, 255],
+            "transparent pixel leaves screen as is"
+        );
         let p = g.pixel(0, 1);
         assert_eq!(p[0], 128);
         assert!((p[2] as i32 - 99).abs() <= 1);
@@ -378,7 +561,14 @@ mod tests {
         let reference = TestPattern::render(&mons[0], 1, None);
         assert_eq!(without, reference);
         assert_ne!(with, reference);
-        assert_eq!(t.pointer(), Some(PointerPos { x: 100, y: 100, shape: 1 }));
+        assert_eq!(
+            t.pointer(),
+            Some(PointerPos {
+                x: 100,
+                y: 100,
+                shape: 1
+            })
+        );
     }
 
     #[test]
@@ -388,7 +578,15 @@ mod tests {
         let a = t.capture(&mons[0]).unwrap();
         let b = t.capture(&mons[0]).unwrap();
         assert_ne!(a, b, "progress bar animates");
-        t.input(&mons, &InputEvent::MouseMove { mon: 1, x: 0.0, y: 0.0 }).unwrap();
+        t.input(
+            &mons,
+            &InputEvent::MouseMove {
+                mon: 1,
+                x: 0.0,
+                y: 0.0,
+            },
+        )
+        .unwrap();
         assert_eq!(t.pointer, (1600, 0));
         assert_eq!(t.received.len(), 1);
     }

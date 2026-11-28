@@ -35,11 +35,17 @@ pub struct HostOptions {
 }
 
 fn desktop(demo: bool) -> Result<Box<dyn Desktop>> {
-    if demo { Ok(Box::new(TestPattern::dual())) } else { open_desktop() }
+    if demo {
+        Ok(Box::new(TestPattern::dual()))
+    } else {
+        open_desktop()
+    }
 }
 
 fn current_monitors(demo: bool) -> Vec<MonitorInfo> {
-    desktop(demo).and_then(|mut d| d.monitors()).unwrap_or_default()
+    desktop(demo)
+        .and_then(|mut d| d.monitors())
+        .unwrap_or_default()
 }
 
 /// Run until updated (returns [`EXIT_UPDATED`]) — reconnects forever otherwise.
@@ -73,12 +79,20 @@ async fn agent_connection(
     last_update_check: &mut Instant,
 ) -> Result<Option<i32>> {
     let url = ws_url(&cfg.server_url, "/ws/agent");
-    let (ws, _) = tokio_tungstenite::connect_async_with_config(url.as_str(), None, true).await.with_context(|| format!("connecting to {url}"))?;
+    let (ws, _) = tokio_tungstenite::connect_async_with_config(url.as_str(), None, true)
+        .await
+        .with_context(|| format!("connecting to {url}"))?;
     let (mut sink, mut stream) = ws.split();
     let demo = opts.demo;
-    let monitors = tokio::task::spawn_blocking(move || current_monitors(demo)).await.unwrap_or_default();
+    let monitors = tokio::task::spawn_blocking(move || current_monitors(demo))
+        .await
+        .unwrap_or_default();
     let register = AgentMsg::Register {
-        enroll_token: if cfg.is_enrolled() { None } else { cfg.enroll_token.clone() },
+        enroll_token: if cfg.is_enrolled() {
+            None
+        } else {
+            cfg.enroll_token.clone()
+        },
         machine_id: cfg.machine_id.clone(),
         secret: cfg.secret.clone(),
         hostname: hostname(),
@@ -87,13 +101,16 @@ async fn agent_connection(
         target: current_target().to_string(),
         monitors: monitors.clone(),
     };
-    sink.send(Message::Text(serde_json::to_string(&register)?.into())).await?;
+    sink.send(Message::Text(serde_json::to_string(&register)?.into()))
+        .await?;
     log::info!("connected to {}", cfg.server_url);
 
     // Preview pictures are taken on their own thread (screen APIs block).
     let (preview_tx, preview_rx) = std::sync::mpsc::channel::<(u32, Option<u8>)>();
     let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<AgentMsg>();
-    std::thread::Builder::new().name("preview".into()).spawn(move || preview_worker(demo, preview_rx, reply_tx))?;
+    std::thread::Builder::new()
+        .name("preview".into())
+        .spawn(move || preview_worker(demo, preview_rx, reply_tx))?;
 
     // The first heartbeat goes right away, so the relay has the computer's
     // load and disks as soon as it is online.
@@ -189,7 +206,11 @@ async fn agent_connection(
 const PREVIEW_KEEP_OPEN: Duration = Duration::from_secs(60);
 
 /// Answers [`AgentMsg::PreviewRequest`]s until the connection ends.
-fn preview_worker(demo: bool, rx: std::sync::mpsc::Receiver<(u32, Option<u8>)>, tx: tokio::sync::mpsc::UnboundedSender<AgentMsg>) {
+fn preview_worker(
+    demo: bool,
+    rx: std::sync::mpsc::Receiver<(u32, Option<u8>)>,
+    tx: tokio::sync::mpsc::UnboundedSender<AgentMsg>,
+) {
     let mut desk: Option<Box<dyn Desktop>> = None;
     loop {
         let first = match rx.recv_timeout(PREVIEW_KEEP_OPEN) {
@@ -202,7 +223,9 @@ fn preview_worker(demo: bool, rx: std::sync::mpsc::Receiver<(u32, Option<u8>)>, 
         };
         let pending: Vec<(u32, Option<u8>)> = std::iter::once(first).chain(rx.try_iter()).collect();
         if desk.is_none() {
-            desk = desktop(demo).map_err(|e| log::debug!("preview: {e:#}")).ok();
+            desk = desktop(demo)
+                .map_err(|e| log::debug!("preview: {e:#}"))
+                .ok();
         }
         // Requests for small pictures that piled up meanwhile all get the same
         // ones; each full-size screenshot is taken on its own.
@@ -210,7 +233,9 @@ fn preview_worker(demo: bool, rx: std::sync::mpsc::Receiver<(u32, Option<u8>)>, 
         for (req, full) in pending {
             let result = match (desk.as_mut(), full) {
                 (None, _) => Ok(Vec::new()),
-                (Some(d), Some(index)) => screenshot_shot(d.as_mut(), index).map(|s| s.into_iter().collect()),
+                (Some(d), Some(index)) => {
+                    screenshot_shot(d.as_mut(), index).map(|s| s.into_iter().collect())
+                }
                 (Some(_), None) if small.is_some() => Ok(small.clone().unwrap()),
                 (Some(d), None) => preview_shots(d.as_mut()).inspect(|s| small = Some(s.clone())),
             };
@@ -233,7 +258,12 @@ pub fn preview_shots(desk: &mut dyn Desktop) -> Result<Vec<PreviewShot>> {
     for m in desk.monitors()? {
         let frame = desk.capture(&m)?;
         let (width, height, jpeg) = crate::codec::thumbnail_jpeg(&frame, PREVIEW_MAX, 70)?;
-        shots.push(PreviewShot { index: m.index, width, height, jpeg: crate::util::base64_encode(&jpeg) });
+        shots.push(PreviewShot {
+            index: m.index,
+            width,
+            height,
+            jpeg: crate::util::base64_encode(&jpeg),
+        });
     }
     Ok(shots)
 }
@@ -241,10 +271,17 @@ pub fn preview_shots(desk: &mut dyn Desktop) -> Result<Vec<PreviewShot>> {
 /// One monitor at full size ("Take screenshot"); `None` if there is no such monitor.
 pub fn screenshot_shot(desk: &mut dyn Desktop, index: u8) -> Result<Option<PreviewShot>> {
     let _ = desk.changed();
-    let Some(m) = desk.monitors()?.into_iter().find(|m| m.index == index) else { return Ok(None) };
+    let Some(m) = desk.monitors()?.into_iter().find(|m| m.index == index) else {
+        return Ok(None);
+    };
     let frame = desk.capture(&m)?;
     let (data, _) = crate::codec::screenshot_image(&frame)?;
-    Ok(Some(PreviewShot { index, width: frame.width, height: frame.height, jpeg: crate::util::base64_encode(&data) }))
+    Ok(Some(PreviewShot {
+        index,
+        width: frame.width,
+        height: frame.height,
+        jpeg: crate::util::base64_encode(&data),
+    }))
 }
 
 /// Regular update check: logs failures, returns the exit code if updated.
@@ -285,12 +322,26 @@ async fn run_update(server: &str, force: bool) -> Result<Option<i32>, String> {
 /// to the viewer is tried meanwhile and used once it works (see
 /// [`crate::direct`]). The relay socket stays the authority either way:
 /// mode switches and the end of the session only ever come from it.
-pub async fn run_session(server: String, machine_id: String, secret: String, session_id: String, view_only: bool, demo: bool) -> Result<()> {
+pub async fn run_session(
+    server: String,
+    machine_id: String,
+    secret: String,
+    session_id: String,
+    view_only: bool,
+    demo: bool,
+) -> Result<()> {
     let url = ws_url(
         &server,
-        &format!("/ws/host-session/{}?machine={}&secret={}", url_encode(&session_id), url_encode(&machine_id), url_encode(&secret)),
+        &format!(
+            "/ws/host-session/{}?machine={}&secret={}",
+            url_encode(&session_id),
+            url_encode(&machine_id),
+            url_encode(&secret)
+        ),
     );
-    let (ws, _) = tokio_tungstenite::connect_async_with_config(url.as_str(), None, true).await.context("opening session")?;
+    let (ws, _) = tokio_tungstenite::connect_async_with_config(url.as_str(), None, true)
+        .await
+        .context("opening session")?;
     let (mut sink, mut stream) = ws.split();
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<SessionMsg>();
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(32);
@@ -300,10 +351,24 @@ pub async fn run_session(server: String, machine_id: String, secret: String, ses
     let clip = Arc::new(std::sync::Mutex::new(ClipboardSync::for_host(demo)));
     let clip_view_only = Arc::new(AtomicBool::new(view_only));
     {
-        let (clip, tx, vo, stop) = (clip.clone(), out_tx.clone(), clip_view_only.clone(), stop.clone());
-        std::thread::Builder::new().name("clipboard".into()).spawn(move || crate::clipboard::poll_loop(clip, tx, vo, stop))?;
+        let (clip, tx, vo, stop) = (
+            clip.clone(),
+            out_tx.clone(),
+            clip_view_only.clone(),
+            stop.clone(),
+        );
+        std::thread::Builder::new()
+            .name("clipboard".into())
+            .spawn(move || crate::clipboard::poll_loop(clip, tx, vo, stop))?;
     }
-    let mut viewer = ViewerInput { view_only, clip, clip_view_only, files: crate::files::FileService::default(), file_out: out_tx.clone(), cmd_tx };
+    let mut viewer = ViewerInput {
+        view_only,
+        clip,
+        clip_view_only,
+        files: crate::files::FileService::default(),
+        file_out: out_tx.clone(),
+        cmd_tx,
+    };
     std::thread::Builder::new()
         .name("screen".into())
         .spawn(move || screen_loop(demo, view_only, cmd_rx, out_tx, stop2))?;
@@ -434,7 +499,8 @@ impl ViewerInput {
             // pastes this text.
             if !self.view_only {
                 let clip = self.clip.clone();
-                let _ = tokio::task::spawn_blocking(move || clip.lock().unwrap().receive(text)).await;
+                let _ =
+                    tokio::task::spawn_blocking(move || clip.lock().unwrap().receive(text)).await;
             }
             return;
         }
@@ -479,11 +545,16 @@ pub fn run_screen(
     tx: tokio::sync::mpsc::Sender<Message>,
     stop: Arc<AtomicBool>,
 ) {
-    let send_json = |m: &SessionMsg| tx.blocking_send(Message::Text(serde_json::to_string(m).unwrap().into())).is_ok();
+    let send_json = |m: &SessionMsg| {
+        tx.blocking_send(Message::Text(serde_json::to_string(m).unwrap().into()))
+            .is_ok()
+    };
     let mut desk = match open() {
         Ok(d) => d,
         Err(e) => {
-            send_json(&SessionMsg::Notice { text: format!("Cannot show this screen: {e:#}") });
+            send_json(&SessionMsg::Notice {
+                text: format!("Cannot show this screen: {e:#}"),
+            });
             return;
         }
     };
@@ -505,7 +576,8 @@ pub fn run_screen(
         Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
     }
-    let mut encoders: Vec<MonitorEncoder> = monitors.iter().map(|_| MonitorEncoder::default()).collect();
+    let mut encoders: Vec<MonitorEncoder> =
+        monitors.iter().map(|_| MonitorEncoder::default()).collect();
     // Last full-size picture per monitor: unchanged screens are not scaled or encoded.
     let mut prev_raw: Vec<Option<Frame>> = monitors.iter().map(|_| None).collect();
     // When each monitor's picture last changed (rough parts are sharpened after a pause).
@@ -611,7 +683,10 @@ pub fn run_screen(
                         // Only if this system can tell where the pointer is.
                         let on = local && desk.pointer().is_some();
                         if on != pointer.on {
-                            pointer = PointerSender { on, ..PointerSender::default() };
+                            pointer = PointerSender {
+                                on,
+                                ..PointerSender::default()
+                            };
                             desk.set_pointer_in_picture(!on);
                             // Pictures with / without the pointer drawn in.
                             encoders.iter_mut().for_each(|e| e.reset());
@@ -635,7 +710,9 @@ pub fn run_screen(
                     encoders = monitors.iter().map(|_| MonitorEncoder::default()).collect();
                     prev_raw = monitors.iter().map(|_| None).collect();
                     last_change = monitors.iter().map(|_| Instant::now()).collect();
-                    if !send_json(&SessionMsg::Monitors { monitors: monitors.clone() }) {
+                    if !send_json(&SessionMsg::Monitors {
+                        monitors: monitors.clone(),
+                    }) {
                         return;
                     }
                 }
@@ -656,10 +733,15 @@ pub fn run_screen(
                 continue;
             }
 
-            let optimised = quality.color == crate::quality::ColorDepth::Optimized && quality.codec != crate::quality::Codec::Jpeg;
+            let optimised = quality.color == crate::quality::ColorDepth::Optimized
+                && quality.codec != crate::quality::Codec::Jpeg;
             if optimised {
                 repaint_for_palette |= learner.step(start);
-                if repaint_for_palette && last_change.iter().all(|t| t.elapsed() >= PALETTE_REPAINT_AFTER) {
+                if repaint_for_palette
+                    && last_change
+                        .iter()
+                        .all(|t| t.elapsed() >= PALETTE_REPAINT_AFTER)
+                {
                     repaint_for_palette = false;
                     encoders.iter_mut().for_each(|e| e.reset());
                     prev_raw.iter_mut().for_each(|p| *p = None);
@@ -710,7 +792,16 @@ pub fn run_screen(
             if !changed && !idle.recheck_due(now) {
                 pace.step(now, &quality, &mut flow);
                 let regular = idle.interval(pace.regular(&quality), now);
-                next_look = next_after(start, look_interval(regular, last_input.map(|t| now.duration_since(t)), None, Duration::ZERO), &pointer);
+                next_look = next_after(
+                    start,
+                    look_interval(
+                        regular,
+                        last_input.map(|t| now.duration_since(t)),
+                        None,
+                        Duration::ZERO,
+                    ),
+                    &pointer,
+                );
                 continue;
             }
             idle.checked(now);
@@ -799,8 +890,12 @@ pub fn run_screen(
             let now = Instant::now();
             pace.step(now, &quality, &mut flow);
             let regular = idle.interval(pace.regular(&quality), now);
-            let interval =
-                look_interval(regular, last_input.map(|t| now.duration_since(t)), Some(now.duration_since(start)), pace.burst_gap(&quality));
+            let interval = look_interval(
+                regular,
+                last_input.map(|t| now.duration_since(t)),
+                Some(now.duration_since(start)),
+                pace.burst_gap(&quality),
+            );
             next_look = next_after(start, interval, &pointer);
         }
     };
@@ -828,7 +923,13 @@ impl HeldInput {
             }
             InputEvent::Key { key, down: false } => self.keys.retain(|k| k != key),
             InputEvent::MouseMove { mon, x, y } => self.at = Some((*mon, *x, *y)),
-            InputEvent::MouseButton { mon, x, y, button, down } => {
+            InputEvent::MouseButton {
+                mon,
+                x,
+                y,
+                button,
+                down,
+            } => {
                 self.at = Some((*mon, *x, *y));
                 self.buttons.retain(|b| b != button);
                 if *down {
@@ -844,8 +945,22 @@ impl HeldInput {
     pub fn release(&mut self) -> Vec<crate::proto::InputEvent> {
         use crate::proto::InputEvent;
         let (mon, x, y) = self.at.unwrap_or((0, 0.5, 0.5));
-        let buttons = self.buttons.drain(..).rev().map(|button| InputEvent::MouseButton { mon, x, y, button, down: false });
-        let keys = self.keys.drain(..).rev().map(|key| InputEvent::Key { key, down: false });
+        let buttons = self
+            .buttons
+            .drain(..)
+            .rev()
+            .map(|button| InputEvent::MouseButton {
+                mon,
+                x,
+                y,
+                button,
+                down: false,
+            });
+        let keys = self
+            .keys
+            .drain(..)
+            .rev()
+            .map(|key| InputEvent::Key { key, down: false });
         buttons.chain(keys).collect()
     }
 }
@@ -883,7 +998,12 @@ impl SpareCpu {
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
         let mut load = crate::sysstat::CpuLoad::default();
         load.busy(); // first reading
-        SpareCpu { load, cores, next: now + Self::EVERY, spare: false }
+        SpareCpu {
+            load,
+            cores,
+            next: now + Self::EVERY,
+            spare: false,
+        }
     }
 
     fn check(&mut self, now: Instant) -> bool {
@@ -897,7 +1017,12 @@ impl SpareCpu {
     }
 
     fn decide(spare: bool, busy: f32, cores: usize) -> bool {
-        cores >= Self::MIN_CORES && if spare { busy <= Self::OFF_ABOVE } else { busy < Self::ON_BELOW }
+        cores >= Self::MIN_CORES
+            && if spare {
+                busy <= Self::OFF_ABOVE
+            } else {
+                busy < Self::ON_BELOW
+            }
     }
 }
 
@@ -924,8 +1049,17 @@ impl TimingStats {
 
     /// The message to send now, if one is due (nothing while no pictures go).
     /// `pace_fps`: the automatic pace now ([`AutoPace`]), if on.
-    pub fn report(&mut self, now: Instant, flow: &mut FlowControl, pace_fps: Option<f32>) -> Option<SessionMsg> {
-        if self.pictures == 0 || self.last_report.is_some_and(|t| now.duration_since(t) < Self::EVERY) {
+    pub fn report(
+        &mut self,
+        now: Instant,
+        flow: &mut FlowControl,
+        pace_fps: Option<f32>,
+    ) -> Option<SessionMsg> {
+        if self.pictures == 0
+            || self
+                .last_report
+                .is_some_and(|t| now.duration_since(t) < Self::EVERY)
+        {
             return None;
         }
         let ms = |d: Duration| d.as_secs_f32() * 1000.0;
@@ -936,7 +1070,10 @@ impl TimingStats {
             rtt_ms: flow.take_rtt().map(ms),
             pace_fps,
         };
-        *self = TimingStats { last_report: Some(now), ..TimingStats::default() };
+        *self = TimingStats {
+            last_report: Some(now),
+            ..TimingStats::default()
+        };
         Some(msg)
     }
 }
@@ -1018,7 +1155,11 @@ impl FlowControl {
 
     /// May another picture go now?
     pub fn can_send(&mut self, now: Instant) -> bool {
-        if self.in_flight.front().is_some_and(|f| now.duration_since(f.1) >= Self::LOST_AFTER) {
+        if self
+            .in_flight
+            .front()
+            .is_some_and(|f| now.duration_since(f.1) >= Self::LOST_AFTER)
+        {
             self.in_flight.clear();
         }
         let ok = self.in_flight.len() < self.window;
@@ -1095,7 +1236,11 @@ impl AutoPace {
     pub const EVERY: Duration = Duration::from_millis(500);
 
     pub fn new(now: Instant) -> AutoPace {
-        AutoPace { gap: Self::START, cost: (Duration::ZERO, 0), next: now + Self::EVERY }
+        AutoPace {
+            gap: Self::START,
+            cost: (Duration::ZERO, 0),
+            next: now + Self::EVERY,
+        }
     }
 
     /// A picture went out; reading and compressing it took `cost`.
@@ -1121,7 +1266,9 @@ impl AutoPace {
         if n > 0 {
             self.gap = self.gap.max(sum / n * 2);
         }
-        self.gap = self.gap.clamp(Self::fastest(q), Self::SLOWEST.max(Self::fastest(q)));
+        self.gap = self
+            .gap
+            .clamp(Self::fastest(q), Self::SLOWEST.max(Self::fastest(q)));
     }
 
     fn fastest(q: &Quality) -> Duration {
@@ -1130,13 +1277,21 @@ impl AutoPace {
 
     /// Time between pictures while the screen changes.
     pub fn regular(&self, q: &Quality) -> Duration {
-        if q.auto_fps { self.gap.max(Self::fastest(q)) } else { Self::fastest(q) }
+        if q.auto_fps {
+            self.gap.max(Self::fastest(q))
+        } else {
+            Self::fastest(q)
+        }
     }
 
     /// Pictures right after input may come twice as fast as [`Self::regular`]
     /// (the reaction to a click matters most), never faster than this.
     pub fn burst_gap(&self, q: &Quality) -> Duration {
-        if q.auto_fps { self.gap / 2 } else { Duration::ZERO }
+        if q.auto_fps {
+            self.gap / 2
+        } else {
+            Duration::ZERO
+        }
     }
 
     pub fn pictures_per_second(&self, q: &Quality) -> f32 {
@@ -1168,7 +1323,12 @@ pub const BURST_FRAME: Duration = Duration::from_millis(16);
 /// costs nothing). A slow capture is never repeated faster than it can go.
 /// `burst_gap`: pictures after input never come faster than this
 /// ([`AutoPace::burst_gap`]).
-pub fn look_interval(regular: Duration, since_input: Option<Duration>, cost: Option<Duration>, burst_gap: Duration) -> Duration {
+pub fn look_interval(
+    regular: Duration,
+    since_input: Option<Duration>,
+    cost: Option<Duration>,
+    burst_gap: Duration,
+) -> Duration {
     if since_input.is_none_or(|t| t >= INPUT_BURST) {
         return regular;
     }
@@ -1185,7 +1345,11 @@ pub fn after_input(now: Instant, last_look: Instant) -> Instant {
 
 /// Next regular look; sooner while the pointer has to be followed.
 fn next_after(start: Instant, interval: Duration, pointer: &PointerSender) -> Instant {
-    let interval = if pointer.on && pointer.recently_moved(start) { interval.min(POINTER_EVERY) } else { interval };
+    let interval = if pointer.on && pointer.recently_moved(start) {
+        interval.min(POINTER_EVERY)
+    } else {
+        interval
+    };
     start + interval
 }
 
@@ -1210,18 +1374,25 @@ impl PointerSender {
     }
 
     fn recently_moved(&self, now: Instant) -> bool {
-        self.moved.is_some_and(|t| now.duration_since(t) < IdleTracker::IDLE_AFTER)
+        self.moved
+            .is_some_and(|t| now.duration_since(t) < IdleTracker::IDLE_AFTER)
     }
 
     /// Look at the pointer (at most every [`POINTER_EVERY`]). Returns what to
     /// send: nothing while it stays put, else a new shape (if any) and then
     /// the position.
     pub fn step(&mut self, desk: &mut dyn Desktop, now: Instant) -> Vec<SessionMsg> {
-        if !self.on || self.checked.is_some_and(|t| now.duration_since(t) < POINTER_EVERY) {
+        if !self.on
+            || self
+                .checked
+                .is_some_and(|t| now.duration_since(t) < POINTER_EVERY)
+        {
             return Vec::new();
         }
         self.checked = Some(now);
-        let Some(p) = desk.pointer() else { return Vec::new() };
+        let Some(p) = desk.pointer() else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
         let id = match self.ids.get(&p.shape) {
             Some(&id) => id,
@@ -1248,7 +1419,11 @@ impl PointerSender {
         }
         self.last = Some(now_at);
         self.moved = Some(now);
-        out.push(SessionMsg::Pointer { x: p.x, y: p.y, shape: id });
+        out.push(SessionMsg::Pointer {
+            x: p.x,
+            y: p.y,
+            shape: id,
+        });
         out
     }
 }
@@ -1270,7 +1445,10 @@ impl IdleTracker {
     pub const RECHECK: Duration = Duration::from_secs(2);
 
     pub fn new(now: Instant) -> IdleTracker {
-        IdleTracker { last_activity: now, last_check: now }
+        IdleTracker {
+            last_activity: now,
+            last_check: now,
+        }
     }
 
     /// Something changed or the person used mouse/keyboard.
@@ -1293,7 +1471,11 @@ impl IdleTracker {
     /// Time between screen checks right now; `busy` = the pace while the
     /// screen changes ([`AutoPace::regular`]).
     pub fn interval(&self, busy: Duration, now: Instant) -> Duration {
-        if self.is_idle(now) { busy.max(Self::IDLE_INTERVAL) } else { busy }
+        if self.is_idle(now) {
+            busy.max(Self::IDLE_INTERVAL)
+        } else {
+            busy
+        }
     }
 }
 
@@ -1309,13 +1491,21 @@ impl FileLogger {
         if let Some(d) = path.parent() {
             std::fs::create_dir_all(d)?;
         }
-        if std::fs::metadata(path).map(|m| m.len() > 5_000_000).unwrap_or(false) {
+        if std::fs::metadata(path)
+            .map(|m| m.len() > 5_000_000)
+            .unwrap_or(false)
+        {
             let _ = std::fs::rename(path, path.with_extension("log.1"));
         }
-        let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-        log::set_boxed_logger(Box::new(FileLogger { file: std::sync::Mutex::new(file) }))
-            .map(|()| log::set_max_level(log::LevelFilter::Info))
-            .map_err(|e| anyhow::anyhow!("{e}"))
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        log::set_boxed_logger(Box::new(FileLogger {
+            file: std::sync::Mutex::new(file),
+        }))
+        .map(|()| log::set_max_level(log::LevelFilter::Info))
+        .map_err(|e| anyhow::anyhow!("{e}"))
     }
 }
 
@@ -1351,7 +1541,8 @@ pub mod service {
     use std::sync::mpsc;
     use std::time::Duration;
     use windows_service::service::{
-        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+        ServiceType,
     };
     use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
     use windows_service::{define_windows_service, service_dispatcher};
@@ -1382,7 +1573,11 @@ pub mod service {
             } else {
                 ServiceControlAccept::empty()
             },
-            exit_code: if code == 0 { ServiceExitCode::Win32(0) } else { ServiceExitCode::ServiceSpecific(code) },
+            exit_code: if code == 0 {
+                ServiceExitCode::Win32(0)
+            } else {
+                ServiceExitCode::ServiceSpecific(code)
+            },
             checkpoint: 0,
             wait_hint: Duration::from_secs(5),
             process_id: None,
@@ -1451,7 +1646,12 @@ pub mod service {
             }
             if child.is_none() && session != 0xFFFF_FFFF {
                 match spawn_in_session(session) {
-                    Ok(p) => child = Some(Child { process: p, session }),
+                    Ok(p) => {
+                        child = Some(Child {
+                            process: p,
+                            session,
+                        })
+                    }
                     Err(e) => {
                         log::error!("starting helper: {e:#}");
                         std::thread::sleep(Duration::from_secs(3));
@@ -1477,13 +1677,25 @@ pub mod service {
                 anyhow::bail!("OpenProcessToken failed");
             }
             let mut dup: HANDLE = null_mut();
-            let ok = DuplicateTokenEx(token, 0x0200_0000 /* MAXIMUM_ALLOWED */, null(), SecurityImpersonation, TokenPrimary, &mut dup);
+            let ok = DuplicateTokenEx(
+                token,
+                0x0200_0000, /* MAXIMUM_ALLOWED */
+                null(),
+                SecurityImpersonation,
+                TokenPrimary,
+                &mut dup,
+            );
             CloseHandle(token);
             if ok == 0 {
                 anyhow::bail!("DuplicateTokenEx failed");
             }
             let mut sid = session;
-            SetTokenInformation(dup, TokenSessionId, &mut sid as *mut u32 as *const _, size_of::<u32>() as u32);
+            SetTokenInformation(
+                dup,
+                TokenSessionId,
+                &mut sid as *mut u32 as *const _,
+                size_of::<u32>() as u32,
+            );
 
             let exe = std::env::current_exe()?;
             let app = wide(&exe.display().to_string());
@@ -1523,7 +1735,10 @@ mod tests {
         let d = SpareCpu::decide;
         assert!(d(false, 10.0, 8), "idle machine: compress harder");
         assert!(!d(false, 50.0, 8), "half busy: stay quick");
-        assert!(d(true, 60.0, 8), "already on: our own work does not switch it off");
+        assert!(
+            d(true, 60.0, 8),
+            "already on: our own work does not switch it off"
+        );
         assert!(!d(true, 80.0, 8), "busy: back to quick");
         assert!(!d(false, 5.0, 2), "two cores: always quick");
     }
@@ -1537,12 +1752,24 @@ mod tests {
         let t0 = Instant::now();
         let mut idle = IdleTracker::new(t0);
         let q = Duration::from_millis(50);
-        assert_eq!(idle.interval(q, t0), Duration::from_millis(50), "busy: full speed");
+        assert_eq!(
+            idle.interval(q, t0),
+            Duration::from_millis(50),
+            "busy: full speed"
+        );
         let later = t0 + Duration::from_secs(3);
         assert!(idle.is_idle(later));
-        assert_eq!(idle.interval(q, later), IdleTracker::IDLE_INTERVAL, "idle: 4 checks a second");
+        assert_eq!(
+            idle.interval(q, later),
+            IdleTracker::IDLE_INTERVAL,
+            "idle: 4 checks a second"
+        );
         idle.activity(later);
-        assert_eq!(idle.interval(q, later), Duration::from_millis(50), "mouse use wakes it up");
+        assert_eq!(
+            idle.interval(q, later),
+            Duration::from_millis(50),
+            "mouse use wakes it up"
+        );
         assert!(!idle.recheck_due(t0 + Duration::from_millis(500)));
         assert!(idle.recheck_due(t0 + IdleTracker::RECHECK));
     }
@@ -1595,10 +1822,29 @@ mod tests {
         let fast = Quality::preset(Preset::Fast);
         let all = run_loop(vec![SessionMsg::Quality { quality: fast }], 600);
         assert_eq!(tile_monitors(&all), HashSet::from([0, 1]));
-        let one = run_loop(vec![SessionMsg::Quality { quality: fast }, SessionMsg::Watch { monitors: vec![1] }], 600);
-        assert_eq!(tile_monitors(&one), HashSet::from([1]), "screen 1 window closed: not captured");
-        let none = run_loop(vec![SessionMsg::Quality { quality: fast }, SessionMsg::Watch { monitors: vec![] }], 400);
-        assert!(tile_monitors(&none).is_empty(), "all windows minimised: nothing captured");
+        let one = run_loop(
+            vec![
+                SessionMsg::Quality { quality: fast },
+                SessionMsg::Watch { monitors: vec![1] },
+            ],
+            600,
+        );
+        assert_eq!(
+            tile_monitors(&one),
+            HashSet::from([1]),
+            "screen 1 window closed: not captured"
+        );
+        let none = run_loop(
+            vec![
+                SessionMsg::Quality { quality: fast },
+                SessionMsg::Watch { monitors: vec![] },
+            ],
+            400,
+        );
+        assert!(
+            tile_monitors(&none).is_empty(),
+            "all windows minimised: nothing captured"
+        );
     }
 
     /// The pretend computer, noting when input arrived and when the screen was read.
@@ -1658,11 +1904,26 @@ mod tests {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(1024);
         let th = std::thread::spawn(move || {
-            let open = move || -> Result<Box<dyn Desktop>> { Ok(Box::new(Recording { inner: TestPattern::new(&[(800, 600)]), input: i2.clone() })) };
-            run_screen(&open, false, cmd_rx, out_tx, Arc::new(AtomicBool::new(false)))
+            let open = move || -> Result<Box<dyn Desktop>> {
+                Ok(Box::new(Recording {
+                    inner: TestPattern::new(&[(800, 600)]),
+                    input: i2.clone(),
+                }))
+            };
+            run_screen(
+                &open,
+                false,
+                cmd_rx,
+                out_tx,
+                Arc::new(AtomicBool::new(false)),
+            )
         });
         let drain = std::thread::spawn(move || while out_rx.blocking_recv().is_some() {});
-        cmd_tx.send(SessionMsg::Quality { quality: Quality::preset(Preset::Fast) }).unwrap();
+        cmd_tx
+            .send(SessionMsg::Quality {
+                quality: Quality::preset(Preset::Fast),
+            })
+            .unwrap();
         for m in script {
             cmd_tx.send(m).unwrap();
             std::thread::sleep(Duration::from_millis(30));
@@ -1677,7 +1938,10 @@ mod tests {
     #[test]
     fn held_input_is_remembered_and_let_go_newest_first() {
         use crate::proto::{InputEvent, MouseButton};
-        let key = |k: &str, down| InputEvent::Key { key: k.into(), down };
+        let key = |k: &str, down| InputEvent::Key {
+            key: k.into(),
+            down,
+        };
         let mut h = HeldInput::default();
         assert!(h.release().is_empty());
         for ev in [
@@ -1686,8 +1950,18 @@ mod tests {
             key("a", true),
             key("a", false),
             key("Shift", true), // auto-repeat: still once
-            InputEvent::MouseButton { mon: 1, x: 0.2, y: 0.3, button: MouseButton::Left, down: true },
-            InputEvent::MouseMove { mon: 1, x: 0.6, y: 0.7 },
+            InputEvent::MouseButton {
+                mon: 1,
+                x: 0.2,
+                y: 0.3,
+                button: MouseButton::Left,
+                down: true,
+            },
+            InputEvent::MouseMove {
+                mon: 1,
+                x: 0.6,
+                y: 0.7,
+            },
             InputEvent::Text { text: "x".into() },
         ] {
             h.note(&ev);
@@ -1695,7 +1969,13 @@ mod tests {
         assert_eq!(
             h.release(),
             vec![
-                InputEvent::MouseButton { mon: 1, x: 0.6, y: 0.7, button: MouseButton::Left, down: false },
+                InputEvent::MouseButton {
+                    mon: 1,
+                    x: 0.6,
+                    y: 0.7,
+                    button: MouseButton::Left,
+                    down: false
+                },
                 key("Control", false),
                 key("Shift", false),
             ],
@@ -1707,24 +1987,66 @@ mod tests {
     #[test]
     fn held_keys_are_let_go_when_the_direct_path_breaks() {
         use crate::proto::InputEvent;
-        let shift = |down| SessionMsg::Input { event: InputEvent::Key { key: "Shift".into(), down } };
+        let shift = |down| SessionMsg::Input {
+            event: InputEvent::Key {
+                key: "Shift".into(),
+                down,
+            },
+        };
         let applied = input_applied(vec![shift(true), SessionMsg::PathSwitch { direct: false }]);
-        assert_eq!(applied.last(), Some(&InputEvent::Key { key: "Shift".into(), down: false }), "{applied:?}");
-        assert_eq!(applied.len(), 2, "let go once, not again at the end: {applied:?}");
+        assert_eq!(
+            applied.last(),
+            Some(&InputEvent::Key {
+                key: "Shift".into(),
+                down: false
+            }),
+            "{applied:?}"
+        );
+        assert_eq!(
+            applied.len(),
+            2,
+            "let go once, not again at the end: {applied:?}"
+        );
         // Nothing held: a broken path changes nothing.
-        let applied = input_applied(vec![shift(true), shift(false), SessionMsg::PathSwitch { direct: false }]);
+        let applied = input_applied(vec![
+            shift(true),
+            shift(false),
+            SessionMsg::PathSwitch { direct: false },
+        ]);
         assert_eq!(applied.len(), 2);
     }
 
     #[test]
     fn held_input_is_let_go_when_the_session_ends_or_turns_view_only() {
         use crate::proto::{InputEvent, MouseButton};
-        let press = SessionMsg::Input { event: InputEvent::MouseButton { mon: 0, x: 0.5, y: 0.5, button: MouseButton::Left, down: true } };
-        let up = InputEvent::MouseButton { mon: 0, x: 0.5, y: 0.5, button: MouseButton::Left, down: false };
+        let press = SessionMsg::Input {
+            event: InputEvent::MouseButton {
+                mon: 0,
+                x: 0.5,
+                y: 0.5,
+                button: MouseButton::Left,
+                down: true,
+            },
+        };
+        let up = InputEvent::MouseButton {
+            mon: 0,
+            x: 0.5,
+            y: 0.5,
+            button: MouseButton::Left,
+            down: false,
+        };
         let applied = input_applied(vec![press.clone()]);
-        assert_eq!(applied.last(), Some(&up), "the viewer left mid-drag: {applied:?}");
+        assert_eq!(
+            applied.last(),
+            Some(&up),
+            "the viewer left mid-drag: {applied:?}"
+        );
         let applied = input_applied(vec![press, SessionMsg::SetViewOnly { view_only: true }]);
-        assert_eq!(applied.last(), Some(&up), "its let-go would be dropped in view-only: {applied:?}");
+        assert_eq!(
+            applied.last(),
+            Some(&up),
+            "its let-go would be dropped in view-only: {applied:?}"
+        );
         assert_eq!(applied.len(), 2);
     }
 
@@ -1738,10 +2060,18 @@ mod tests {
         let s2 = stop.clone();
         // One picture a second: the old loop slept up to a second before
         // even reading the input.
-        let slow = Quality { max_fps: 1, ..Quality::preset(Preset::Fast) };
+        let slow = Quality {
+            max_fps: 1,
+            ..Quality::preset(Preset::Fast)
+        };
         cmd_tx.send(SessionMsg::Quality { quality: slow }).unwrap();
         let th = std::thread::spawn(move || {
-            let open = move || -> Result<Box<dyn Desktop>> { Ok(Box::new(Timed { inner: TestPattern::new(&[(800, 600)]), log: l2.clone() })) };
+            let open = move || -> Result<Box<dyn Desktop>> {
+                Ok(Box::new(Timed {
+                    inner: TestPattern::new(&[(800, 600)]),
+                    log: l2.clone(),
+                }))
+            };
             run_screen(&open, false, cmd_rx, out_tx, s2)
         });
         // Acks so flow control never holds pictures back.
@@ -1760,7 +2090,11 @@ mod tests {
         };
         std::thread::sleep(Duration::from_millis(300)); // first picture sent, loop now waiting
         let sent = Instant::now();
-        let click = crate::proto::InputEvent::MouseMove { mon: 0, x: 0.5, y: 0.5 };
+        let click = crate::proto::InputEvent::MouseMove {
+            mon: 0,
+            x: 0.5,
+            y: 0.5,
+        };
         cmd_tx.send(SessionMsg::Input { event: click }).unwrap();
         std::thread::sleep(Duration::from_millis(300));
         stop.store(true, Ordering::Relaxed);
@@ -1768,17 +2102,42 @@ mod tests {
         th.join().unwrap();
         acker.join().unwrap();
         let log = log.lock().unwrap();
-        let input = log.iter().find(|(k, _)| *k == "input").expect("input applied").1;
-        assert!(input.duration_since(sent) < Duration::from_millis(30), "input waited {:?}", input.duration_since(sent));
-        let look = log.iter().find(|(k, t)| *k == "capture" && *t > input).expect("screen read after the input").1;
-        assert!(look.duration_since(input) < Duration::from_millis(100), "reaction looked at after {:?}", look.duration_since(input));
+        let input = log
+            .iter()
+            .find(|(k, _)| *k == "input")
+            .expect("input applied")
+            .1;
+        assert!(
+            input.duration_since(sent) < Duration::from_millis(30),
+            "input waited {:?}",
+            input.duration_since(sent)
+        );
+        let look = log
+            .iter()
+            .find(|(k, t)| *k == "capture" && *t > input)
+            .expect("screen read after the input")
+            .1;
+        assert!(
+            look.duration_since(input) < Duration::from_millis(100),
+            "reaction looked at after {:?}",
+            look.duration_since(input)
+        );
     }
 
     #[test]
     fn pointer_is_sent_apart_from_the_pictures_when_the_viewer_draws_it() {
         let fast = Quality::preset(Preset::Fast);
-        let move_to = |x| SessionMsg::Input { event: crate::proto::InputEvent::MouseMove { mon: 0, x, y: 0.5 } };
-        let msgs = run_loop(vec![SessionMsg::Quality { quality: fast }, SessionMsg::PointerMode { local: true }, move_to(0.25)], 400);
+        let move_to = |x| SessionMsg::Input {
+            event: crate::proto::InputEvent::MouseMove { mon: 0, x, y: 0.5 },
+        };
+        let msgs = run_loop(
+            vec![
+                SessionMsg::Quality { quality: fast },
+                SessionMsg::PointerMode { local: true },
+                move_to(0.25),
+            ],
+            400,
+        );
         let json: Vec<SessionMsg> = msgs
             .iter()
             .filter_map(|m| match m {
@@ -1786,18 +2145,41 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let shapes: Vec<_> = json.iter().filter(|m| matches!(m, SessionMsg::PointerShape { .. })).collect();
+        let shapes: Vec<_> = json
+            .iter()
+            .filter(|m| matches!(m, SessionMsg::PointerShape { .. }))
+            .collect();
         assert_eq!(shapes.len(), 1, "the shape goes once");
-        let SessionMsg::PointerShape { id, width, height, rgba, .. } = shapes[0] else { unreachable!() };
-        assert_eq!(crate::util::base64_decode(rgba).unwrap().len(), (width * height * 4) as usize);
+        let SessionMsg::PointerShape {
+            id,
+            width,
+            height,
+            rgba,
+            ..
+        } = shapes[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            crate::util::base64_decode(rgba).unwrap().len(),
+            (width * height * 4) as usize
+        );
         let last = json.iter().rev().find_map(|m| match m {
             SessionMsg::Pointer { x, y, shape } => Some((*x, *y, *shape)),
             _ => None,
         });
-        assert_eq!(last, Some((400, 450, *id)), "follows the injected move (1600x900 screen)");
+        assert_eq!(
+            last,
+            Some((400, 450, *id)),
+            "follows the injected move (1600x900 screen)"
+        );
         // Without asking, nothing pointer-related is sent.
         let plain = run_loop(vec![SessionMsg::Quality { quality: fast }], 300);
-        assert!(!plain.iter().any(|m| matches!(m, Message::Text(t) if t.contains("pointer"))));
+        assert!(
+            !plain
+                .iter()
+                .any(|m| matches!(m, Message::Text(t) if t.contains("pointer")))
+        );
     }
 
     #[test]
@@ -1817,7 +2199,11 @@ mod tests {
             t += 100;
             f.acked(seq, ms(t));
         }
-        assert_eq!(f.window(), FlowControl::MAX, "a long, empty link gets more pictures on the way");
+        assert_eq!(
+            f.window(),
+            FlowControl::MAX,
+            "a long, empty link gets more pictures on the way"
+        );
         // Now acks come back late (pictures queue): the window shrinks.
         for _ in 0..20 {
             while f.can_send(ms(t)) {
@@ -1827,7 +2213,11 @@ mod tests {
             t += 400;
             f.acked(seq, ms(t));
         }
-        assert_eq!(f.window(), FlowControl::MIN, "but never below the old fixed two");
+        assert_eq!(
+            f.window(),
+            FlowControl::MIN,
+            "but never below the old fixed two"
+        );
         assert!(f.far(), "100 ms away: worth compressing harder");
         let mut near = FlowControl::new(t0);
         assert!(!near.far(), "unknown distance: quick compression");
@@ -1842,13 +2232,28 @@ mod tests {
         let regular = ms(33);
         // No input lately: the normal pace.
         assert_eq!(look_interval(regular, None, None, ms(0)), regular);
-        assert_eq!(look_interval(regular, Some(INPUT_BURST), Some(ms(2)), ms(0)), regular);
+        assert_eq!(
+            look_interval(regular, Some(INPUT_BURST), Some(ms(2)), ms(0)),
+            regular
+        );
         // Just after input: cheap checks every few ms, pictures at 60 per second.
-        assert_eq!(look_interval(regular, Some(ms(10)), None, ms(0)), BURST_POLL);
-        assert_eq!(look_interval(regular, Some(ms(10)), Some(ms(3)), ms(0)), BURST_FRAME);
+        assert_eq!(
+            look_interval(regular, Some(ms(10)), None, ms(0)),
+            BURST_POLL
+        );
+        assert_eq!(
+            look_interval(regular, Some(ms(10)), Some(ms(3)), ms(0)),
+            BURST_FRAME
+        );
         // A slow capture gets room to breathe, and a faster regular pace wins.
-        assert_eq!(look_interval(regular, Some(ms(10)), Some(ms(12)), ms(0)), ms(24));
-        assert_eq!(look_interval(regular, Some(ms(10)), Some(ms(40)), ms(0)), regular);
+        assert_eq!(
+            look_interval(regular, Some(ms(10)), Some(ms(12)), ms(0)),
+            ms(24)
+        );
+        assert_eq!(
+            look_interval(regular, Some(ms(10)), Some(ms(40)), ms(0)),
+            regular
+        );
         assert_eq!(look_interval(ms(5), Some(ms(10)), None, ms(0)), ms(5));
     }
 
@@ -1867,7 +2272,10 @@ mod tests {
         f.sent(2, t0);
         f.sent(3, t0);
         assert!(!f.can_send(t0 + Duration::from_secs(1)));
-        assert!(f.can_send(t0 + FlowControl::LOST_AFTER), "lost acks don't freeze the session");
+        assert!(
+            f.can_send(t0 + FlowControl::LOST_AFTER),
+            "lost acks don't freeze the session"
+        );
         f.acked(1, t0 + Duration::from_secs(4)); // stale ack: harmless
     }
 
@@ -1877,33 +2285,64 @@ mod tests {
         let ms = Duration::from_millis;
         let mut f = FlowControl::new(t0);
         let mut t = TimingStats::default();
-        assert_eq!(t.report(t0, &mut f, None), None, "nothing sent: nothing to say");
+        assert_eq!(
+            t.report(t0, &mut f, None),
+            None,
+            "nothing sent: nothing to say"
+        );
         f.sent(1, t0);
         f.acked(1, t0 + ms(20));
         f.sent(2, t0);
         f.acked(2, t0 + ms(40));
         t.picture(ms(2), ms(10));
         t.picture(ms(4), ms(20));
-        let Some(SessionMsg::Timing { capture_ms, encode_ms, rtt_ms, pace_fps }) = t.report(t0, &mut f, Some(10.0)) else { panic!() };
+        let Some(SessionMsg::Timing {
+            capture_ms,
+            encode_ms,
+            rtt_ms,
+            pace_fps,
+        }) = t.report(t0, &mut f, Some(10.0))
+        else {
+            panic!()
+        };
         assert_eq!(pace_fps, Some(10.0));
         assert!((capture_ms - 3.0).abs() < 0.01 && (encode_ms - 15.0).abs() < 0.01);
         assert!((rtt_ms.unwrap() - 30.0).abs() < 0.01, "average round trip");
         t.picture(ms(1), ms(1));
-        assert_eq!(t.report(t0 + ms(500), &mut f, None), None, "at most once a second");
-        let Some(SessionMsg::Timing { rtt_ms, .. }) = t.report(t0 + ms(1000), &mut f, None) else { panic!() };
-        assert!((rtt_ms.unwrap() - 40.0).abs() < 0.01, "no new ack: the latest round trip");
+        assert_eq!(
+            t.report(t0 + ms(500), &mut f, None),
+            None,
+            "at most once a second"
+        );
+        let Some(SessionMsg::Timing { rtt_ms, .. }) = t.report(t0 + ms(1000), &mut f, None) else {
+            panic!()
+        };
+        assert!(
+            (rtt_ms.unwrap() - 40.0).abs() < 0.01,
+            "no new ack: the latest round trip"
+        );
     }
 
     #[test]
     fn preview_has_a_small_picture_of_every_screen() {
         let mut desk = TestPattern::dual();
         let shots = preview_shots(&mut desk).unwrap();
-        assert_eq!(shots.iter().map(|s| (s.index, s.width, s.height)).collect::<Vec<_>>(), vec![(0, 480, 270), (1, 480, 384)]);
+        assert_eq!(
+            shots
+                .iter()
+                .map(|s| (s.index, s.width, s.height))
+                .collect::<Vec<_>>(),
+            vec![(0, 480, 270), (1, 480, 384)]
+        );
         for s in &shots {
             let jpeg = crate::util::base64_decode(&s.jpeg).unwrap();
             let f = crate::codec::decode_tile(crate::proto::TileFormat::Jpeg, &jpeg).unwrap();
             assert_eq!((f.width, f.height), (s.width, s.height));
-            assert!(jpeg.len() < 100_000, "previews stay small: {} bytes", jpeg.len());
+            assert!(
+                jpeg.len() < 100_000,
+                "previews stay small: {} bytes",
+                jpeg.len()
+            );
         }
     }
 
@@ -1912,7 +2351,10 @@ mod tests {
         let mut desk = TestPattern::dual();
         let m = desk.monitors().unwrap().remove(0);
         let shot = screenshot_shot(&mut desk, 0).unwrap().unwrap();
-        assert_eq!((shot.index, shot.width, shot.height), (0, m.width, m.height));
+        assert_eq!(
+            (shot.index, shot.width, shot.height),
+            (0, m.width, m.height)
+        );
         let data = crate::util::base64_decode(&shot.jpeg).unwrap();
         assert!(data.starts_with(b"\x89PNG"));
         let f = crate::codec::decode_image(&data).unwrap();
@@ -1937,7 +2379,13 @@ mod tests {
         for _ in 0..5 {
             match out_rx.blocking_recv().unwrap() {
                 AgentMsg::Preview { req: 10, shots } => {
-                    assert_eq!(shots.iter().map(|s| (s.index, s.width, s.height)).collect::<Vec<_>>(), vec![(1, 1280, 1024)]);
+                    assert_eq!(
+                        shots
+                            .iter()
+                            .map(|s| (s.index, s.width, s.height))
+                            .collect::<Vec<_>>(),
+                        vec![(1, 1280, 1024)]
+                    );
                     answered.push(10);
                 }
                 AgentMsg::Preview { req: 11, shots } => {
@@ -1954,6 +2402,9 @@ mod tests {
         assert_eq!(answered, vec![7, 8, 9, 10, 11]);
         drop(tx);
         th.join().unwrap();
-        assert!(out_rx.blocking_recv().is_none(), "worker ended when the connection went away");
+        assert!(
+            out_rx.blocking_recv().is_none(),
+            "worker ended when the connection went away"
+        );
     }
 }

@@ -16,6 +16,7 @@
 //! ([`LinkTx::send`] / [`LinkRx::recv`]); see `host::run_session` and
 //! `net::network_task` for switching between the two paths.
 
+use crate::proto::SessionMsg;
 use anyhow::{Context, Result, anyhow, bail};
 use rustls::DigitallySignedStruct;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -26,7 +27,6 @@ use sha2::{Digest, Sha256};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
-use crate::proto::SessionMsg;
 use tokio_tungstenite::tungstenite::Message;
 
 const ALPN: &[u8] = b"farlink-direct/1";
@@ -101,7 +101,11 @@ pub fn fingerprint(cert: &[u8]) -> String {
 pub fn is_lan(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
-        IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00 || (v6.segments()[0] & 0xffc0) == 0xfe80,
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
     }
 }
 
@@ -133,20 +137,44 @@ impl Pinned {
         if crate::util::constant_time_eq(&fingerprint(cert), &self.fingerprint) {
             Ok(())
         } else {
-            Err(rustls::Error::InvalidCertificate(rustls::CertificateError::ApplicationVerificationFailure))
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ))
         }
     }
 
-    fn tls12(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(m, c, d, &self.provider.signature_verification_algorithms)
+    fn tls12(
+        &self,
+        m: &[u8],
+        c: &CertificateDer<'_>,
+        d: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            m,
+            c,
+            d,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
-    fn tls13(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(m, c, d, &self.provider.signature_verification_algorithms)
+    fn tls13(
+        &self,
+        m: &[u8],
+        c: &CertificateDer<'_>,
+        d: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            m,
+            c,
+            d,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.provider.signature_verification_algorithms.supported_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -159,12 +187,23 @@ impl ServerCertVerifier for Pinned {
         _: &[u8],
         _: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        self.check(end_entity).map(|_| ServerCertVerified::assertion())
+        self.check(end_entity)
+            .map(|_| ServerCertVerified::assertion())
     }
-    fn verify_tls12_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+    fn verify_tls12_signature(
+        &self,
+        m: &[u8],
+        c: &CertificateDer<'_>,
+        d: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
         self.tls12(m, c, d)
     }
-    fn verify_tls13_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+    fn verify_tls13_signature(
+        &self,
+        m: &[u8],
+        c: &CertificateDer<'_>,
+        d: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
         self.tls13(m, c, d)
     }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -176,13 +215,29 @@ impl ClientCertVerifier for Pinned {
     fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
         &[]
     }
-    fn verify_client_cert(&self, end_entity: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: UnixTime) -> Result<ClientCertVerified, rustls::Error> {
-        self.check(end_entity).map(|_| ClientCertVerified::assertion())
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        self.check(end_entity)
+            .map(|_| ClientCertVerified::assertion())
     }
-    fn verify_tls12_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+    fn verify_tls12_signature(
+        &self,
+        m: &[u8],
+        c: &CertificateDer<'_>,
+        d: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
         self.tls12(m, c, d)
     }
-    fn verify_tls13_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+    fn verify_tls13_signature(
+        &self,
+        m: &[u8],
+        c: &CertificateDer<'_>,
+        d: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
         self.tls13(m, c, d)
     }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -192,7 +247,10 @@ impl ClientCertVerifier for Pinned {
 
 /// The relay's host name (or address) in a server URL.
 pub fn relay_host(server: &str) -> Option<String> {
-    let rest = server.trim().split_once("://").map_or(server.trim(), |(_, r)| r);
+    let rest = server
+        .trim()
+        .split_once("://")
+        .map_or(server.trim(), |(_, r)| r);
     let authority = rest.split(['/', '?']).next()?;
     let host = if let Some(v6) = authority.strip_prefix('[') {
         v6.split(']').next()?
@@ -222,7 +280,11 @@ impl DirectEndpoint {
     /// Bind a socket and learn its addresses from the relay's STUN answerer
     /// on `relay_host`:`stun_port` (IPv4), and from `extra` STUN servers
     /// (`host:port`, from the relay's settings) to tell a hard NAT.
-    pub async fn bind(relay_host: &str, stun_port: u16, extra: &[String]) -> Result<DirectEndpoint> {
+    pub async fn bind(
+        relay_host: &str,
+        stun_port: u16,
+        extra: &[String],
+    ) -> Result<DirectEndpoint> {
         let stun = tokio::net::lookup_host((relay_host, stun_port))
             .await
             .context("looking up the relay")?
@@ -230,7 +292,11 @@ impl DirectEndpoint {
             .ok_or_else(|| anyhow!("the relay has no IPv4 address"))?;
         let mut servers = vec![stun];
         for name in extra.iter().take(MAX_EXTRA_STUN) {
-            let found = tokio::time::timeout(Duration::from_secs(1), tokio::net::lookup_host(name.as_str())).await;
+            let found = tokio::time::timeout(
+                Duration::from_secs(1),
+                tokio::net::lookup_host(name.as_str()),
+            )
+            .await;
             if let Ok(Ok(mut found)) = found
                 && let Some(addr) = found.find(SocketAddr::is_ipv4)
                 && !servers.contains(&addr)
@@ -261,42 +327,79 @@ impl DirectEndpoint {
     }
 
     /// An endpoint on `sock` offering `addrs` (tests: loopback only).
-    pub fn with_socket(sock: std::net::UdpSocket, addrs: Vec<SocketAddr>) -> Result<DirectEndpoint> {
+    pub fn with_socket(
+        sock: std::net::UdpSocket,
+        addrs: Vec<SocketAddr>,
+    ) -> Result<DirectEndpoint> {
         let made = rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_string()])?;
         let cert = made.cert.der().clone();
         let key = PrivatePkcs8KeyDer::from(made.key_pair.serialize_der());
-        let endpoint = quinn::Endpoint::new(quinn::EndpointConfig::default(), None, sock, Arc::new(quinn::TokioRuntime))?;
-        Ok(DirectEndpoint { fingerprint: fingerprint(&cert), endpoint, cert, key, addrs, hard_nat: false })
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            sock,
+            Arc::new(quinn::TokioRuntime),
+        )?;
+        Ok(DirectEndpoint {
+            fingerprint: fingerprint(&cert),
+            endpoint,
+            cert,
+            key,
+            addrs,
+            hard_nat: false,
+        })
     }
 
     fn server_config(&self, peer: &str) -> Result<quinn::ServerConfig> {
-        let pinned = Arc::new(Pinned { fingerprint: peer.to_string(), provider: provider() });
+        let pinned = Arc::new(Pinned {
+            fingerprint: peer.to_string(),
+            provider: provider(),
+        });
         let mut tls = rustls::ServerConfig::builder_with_provider(provider())
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .with_client_cert_verifier(pinned)
-            .with_single_cert(vec![self.cert.clone()], PrivateKeyDer::Pkcs8(self.key.clone_key()))?;
+            .with_single_cert(
+                vec![self.cert.clone()],
+                PrivateKeyDer::Pkcs8(self.key.clone_key()),
+            )?;
         tls.alpn_protocols = vec![ALPN.to_vec()];
-        let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(quinn::crypto::rustls::QuicServerConfig::try_from(tls)?));
+        let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(tls)?,
+        ));
         cfg.transport_config(transport());
         Ok(cfg)
     }
 
     fn client_config(&self, peer: &str) -> Result<quinn::ClientConfig> {
-        let pinned = Arc::new(Pinned { fingerprint: peer.to_string(), provider: provider() });
+        let pinned = Arc::new(Pinned {
+            fingerprint: peer.to_string(),
+            provider: provider(),
+        });
         let mut tls = rustls::ClientConfig::builder_with_provider(provider())
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .dangerous()
             .with_custom_certificate_verifier(pinned)
-            .with_client_auth_cert(vec![self.cert.clone()], PrivateKeyDer::Pkcs8(self.key.clone_key()))?;
+            .with_client_auth_cert(
+                vec![self.cert.clone()],
+                PrivateKeyDer::Pkcs8(self.key.clone_key()),
+            )?;
         tls.alpn_protocols = vec![ALPN.to_vec()];
-        let mut cfg = quinn::ClientConfig::new(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(tls)?));
+        let mut cfg = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
+        ));
         cfg.transport_config(transport());
         Ok(cfg)
     }
 
     /// Connect to the peer (fingerprint `peer_fp`, addresses `peer_addrs`).
     /// `viewer`: this side chooses the connection. `None` after `timeout`.
-    pub async fn establish(self, viewer: bool, peer_fp: &str, peer_addrs: &[SocketAddr], timeout: Duration) -> Option<Link> {
+    pub async fn establish(
+        self,
+        viewer: bool,
+        peer_fp: &str,
+        peer_addrs: &[SocketAddr],
+        timeout: Duration,
+    ) -> Option<Link> {
         match tokio::time::timeout(timeout, self.race(viewer, peer_fp, peer_addrs)).await {
             Ok(Ok(link)) => Some(link),
             Ok(Err(e)) => {
@@ -317,7 +420,9 @@ impl DirectEndpoint {
         let (conn_tx, mut conn_rx) = tokio::sync::mpsc::unbounded_channel::<quinn::Connection>();
         let mut tasks = tokio::task::JoinSet::new();
         for &addr in peer_addrs.iter().filter(|a| a.is_ipv4()).take(MAX_ADDRS) {
-            let Ok(connecting) = ep.connect_with(client.clone(), addr, SERVER_NAME) else { continue };
+            let Ok(connecting) = ep.connect_with(client.clone(), addr, SERVER_NAME) else {
+                continue;
+            };
             let tx = conn_tx.clone();
             tasks.spawn(async move {
                 if let Ok(c) = connecting.await {
@@ -340,7 +445,10 @@ impl DirectEndpoint {
         }
         drop(conn_tx);
         let (conn, send, recv) = if viewer {
-            let conn = conn_rx.recv().await.ok_or_else(|| anyhow!("no connection"))?;
+            let conn = conn_rx
+                .recv()
+                .await
+                .ok_or_else(|| anyhow!("no connection"))?;
             let (mut send, mut recv) = conn.open_bi().await?;
             // A stream only shows up on the other side once something is written.
             send.write_all(&[KIND_START, 0, 0, 0, 0]).await?;
@@ -375,7 +483,15 @@ impl DirectEndpoint {
         tasks.abort_all();
         ep.set_server_config(None); // no more connections on this socket
         let remote = conn.remote_address();
-        Ok(Link { tx: LinkTx { send, conn, _endpoint: ep }, rx: LinkRx::start(recv), remote })
+        Ok(Link {
+            tx: LinkTx {
+                send,
+                conn,
+                _endpoint: ep,
+            },
+            rx: LinkRx::start(recv),
+            remote,
+        })
     }
 }
 
@@ -417,7 +533,10 @@ impl LinkRx {
 
     /// The next message (safe to interrupt). An error: the link broke.
     pub async fn recv(&mut self) -> Result<Message> {
-        self.messages.recv().await.unwrap_or_else(|| Err(anyhow!("direct connection closed")))
+        self.messages
+            .recv()
+            .await
+            .unwrap_or_else(|| Err(anyhow!("direct connection closed")))
     }
 }
 
@@ -451,7 +570,11 @@ pub enum Event {
 /// After a failed attempt or a broken connection the viewer tries again
 /// this long later (the last one repeats): the network may have changed
 /// (Wi-Fi back, other network, router restarted).
-pub const RETRY_AFTER: [Duration; 3] = [Duration::from_secs(5), Duration::from_secs(30), Duration::from_secs(120)];
+pub const RETRY_AFTER: [Duration; 3] = [
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+    Duration::from_secs(120),
+];
 
 /// One side's direct-path state during a session. The relay socket stays
 /// the authority (mode switches, end of session) and the fallback: the
@@ -514,17 +637,24 @@ impl DirectState {
         if self.stun.is_some() || stun_port == 0 {
             return;
         }
-        let Some(host) = relay_host(server) else { return };
+        let Some(host) = relay_host(server) else {
+            return;
+        };
         self.stun = Some((host, stun_port, extra));
         self.why_not = Some(LOOKING);
         self.bind();
     }
 
     fn bind(&mut self) {
-        let Some((host, port, extra)) = self.stun.clone() else { return };
+        let Some((host, port, extra)) = self.stun.clone() else {
+            return;
+        };
         let (events, attempt) = (self.events.clone(), self.attempt);
         tokio::spawn(async move {
-            let _ = events.send(Event::Bound(attempt, DirectEndpoint::bind(&host, port, &extra).await));
+            let _ = events.send(Event::Bound(
+                attempt,
+                DirectEndpoint::bind(&host, port, &extra).await,
+            ));
         });
     }
 
@@ -543,9 +673,18 @@ impl DirectState {
             }
         };
         if ep.hard_nat {
-            self.why_not = Some(if self.viewer { "this computer is behind a strict NAT" } else { "the remote computer is behind a strict NAT" });
+            self.why_not = Some(if self.viewer {
+                "this computer is behind a strict NAT"
+            } else {
+                "the remote computer is behind a strict NAT"
+            });
         }
-        let offer = SessionMsg::DirectOffer { fp: ep.fingerprint.clone(), addrs: ep.addrs.clone(), hard_nat: ep.hard_nat, attempt };
+        let offer = SessionMsg::DirectOffer {
+            fp: ep.fingerprint.clone(),
+            addrs: ep.addrs.clone(),
+            hard_nat: ep.hard_nat,
+            attempt,
+        };
         self.mine = Some(ep);
         if self.viewer {
             let events = self.events.clone();
@@ -561,8 +700,15 @@ impl DirectState {
     /// The other side's offer arrived (through the relay). A newer attempt
     /// than ours (the viewer is trying again) ends whatever we had: returns
     /// the switch back to the relay to send, if we were still sending directly.
-    pub fn offer(&mut self, fp: String, mut addrs: Vec<SocketAddr>, hard_nat: bool, attempt: u32) -> Option<SessionMsg> {
-        if self.stun.is_none() || attempt < self.attempt || (attempt > self.attempt && self.viewer) {
+    pub fn offer(
+        &mut self,
+        fp: String,
+        mut addrs: Vec<SocketAddr>,
+        hard_nat: bool,
+        attempt: u32,
+    ) -> Option<SessionMsg> {
+        if self.stun.is_none() || attempt < self.attempt || (attempt > self.attempt && self.viewer)
+        {
             return None; // not allowed, stale, or not ours to start
         }
         let mut back = None;
@@ -575,7 +721,11 @@ impl DirectState {
         }
         addrs.truncate(MAX_ADDRS);
         if hard_nat {
-            self.why_not = Some(if self.viewer { "the remote computer is behind a strict NAT" } else { "the viewer is behind a strict NAT" });
+            self.why_not = Some(if self.viewer {
+                "the remote computer is behind a strict NAT"
+            } else {
+                "the viewer is behind a strict NAT"
+            });
         }
         if self.peer.is_none() && !fp.is_empty() && !addrs.is_empty() {
             self.peer = Some((fp, addrs));
@@ -586,7 +736,11 @@ impl DirectState {
 
     /// Why the session is not on a direct path (`None` while it is).
     pub fn why_not(&self) -> Option<&'static str> {
-        if self.remote().is_some() { None } else { self.why_not }
+        if self.remote().is_some() {
+            None
+        } else {
+            self.why_not
+        }
     }
 
     fn try_establish(&mut self) {
@@ -751,9 +905,15 @@ mod tests {
 
     #[test]
     fn finds_relay_host_and_lan_addresses() {
-        assert_eq!(relay_host("https://rd.example.com"), Some("rd.example.com".into()));
+        assert_eq!(
+            relay_host("https://rd.example.com"),
+            Some("rd.example.com".into())
+        );
         assert_eq!(relay_host("http://10.0.0.5:8470/"), Some("10.0.0.5".into()));
-        assert_eq!(relay_host("wss://[2001:db8::1]:443/ws"), Some("2001:db8::1".into()));
+        assert_eq!(
+            relay_host("wss://[2001:db8::1]:443/ws"),
+            Some("2001:db8::1".into())
+        );
         assert_eq!(relay_host("https://"), None);
         assert!(is_lan("192.168.1.4".parse().unwrap()));
         assert!(is_lan("10.1.2.3".parse().unwrap()));
@@ -767,15 +927,28 @@ mod tests {
         let a = |s: &str| -> SocketAddr { s.parse().unwrap() };
         let lan = Some(a("192.168.1.10:5000"));
         // Relay and public servers agree: easy NAT, LAN + public address.
-        assert_eq!(candidates(lan, &[a("203.0.113.5:6000"), a("203.0.113.5:6000")]), (vec![a("192.168.1.10:5000"), a("203.0.113.5:6000")], false));
+        assert_eq!(
+            candidates(lan, &[a("203.0.113.5:6000"), a("203.0.113.5:6000")]),
+            (vec![a("192.168.1.10:5000"), a("203.0.113.5:6000")], false)
+        );
         // A relay on the same network sees the LAN address: no hard NAT for that.
         assert_eq!(
-            candidates(lan, &[a("192.168.1.10:5000"), a("203.0.113.5:6000"), a("203.0.113.5:6000")]),
+            candidates(
+                lan,
+                &[
+                    a("192.168.1.10:5000"),
+                    a("203.0.113.5:6000"),
+                    a("203.0.113.5:6000")
+                ]
+            ),
             (vec![a("192.168.1.10:5000"), a("203.0.113.5:6000")], false),
             "the public address the internet servers saw is offered too"
         );
         // Internet servers disagree: hard NAT, LAN only.
-        assert_eq!(candidates(lan, &[a("203.0.113.5:6000"), a("203.0.113.5:6001")]), (vec![a("192.168.1.10:5000")], true));
+        assert_eq!(
+            candidates(lan, &[a("203.0.113.5:6000"), a("203.0.113.5:6001")]),
+            (vec![a("192.168.1.10:5000")], true)
+        );
         // Nobody answered: LAN only, not known to be hard.
         assert_eq!(candidates(lan, &[]), (vec![a("192.168.1.10:5000")], false));
         assert_eq!(candidates(None, &[]), (vec![], false));
@@ -784,17 +957,41 @@ mod tests {
     #[tokio::test]
     async fn connects_both_ways_and_carries_messages() {
         let (v, h) = (local(), local());
-        let (vfp, hfp, vaddrs, haddrs) = (v.fingerprint.clone(), h.fingerprint.clone(), v.addrs.clone(), h.addrs.clone());
-        let viewer = tokio::spawn(async move { v.establish(true, &hfp, &haddrs, Duration::from_secs(5)).await });
-        let host = tokio::spawn(async move { h.establish(false, &vfp, &vaddrs, Duration::from_secs(5)).await });
-        let (mut v, mut h) = (viewer.await.unwrap().expect("viewer side"), host.await.unwrap().expect("host side"));
-        v.tx.send(&Message::Text(r#"{"t":"refresh"}"#.into())).await.unwrap();
+        let (vfp, hfp, vaddrs, haddrs) = (
+            v.fingerprint.clone(),
+            h.fingerprint.clone(),
+            v.addrs.clone(),
+            h.addrs.clone(),
+        );
+        let viewer = tokio::spawn(async move {
+            v.establish(true, &hfp, &haddrs, Duration::from_secs(5))
+                .await
+        });
+        let host = tokio::spawn(async move {
+            h.establish(false, &vfp, &vaddrs, Duration::from_secs(5))
+                .await
+        });
+        let (mut v, mut h) = (
+            viewer.await.unwrap().expect("viewer side"),
+            host.await.unwrap().expect("host side"),
+        );
+        v.tx.send(&Message::Text(r#"{"t":"refresh"}"#.into()))
+            .await
+            .unwrap();
         let big: Vec<u8> = (0..3_000_000u32).map(|i| i as u8).collect();
-        h.tx.send(&Message::Binary(big.clone().into())).await.unwrap();
-        assert_eq!(h.rx.recv().await.unwrap(), Message::Text(r#"{"t":"refresh"}"#.into()));
+        h.tx.send(&Message::Binary(big.clone().into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            h.rx.recv().await.unwrap(),
+            Message::Text(r#"{"t":"refresh"}"#.into())
+        );
         assert_eq!(v.rx.recv().await.unwrap(), Message::Binary(big.into()));
         v.tx.close();
-        assert!(h.rx.recv().await.is_err(), "closing ends the other side too");
+        assert!(
+            h.rx.recv().await.is_err(),
+            "closing ends the other side too"
+        );
     }
 
     /// Reading must survive being interrupted: in the session loops the
@@ -804,9 +1001,20 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reading_survives_interruptions_mid_frame() {
         let (v, h) = (local(), local());
-        let (vfp, hfp, vaddrs, haddrs) = (v.fingerprint.clone(), h.fingerprint.clone(), v.addrs.clone(), h.addrs.clone());
-        let viewer = tokio::spawn(async move { v.establish(true, &hfp, &haddrs, Duration::from_secs(5)).await });
-        let host = tokio::spawn(async move { h.establish(false, &vfp, &vaddrs, Duration::from_secs(5)).await });
+        let (vfp, hfp, vaddrs, haddrs) = (
+            v.fingerprint.clone(),
+            h.fingerprint.clone(),
+            v.addrs.clone(),
+            h.addrs.clone(),
+        );
+        let viewer = tokio::spawn(async move {
+            v.establish(true, &hfp, &haddrs, Duration::from_secs(5))
+                .await
+        });
+        let host = tokio::spawn(async move {
+            h.establish(false, &vfp, &vaddrs, Duration::from_secs(5))
+                .await
+        });
         let (mut v, mut h) = (viewer.await.unwrap().unwrap(), host.await.unwrap().unwrap());
         const N: usize = 40;
         let sender = tokio::spawn(async move {
@@ -838,8 +1046,19 @@ mod tests {
         let (hfp, haddrs) = (h.fingerprint.clone(), h.addrs.clone());
         let vaddrs = v.addrs.clone();
         // The host expects `stranger`, but the viewer connects.
-        let host = tokio::spawn(async move { h.establish(false, &stranger.fingerprint, &vaddrs, Duration::from_secs(2)).await });
-        let viewer = tokio::spawn(async move { v.establish(true, &hfp, &haddrs, Duration::from_secs(2)).await });
+        let host = tokio::spawn(async move {
+            h.establish(
+                false,
+                &stranger.fingerprint,
+                &vaddrs,
+                Duration::from_secs(2),
+            )
+            .await
+        });
+        let viewer = tokio::spawn(async move {
+            v.establish(true, &hfp, &haddrs, Duration::from_secs(2))
+                .await
+        });
         assert!(host.await.unwrap().is_none());
         assert!(viewer.await.unwrap().is_none());
     }
@@ -854,7 +1073,12 @@ mod tests {
     /// for the relay, if any.
     fn deliver(to: &mut DirectState, msg: SessionMsg) -> Option<SessionMsg> {
         match msg {
-            SessionMsg::DirectOffer { fp, addrs, hard_nat, attempt } => to.offer(fp, addrs, hard_nat, attempt),
+            SessionMsg::DirectOffer {
+                fp,
+                addrs,
+                hard_nat,
+                attempt,
+            } => to.offer(fp, addrs, hard_nat, attempt),
             SessionMsg::PathSwitch { direct } => to.peer_switched(direct),
             _ => None,
         }
@@ -869,7 +1093,11 @@ mod tests {
                     Some(e) = v.ev.recv() => (e, true),
                     Some(e) = h.ev.recv() => (e, false),
                 };
-                let (me, other) = if from_viewer { (&mut v.st, &mut h.st) } else { (&mut h.st, &mut v.st) };
+                let (me, other) = if from_viewer {
+                    (&mut v.st, &mut h.st)
+                } else {
+                    (&mut h.st, &mut v.st)
+                };
                 let mut say = match ev {
                     Event::Bound(n, ep) => me.bound(n, ep),
                     Event::Linked(n, l) => me.linked(n, l),
@@ -885,7 +1113,11 @@ mod tests {
                 // Messages bounce until nobody has anything more to say.
                 let mut to_other = true;
                 while let Some(m) = say {
-                    say = if to_other { deliver(other, m) } else { deliver(me, m) };
+                    say = if to_other {
+                        deliver(other, m)
+                    } else {
+                        deliver(me, m)
+                    };
                     to_other = !to_other;
                 }
             }
@@ -917,7 +1149,10 @@ mod tests {
         pump(&mut v, &mut h, both_direct).await;
         assert!(v.st.why_not().is_none());
         let pic = Message::Binary(vec![1, 2, 3].into());
-        assert!(h.st.send(pic.clone()).await.is_empty(), "sent directly, nothing for the relay");
+        assert!(
+            h.st.send(pic.clone()).await.is_empty(),
+            "sent directly, nothing for the relay"
+        );
         assert_eq!(v.st.recv().await.unwrap(), pic);
     }
 
@@ -929,23 +1164,47 @@ mod tests {
 
         // The host's side notices first (its write failed, or it lost the connection).
         let back = h.st.broken();
-        assert_eq!(back, Some(SessionMsg::PathSwitch { direct: false }), "tells the viewer through the relay");
+        assert_eq!(
+            back,
+            Some(SessionMsg::PathSwitch { direct: false }),
+            "tells the viewer through the relay"
+        );
         assert_eq!(h.st.broken(), None, "only once");
-        assert_eq!(h.st.send(pic.clone()).await, vec![pic.clone()], "now everything goes on the relay");
+        assert_eq!(
+            h.st.send(pic.clone()).await,
+            vec![pic.clone()],
+            "now everything goes on the relay"
+        );
         // The viewer's direct path ends at once (the host closed it)...
-        assert!(tokio::time::timeout(Duration::from_secs(2), v.st.recv()).await.expect("noticed quickly").is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), v.st.recv())
+                .await
+                .expect("noticed quickly")
+                .is_err()
+        );
         // ... and with the host's switch (through the relay) its sending falls back too.
-        assert_eq!(deliver(&mut v.st, back.unwrap()), Some(SessionMsg::PathSwitch { direct: false }));
+        assert_eq!(
+            deliver(&mut v.st, back.unwrap()),
+            Some(SessionMsg::PathSwitch { direct: false })
+        );
         assert_eq!(v.st.send(pic.clone()).await, vec![pic.clone()]);
         assert_eq!(v.st.why_not(), Some("the direct connection broke"));
         // With nothing to read directly, `recv` waits forever (the relay is read instead).
-        assert!(tokio::time::timeout(Duration::from_millis(100), v.st.recv()).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), v.st.recv())
+                .await
+                .is_err()
+        );
 
         // The viewer tries again a little later; the host follows its new offer.
         pump(&mut v, &mut h, both_direct).await;
         assert_eq!((v.st.attempt, h.st.attempt), (1, 1));
         assert!(v.st.send(pic.clone()).await.is_empty());
-        assert_eq!(h.st.recv().await.unwrap(), pic, "the new connection carries messages");
+        assert_eq!(
+            h.st.recv().await.unwrap(),
+            pic,
+            "the new connection carries messages"
+        );
     }
 
     #[tokio::test]
@@ -962,20 +1221,37 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert_eq!(relay, vec![json(&SessionMsg::PathSwitch { direct: false }), pic], "switch marker first, then the message, on the relay");
+        assert_eq!(
+            relay,
+            vec![json(&SessionMsg::PathSwitch { direct: false }), pic],
+            "switch marker first, then the message, on the relay"
+        );
         assert!(v.st.remote().is_none());
     }
 
     #[tokio::test]
     async fn a_failed_attempt_is_tried_again() {
         let (mut v, _h) = pair().await;
-        let Some(Event::Bound(0, ep)) = v.ev.recv().await else { panic!() };
+        let Some(Event::Bound(0, ep)) = v.ev.recv().await else {
+            panic!()
+        };
         assert!(v.st.bound(0, ep).is_some());
-        assert_eq!(v.st.linked(0, None), None, "no connection: nothing to switch");
-        assert_eq!(v.st.why_not(), Some("no direct path found (firewall or NAT)"));
-        let Some(Event::Retry(0)) = v.ev.recv().await else { panic!("a retry is due") };
+        assert_eq!(
+            v.st.linked(0, None),
+            None,
+            "no connection: nothing to switch"
+        );
+        assert_eq!(
+            v.st.why_not(),
+            Some("no direct path found (firewall or NAT)")
+        );
+        let Some(Event::Retry(0)) = v.ev.recv().await else {
+            panic!("a retry is due")
+        };
         v.st.retry(0);
-        let Some(Event::Bound(1, _)) = v.ev.recv().await else { panic!("attempt 1 binds a new socket") };
+        let Some(Event::Bound(1, _)) = v.ev.recv().await else {
+            panic!("attempt 1 binds a new socket")
+        };
         // Late news about attempt 0 changes nothing.
         assert_eq!(v.st.linked(0, None), None);
         assert_eq!(v.st.attempt, 1);
@@ -986,11 +1262,16 @@ mod tests {
     #[tokio::test]
     async fn an_old_helper_that_never_answers_is_named() {
         let (mut v, _h) = pair().await; // the host's offers never reach the viewer
-        let Some(Event::Bound(0, ep)) = v.ev.recv().await else { panic!() };
+        let Some(Event::Bound(0, ep)) = v.ev.recv().await else {
+            panic!()
+        };
         assert!(v.st.bound(0, ep).is_some());
         assert_eq!(v.st.why_not(), Some(LOOKING));
         v.st.no_answer(0);
-        assert_eq!(v.st.why_not(), Some("the remote computer's helper is too old for direct connections"));
+        assert_eq!(
+            v.st.why_not(),
+            Some("the remote computer's helper is too old for direct connections")
+        );
         assert_eq!(v.st.attempt, 0, "no point trying again");
         // An answer that did come makes it a non-event.
         let (mut w, mut hh) = pair().await;
@@ -1002,7 +1283,14 @@ mod tests {
     #[tokio::test]
     async fn only_the_viewer_starts_new_attempts() {
         let (mut v, mut h) = pair().await;
-        let offer = |attempt| ("ab".to_string(), vec!["127.0.0.1:9".parse().unwrap()], false, attempt);
+        let offer = |attempt| {
+            (
+                "ab".to_string(),
+                vec!["127.0.0.1:9".parse().unwrap()],
+                false,
+                attempt,
+            )
+        };
         let (fp, addrs, hard, _) = offer(5);
         assert_eq!(v.st.offer(fp, addrs, hard, 5), None);
         assert_eq!(v.st.attempt, 0, "a host can't make the viewer start over");
@@ -1025,21 +1313,43 @@ mod tests {
     async fn the_other_side_going_back_to_the_relay_ends_ours_too() {
         let (mut v, mut h) = pair().await;
         pump(&mut v, &mut h, both_direct).await;
-        assert_eq!(v.st.peer_switched(false), Some(SessionMsg::PathSwitch { direct: false }));
+        assert_eq!(
+            v.st.peer_switched(false),
+            Some(SessionMsg::PathSwitch { direct: false })
+        );
         let m = Message::Text("x".into());
         assert_eq!(v.st.send(m.clone()).await, vec![m]);
-        assert!(tokio::time::timeout(Duration::from_secs(2), h.st.recv()).await.unwrap().is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), h.st.recv())
+                .await
+                .unwrap()
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn says_why_there_is_no_direct_path() {
         let (mut v, _e) = DirectState::new(true);
         assert_eq!(v.why_not(), Some("the server allows no direct connections"));
-        assert_eq!(v.offer("ab".into(), vec!["203.0.113.1:5".parse().unwrap()], false, 0), None);
-        assert!(v.peer.is_none(), "offers are ignored unless the relay allowed direct connections");
+        assert_eq!(
+            v.offer(
+                "ab".into(),
+                vec!["203.0.113.1:5".parse().unwrap()],
+                false,
+                0
+            ),
+            None
+        );
+        assert!(
+            v.peer.is_none(),
+            "offers are ignored unless the relay allowed direct connections"
+        );
         let (mut v, _w) = pair().await;
         v.st.offer("ab".into(), vec!["203.0.113.1:5".parse().unwrap()], true, 0);
-        assert_eq!(v.st.why_not(), Some("the remote computer is behind a strict NAT"));
+        assert_eq!(
+            v.st.why_not(),
+            Some("the remote computer is behind a strict NAT")
+        );
         assert_eq!(v.st.bound(0, Err(anyhow!("udp blocked"))), None);
         assert_eq!(v.st.why_not(), Some("no UDP connection to the server"));
     }
@@ -1050,7 +1360,11 @@ mod tests {
         let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = silent.local_addr().unwrap();
         let t = std::time::Instant::now();
-        assert!(v.establish(true, "00", &[addr], Duration::from_millis(500)).await.is_none());
+        assert!(
+            v.establish(true, "00", &[addr], Duration::from_millis(500))
+                .await
+                .is_none()
+        );
         assert!(t.elapsed() < Duration::from_secs(2));
     }
 }

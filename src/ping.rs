@@ -86,7 +86,8 @@ pub fn render(t: f32, radius: u32) -> Vec<u32> {
             }
             if a > 0.0 {
                 let b = |v: f32| (v.round() as u32).min(255);
-                out[(y * size + x) as usize] = b(a * 255.0) << 24 | b(c[0]) << 16 | b(c[1]) << 8 | b(c[2]);
+                out[(y * size + x) as usize] =
+                    b(a * 255.0) << 24 | b(c[0]) << 16 | b(c[1]) << 8 | b(c[2]);
             }
         }
     }
@@ -101,11 +102,13 @@ pub fn progress(elapsed: Duration) -> f32 {
 /// Show a ping centred on (`x`, `y`) virtual-desktop pixels. Returns at
 /// once: the effect runs on its own thread and cleans up after itself.
 pub fn show(x: i32, y: i32, radius: u32) {
-    let spawned = std::thread::Builder::new().name("ping".into()).spawn(move || {
-        if let Err(e) = overlay(x, y, radius) {
-            log::warn!("ping: {e}");
-        }
-    });
+    let spawned = std::thread::Builder::new()
+        .name("ping".into())
+        .spawn(move || {
+            if let Err(e) = overlay(x, y, radius) {
+                log::warn!("ping: {e}");
+            }
+        });
     if let Err(e) = spawned {
         log::warn!("ping: {e}");
     }
@@ -120,7 +123,8 @@ fn animate(mut frame: impl FnMut(f32) -> anyhow::Result<()>) -> anyhow::Result<(
             return Ok(());
         }
         frame(t)?;
-        let next = start + FRAME.mul_f32(((start.elapsed().as_secs_f32() / FRAME.as_secs_f32()).floor()) + 1.0);
+        let next = start
+            + FRAME.mul_f32(((start.elapsed().as_secs_f32() / FRAME.as_secs_f32()).floor()) + 1.0);
         std::thread::sleep(next.saturating_duration_since(Instant::now()));
     }
 }
@@ -148,15 +152,33 @@ fn overlay(x: i32, y: i32, radius: u32) -> anyhow::Result<()> {
         .flat_map(|d| d.visuals.iter())
         .find(|v| v.class == VisualClass::TRUE_COLOR)
         .map(|v| v.visual_id);
-    let cm = conn.intern_atom(false, format!("_NET_WM_CM_S{n}").as_bytes())?.reply()?.atom;
+    let cm = conn
+        .intern_atom(false, format!("_NET_WM_CM_S{n}").as_bytes())?
+        .reply()?
+        .atom;
     let composited = conn.get_selection_owner(cm)?.reply()?.owner != x11rb::NONE;
     let win = conn.generate_id()?;
-    let aux = CreateWindowAux::new().override_redirect(1).border_pixel(0).background_pixel(0);
+    let aux = CreateWindowAux::new()
+        .override_redirect(1)
+        .border_pixel(0)
+        .background_pixel(0);
     let alpha = match argb {
         Some(visual) if composited => {
             let cmap = conn.generate_id()?;
             conn.create_colormap(ColormapAlloc::NONE, cmap, screen.root, visual)?;
-            conn.create_window(32, win, screen.root, left, top, size, size, 0, WindowClass::INPUT_OUTPUT, visual, &aux.colormap(cmap))?;
+            conn.create_window(
+                32,
+                win,
+                screen.root,
+                left,
+                top,
+                size,
+                size,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                visual,
+                &aux.colormap(cmap),
+            )?;
             true
         }
         _ => {
@@ -173,7 +195,15 @@ fn overlay(x: i32, y: i32, radius: u32) -> anyhow::Result<()> {
                 x11rb::COPY_FROM_PARENT,
                 &aux,
             )?;
-            conn.shape_rectangles(shape::SO::SET, shape::SK::BOUNDING, ClipOrdering::UNSORTED, win, 0, 0, &[])?;
+            conn.shape_rectangles(
+                shape::SO::SET,
+                shape::SK::BOUNDING,
+                ClipOrdering::UNSORTED,
+                win,
+                0,
+                0,
+                &[],
+            )?;
             false
         }
     };
@@ -196,13 +226,36 @@ fn overlay(x: i32, y: i32, radius: u32) -> anyhow::Result<()> {
             // Without transparency: the effect's colour at full strength where
             // it is clearly visible, nothing elsewhere.
             let p = if alpha { p } else { unpremultiply(p) };
-            bytes.extend_from_slice(&if msb { p.to_be_bytes() } else { p.to_le_bytes() });
+            bytes.extend_from_slice(&if msb {
+                p.to_be_bytes()
+            } else {
+                p.to_le_bytes()
+            });
         }
         if !alpha {
             let rects = shape_runs(&px, 2 * radius, 0x60);
-            conn.shape_rectangles(shape::SO::SET, shape::SK::BOUNDING, ClipOrdering::Y_SORTED, win, 0, 0, &rects)?;
+            conn.shape_rectangles(
+                shape::SO::SET,
+                shape::SK::BOUNDING,
+                ClipOrdering::Y_SORTED,
+                win,
+                0,
+                0,
+                &rects,
+            )?;
         }
-        conn.put_image(ImageFormat::Z_PIXMAP, win, gc, size, size, 0, 0, 0, depth, &bytes)?;
+        conn.put_image(
+            ImageFormat::Z_PIXMAP,
+            win,
+            gc,
+            size,
+            size,
+            0,
+            0,
+            0,
+            depth,
+            &bytes,
+        )?;
         conn.configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
         conn.sync()?;
         Ok(())
@@ -226,7 +279,12 @@ fn shape_runs(px: &[u32], size: u32, min: u32) -> Vec<x11rb::protocol::xproto::R
                 while x < size && row[x as usize] >> 24 >= min {
                     x += 1;
                 }
-                out.push(x11rb::protocol::xproto::Rectangle { x: start as i16, y: y as i16, width: (x - start) as u16, height: 1 });
+                out.push(x11rb::protocol::xproto::Rectangle {
+                    x: start as i16,
+                    y: y as i16,
+                    width: (x - start) as u16,
+                    height: 1,
+                });
             } else {
                 x += 1;
             }
@@ -301,7 +359,11 @@ fn overlay(x: i32, y: i32, radius: u32) -> anyhow::Result<()> {
         bmi.bmiHeader.biCompression = BI_RGB;
         let mut bits: *mut core::ffi::c_void = null_mut();
         let bmp = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
-        let old = if bmp.is_null() { null_mut() } else { SelectObject(dc, bmp as HGDIOBJ) };
+        let old = if bmp.is_null() {
+            null_mut()
+        } else {
+            SelectObject(dc, bmp as HGDIOBJ)
+        };
         let mut shown = false;
         let result = if bmp.is_null() || bits.is_null() {
             Err(anyhow::anyhow!("cannot create the ping picture"))
@@ -311,16 +373,32 @@ fn overlay(x: i32, y: i32, radius: u32) -> anyhow::Result<()> {
                 // with per-pixel alpha wants (BGRA bytes).
                 let px = render(t, radius);
                 std::ptr::copy_nonoverlapping(px.as_ptr(), bits as *mut u32, px.len());
-                let pos = POINT { x: x - radius as i32, y: y - radius as i32 };
+                let pos = POINT {
+                    x: x - radius as i32,
+                    y: y - radius as i32,
+                };
                 let sz = SIZE { cx: size, cy: size };
                 let src = POINT { x: 0, y: 0 };
-                let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
+                let blend = BLENDFUNCTION {
+                    BlendOp: AC_SRC_OVER as u8,
+                    BlendFlags: 0,
+                    SourceConstantAlpha: 255,
+                    AlphaFormat: AC_SRC_ALPHA as u8,
+                };
                 UpdateLayeredWindow(hwnd, screen, &pos, &sz, dc, &src, 0, &blend, ULW_ALPHA);
                 if !shown {
                     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                     shown = true;
                 }
-                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
                 let mut msg: MSG = zeroed();
                 while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
                     TranslateMessage(&msg);
@@ -370,7 +448,16 @@ pub fn draw_into(frame: &mut crate::codec::Frame, cx: i32, cy: i32, radius: u32,
             }
             let under = frame.pixel(fx as u32, fy as u32);
             let mix = |src: u32, dst: u8| (src + dst as u32 * (255 - a) / 255).min(255) as u8;
-            frame.set_pixel(fx as u32, fy as u32, [mix((p >> 16) & 0xff, under[0]), mix((p >> 8) & 0xff, under[1]), mix(p & 0xff, under[2]), 255]);
+            frame.set_pixel(
+                fx as u32,
+                fy as u32,
+                [
+                    mix((p >> 16) & 0xff, under[0]),
+                    mix((p >> 8) & 0xff, under[1]),
+                    mix(p & 0xff, under[2]),
+                    255,
+                ],
+            );
         }
     }
 }
@@ -390,7 +477,10 @@ mod tests {
         assert_eq!(alpha(&start, r, r, r), 255, "the dot is solid at the click");
         assert_eq!(alpha(&start, r, 0, 0), 0, "corners stay clear");
         let end = render(0.999, r);
-        assert!(end.iter().all(|p| p >> 24 < 8), "nearly invisible at the end");
+        assert!(
+            end.iter().all(|p| p >> 24 < 8),
+            "nearly invisible at the end"
+        );
     }
 
     #[test]
@@ -399,13 +489,26 @@ mod tests {
         // Farthest visible pixel along the row through the centre.
         let reach = |t: f32| {
             let px = render(t, r);
-            (r..2 * r).rev().find(|&x| alpha(&px, r, x, r) > 20).map(|x| x - r).unwrap_or(0)
+            (r..2 * r)
+                .rev()
+                .find(|&x| alpha(&px, r, x, r) > 20)
+                .map(|x| x - r)
+                .unwrap_or(0)
         };
         let strongest = |t: f32| {
             let px = render(t, r);
-            ((r + 20)..2 * r).map(|x| alpha(&px, r, x, r)).max().unwrap_or(0)
+            ((r + 20)..2 * r)
+                .map(|x| alpha(&px, r, x, r))
+                .max()
+                .unwrap_or(0)
         };
-        assert!(reach(0.1) < reach(0.3) && reach(0.3) < reach(0.5), "{} {} {}", reach(0.1), reach(0.3), reach(0.5));
+        assert!(
+            reach(0.1) < reach(0.3) && reach(0.3) < reach(0.5),
+            "{} {} {}",
+            reach(0.1),
+            reach(0.3),
+            reach(0.5)
+        );
         assert!(reach(0.5) < r);
         assert!(strongest(0.3) > strongest(0.85));
     }
@@ -431,18 +534,33 @@ mod tests {
         let mons = d.monitors().unwrap();
         let m = mons[0].clone();
         let (cx, cy) = (m.width / 2, m.height / 2);
-        d.input(&mons, &crate::proto::InputEvent::Ping { mon: m.index, x: 0.5, y: 0.5 }).unwrap();
+        d.input(
+            &mons,
+            &crate::proto::InputEvent::Ping {
+                mon: m.index,
+                x: 0.5,
+                y: 0.5,
+            },
+        )
+        .unwrap();
         std::thread::sleep(Duration::from_millis(250));
         let during = d.capture(&m).unwrap();
         if let Ok(dir) = std::env::var("FARLINK_PING_SHOT") {
             let crop = |f: &crate::codec::Frame| {
                 let r = radius_for(&m);
-                image::RgbaImage::from_fn(2 * r, 2 * r, |x, y| image::Rgba(f.pixel(cx - r + x, cy - r + y)))
+                image::RgbaImage::from_fn(2 * r, 2 * r, |x, y| {
+                    image::Rgba(f.pixel(cx - r + x, cy - r + y))
+                })
             };
-            crop(&during).save(format!("{dir}/ping-during.png")).unwrap();
+            crop(&during)
+                .save(format!("{dir}/ping-during.png"))
+                .unwrap();
         }
         let c = during.pixel(cx, cy);
-        assert!(c[0] > 200 && c[1] < 120 && c[2] < 120, "red dot at the centre, got {c:?}");
+        assert!(
+            c[0] > 200 && c[1] < 120 && c[2] < 120,
+            "red dot at the centre, got {c:?}"
+        );
         std::thread::sleep(DURATION);
         let after = d.capture(&m).unwrap();
         assert_ne!(after.pixel(cx, cy), c, "gone afterwards");
@@ -457,7 +575,10 @@ mod tests {
         let runs = shape_runs(&px, 3, 0x60);
         let got: Vec<_> = runs.iter().map(|r| (r.x, r.y, r.width, r.height)).collect();
         assert_eq!(got, vec![(0, 0, 1, 1), (2, 0, 1, 1), (1, 2, 2, 1)]);
-        assert!(shape_runs(&render(0.999, 50), 100, 0x60).is_empty(), "nothing left at the end");
+        assert!(
+            shape_runs(&render(0.999, 50), 100, 0x60).is_empty(),
+            "nothing left at the end"
+        );
         assert!(!shape_runs(&render(0.2, 50), 100, 0x60).is_empty());
     }
 
@@ -470,7 +591,15 @@ mod tests {
 
     #[test]
     fn sizes_follow_the_screen_within_limits() {
-        let m = |h| MonitorInfo { index: 0, name: String::new(), x: 0, y: 0, width: h * 16 / 9, height: h, primary: true };
+        let m = |h| MonitorInfo {
+            index: 0,
+            name: String::new(),
+            x: 0,
+            y: 0,
+            width: h * 16 / 9,
+            height: h,
+            primary: true,
+        };
         assert_eq!(radius_for(&m(1080)), 118);
         assert_eq!(radius_for(&m(480)), 80, "never tiny");
         assert_eq!(radius_for(&m(4320)), 220, "never huge");
@@ -481,7 +610,10 @@ mod tests {
         let mut f = crate::codec::Frame::new(50, 40);
         draw_into(&mut f, 0, 0, 30, 0.0);
         let c = f.pixel(0, 0);
-        assert!(c[0] > 200 && c[1] < 120, "dot drawn at the corner, got {c:?}");
+        assert!(
+            c[0] > 200 && c[1] < 120,
+            "dot drawn at the corner, got {c:?}"
+        );
         draw_into(&mut f, -500, 900, 30, 0.3); // fully outside: no panic
         assert_eq!(f.rgba.len(), 50 * 40 * 4);
     }
@@ -489,7 +621,10 @@ mod tests {
     #[test]
     fn placed_on_the_right_monitor_and_sized_for_it() {
         let t = crate::desktop::TestPattern::dual();
-        assert_eq!(place(&t.monitors, 1, 0.5, 0.5), Some((1600 + 640, 512, 112)));
+        assert_eq!(
+            place(&t.monitors, 1, 0.5, 0.5),
+            Some((1600 + 640, 512, 112))
+        );
         assert_eq!(place(&t.monitors, 7, 0.5, 0.5), None);
     }
 }

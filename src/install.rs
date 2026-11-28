@@ -15,20 +15,42 @@ pub enum Step {
     /// Copy the running program to this path.
     CopySelf(PathBuf),
     /// Copy a folder (e.g. published releases) if it exists.
-    CopyDir { from: PathBuf, to: PathBuf },
-    WriteFile { path: PathBuf, contents: String, mode: Option<u32> },
+    CopyDir {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    WriteFile {
+        path: PathBuf,
+        contents: String,
+        mode: Option<u32>,
+    },
     /// Add `line` to the file unless it is already there.
-    EnsureLine { path: PathBuf, line: String },
-    Run { program: String, args: Vec<String>, ignore_failure: bool },
+    EnsureLine {
+        path: PathBuf,
+        line: String,
+    },
+    Run {
+        program: String,
+        args: Vec<String>,
+        ignore_failure: bool,
+    },
     Note(String),
 }
 
 impl Step {
     fn run(program: &str, args: &[&str]) -> Step {
-        Step::Run { program: program.into(), args: args.iter().map(|s| s.to_string()).collect(), ignore_failure: false }
+        Step::Run {
+            program: program.into(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            ignore_failure: false,
+        }
     }
     fn try_run(program: &str, args: &[&str]) -> Step {
-        Step::Run { program: program.into(), args: args.iter().map(|s| s.to_string()).collect(), ignore_failure: true }
+        Step::Run {
+            program: program.into(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            ignore_failure: true,
+        }
     }
 
     pub fn describe(&self) -> String {
@@ -37,9 +59,19 @@ impl Step {
             Step::CopySelf(p) => format!("copy program to {}", p.display()),
             Step::CopyDir { from, to } => format!("copy {} to {}", from.display(), to.display()),
             Step::WriteFile { path, .. } => format!("write {}", path.display()),
-            Step::EnsureLine { path, line } => format!("make sure {} contains `{line}`", path.display()),
-            Step::Run { program, args, ignore_failure } => {
-                format!("run {program} {}{}", args.join(" "), if *ignore_failure { "  (may fail)" } else { "" })
+            Step::EnsureLine { path, line } => {
+                format!("make sure {} contains `{line}`", path.display())
+            }
+            Step::Run {
+                program,
+                args,
+                ignore_failure,
+            } => {
+                format!(
+                    "run {program} {}{}",
+                    args.join(" "),
+                    if *ignore_failure { "  (may fail)" } else { "" }
+                )
             }
             Step::Note(n) => format!("note: {n}"),
         }
@@ -63,7 +95,12 @@ fn host_json(server: &str, token: &str) -> String {
 /// The host runs as a SYSTEM service that starts the screen helper inside the
 /// active console session, so the lock screen, sign-in screen and UAC prompts
 /// can be seen and controlled.
-pub fn host_windows_plan(server: &str, token: &str, program_files: &Path, program_data: &Path) -> Vec<Step> {
+pub fn host_windows_plan(
+    server: &str,
+    token: &str,
+    program_files: &Path,
+    program_data: &Path,
+) -> Vec<Step> {
     let dir = program_files.join("Farlink");
     let exe = dir.join("farlink-host.exe");
     let exe_s = exe.display().to_string();
@@ -79,47 +116,129 @@ pub fn host_windows_plan(server: &str, token: &str, program_files: &Path, progra
         Step::Mkdir(dir.clone()),
         Step::CopySelf(exe.clone()),
         Step::Mkdir(data.clone()),
-        Step::WriteFile { path: data.join("host.json"), contents: host_json(server, token), mode: None },
+        Step::WriteFile {
+            path: data.join("host.json"),
+            contents: host_json(server, token),
+            mode: None,
+        },
         // Only SYSTEM and Administrators may read the machine key.
         Step::try_run(
             "icacls.exe",
-            &[&data_s, "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "/grant:r", "*S-1-5-32-544:(OI)(CI)F"],
+            &[
+                &data_s,
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-18:(OI)(CI)F",
+                "/grant:r",
+                "*S-1-5-32-544:(OI)(CI)F",
+            ],
         ),
         // Firewall: allow the program in both directions (idempotent).
-        Step::try_run("netsh.exe", &["advfirewall", "firewall", "delete", "rule", &format!("name={FIREWALL_RULE}")]),
-        Step::run(
+        Step::try_run(
             "netsh.exe",
             &[
-                "advfirewall", "firewall", "add", "rule", &format!("name={FIREWALL_RULE}"), "dir=out", "action=allow",
-                &format!("program={exe_s}"), "enable=yes", "profile=any",
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
+                &format!("name={FIREWALL_RULE}"),
             ],
         ),
         Step::run(
             "netsh.exe",
             &[
-                "advfirewall", "firewall", "add", "rule", &format!("name={FIREWALL_RULE}"), "dir=in", "action=allow",
-                &format!("program={exe_s}"), "enable=yes", "profile=any",
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                &format!("name={FIREWALL_RULE}"),
+                "dir=out",
+                "action=allow",
+                &format!("program={exe_s}"),
+                "enable=yes",
+                "profile=any",
+            ],
+        ),
+        Step::run(
+            "netsh.exe",
+            &[
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                &format!("name={FIREWALL_RULE}"),
+                "dir=in",
+                "action=allow",
+                &format!("program={exe_s}"),
+                "enable=yes",
+                "profile=any",
             ],
         ),
         // Allow a service to send Ctrl+Alt+Del (SendSAS).
         Step::run(
             "reg.exe",
             &[
-                "add", r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System", "/v", "SoftwareSASGeneration",
-                "/t", "REG_DWORD", "/d", "1", "/f",
+                "add",
+                r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
+                "/v",
+                "SoftwareSASGeneration",
+                "/t",
+                "REG_DWORD",
+                "/d",
+                "1",
+                "/f",
             ],
         ),
         Step::try_run(
             "sc.exe",
-            &["create", WIN_SERVICE, "binPath=", &bin_path, "start=", "auto", "DisplayName=", WIN_SERVICE_DISPLAY],
+            &[
+                "create",
+                WIN_SERVICE,
+                "binPath=",
+                &bin_path,
+                "start=",
+                "auto",
+                "DisplayName=",
+                WIN_SERVICE_DISPLAY,
+            ],
         ),
-        Step::run("sc.exe", &["config", WIN_SERVICE, "binPath=", &bin_path, "start=", "auto"]),
-        Step::try_run("sc.exe", &["description", WIN_SERVICE, "Lets your Farlink server show and control this computer."]),
+        Step::run(
+            "sc.exe",
+            &[
+                "config",
+                WIN_SERVICE,
+                "binPath=",
+                &bin_path,
+                "start=",
+                "auto",
+            ],
+        ),
+        Step::try_run(
+            "sc.exe",
+            &[
+                "description",
+                WIN_SERVICE,
+                "Lets your Farlink server show and control this computer.",
+            ],
+        ),
         // Restart automatically (also used after background updates).
-        Step::run("sc.exe", &["failure", WIN_SERVICE, "reset=", "86400", "actions=", "restart/3000/restart/3000/restart/3000"]),
+        Step::run(
+            "sc.exe",
+            &[
+                "failure",
+                WIN_SERVICE,
+                "reset=",
+                "86400",
+                "actions=",
+                "restart/3000/restart/3000/restart/3000",
+            ],
+        ),
         Step::try_run("sc.exe", &["failureflag", WIN_SERVICE, "1"]),
         Step::run("sc.exe", &["start", WIN_SERVICE]),
-        Step::Note("Installed. This computer will appear in your Farlink list within a few seconds.".into()),
+        Step::Note(
+            "Installed. This computer will appear in your Farlink list within a few seconds."
+                .into(),
+        ),
     ]
 }
 
@@ -127,15 +246,31 @@ pub fn host_windows_plan(server: &str, token: &str, program_files: &Path, progra
 fn defender_exclusion(cmdlet: &str, dir: &Path, data: &Path) -> Step {
     let q = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "''"));
     let cmd = format!("{cmdlet} -ExclusionPath {},{}", q(dir), q(data));
-    Step::try_run("powershell.exe", &["-NoProfile", "-NonInteractive", "-Command", &cmd])
+    Step::try_run(
+        "powershell.exe",
+        &["-NoProfile", "-NonInteractive", "-Command", &cmd],
+    )
 }
 
 pub fn host_windows_uninstall_plan(program_files: &Path, program_data: &Path) -> Vec<Step> {
     vec![
         Step::try_run("sc.exe", &["stop", WIN_SERVICE]),
         Step::try_run("sc.exe", &["delete", WIN_SERVICE]),
-        Step::try_run("netsh.exe", &["advfirewall", "firewall", "delete", "rule", &format!("name={FIREWALL_RULE}")]),
-        defender_exclusion("Remove-MpPreference", &program_files.join("Farlink"), &program_data.join("Farlink")),
+        Step::try_run(
+            "netsh.exe",
+            &[
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
+                &format!("name={FIREWALL_RULE}"),
+            ],
+        ),
+        defender_exclusion(
+            "Remove-MpPreference",
+            &program_files.join("Farlink"),
+            &program_data.join("Farlink"),
+        ),
         Step::Note(format!(
             "Remove the folders {} and {} to finish.",
             program_files.join("Farlink").display(),
@@ -169,12 +304,50 @@ pub fn host_linux_plan(server: &str, token: &str, user: &str, uid: u32) -> Vec<S
         Step::CopySelf(exe),
         Step::run("chown", &["-R", &format!("{user}:{user}"), LINUX_HOST_DIR]),
         Step::Mkdir("/etc/farlink".into()),
-        Step::WriteFile { path: crate::config::LINUX_HOST_SEED.into(), contents: host_json(server, token), mode: Some(0o644) },
-        Step::WriteFile { path: LINUX_USER_UNIT.into(), contents: linux_user_unit(), mode: Some(0o644) },
+        Step::WriteFile {
+            path: crate::config::LINUX_HOST_SEED.into(),
+            contents: host_json(server, token),
+            mode: Some(0o644),
+        },
+        Step::WriteFile {
+            path: LINUX_USER_UNIT.into(),
+            contents: linux_user_unit(),
+            mode: Some(0o644),
+        },
         Step::run("systemctl", &["--global", "enable", "farlink-host.service"]),
-        Step::try_run("runuser", &["-u", user, "--", "env", &runtime, &bus, "systemctl", "--user", "daemon-reload"]),
-        Step::try_run("runuser", &["-u", user, "--", "env", &runtime, &bus, "systemctl", "--user", "restart", "farlink-host.service"]),
-        Step::Note("Installed. The helper runs whenever this user is signed in to the desktop (X11).".into()),
+        Step::try_run(
+            "runuser",
+            &[
+                "-u",
+                user,
+                "--",
+                "env",
+                &runtime,
+                &bus,
+                "systemctl",
+                "--user",
+                "daemon-reload",
+            ],
+        ),
+        Step::try_run(
+            "runuser",
+            &[
+                "-u",
+                user,
+                "--",
+                "env",
+                &runtime,
+                &bus,
+                "systemctl",
+                "--user",
+                "restart",
+                "farlink-host.service",
+            ],
+        ),
+        Step::Note(
+            "Installed. The helper runs whenever this user is signed in to the desktop (X11)."
+                .into(),
+        ),
         Step::Note("For unattended access turn on automatic login in Settings > Users.".into()),
     ]
 }
@@ -203,7 +376,11 @@ pub fn valid_domain(d: &str) -> bool {
         && d.len() <= 253
         && d.contains('.')
         && d.split('.').all(|l| {
-            !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-') && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
         })
 }
 
@@ -222,8 +399,7 @@ pub const TCP_WARM_CONTENTS: &str =
 net.ipv4.tcp_slow_start_after_idle = 0
 ";
 /// The command that fixes an already installed relay (run as root).
-pub const TCP_WARM_FIX: &str =
-    "echo 'net.ipv4.tcp_slow_start_after_idle = 0' | sudo tee /etc/sysctl.d/60-farlink.conf && sudo sysctl -p /etc/sysctl.d/60-farlink.conf";
+pub const TCP_WARM_FIX: &str = "echo 'net.ipv4.tcp_slow_start_after_idle = 0' | sudo tee /etc/sysctl.d/60-farlink.conf && sudo sysctl -p /etc/sysctl.d/60-farlink.conf";
 
 /// Does this Linux keep connections at speed after a pause? `None`: not
 /// Linux, or it can't be read.
@@ -251,13 +427,21 @@ pub fn server_linux_plan(
     }
     let tls = match cert {
         Some((cert, key)) => crate::config::Tls::Files { cert, key },
-        None if port == 443 => crate::config::Tls::Auto { domain: domain.to_string(), email: String::new(), staging: false },
+        None if port == 443 => crate::config::Tls::Auto {
+            domain: domain.to_string(),
+            email: String::new(),
+            staging: false,
+        },
         None => bail!(
             "automatic certificates only work on port 443 (Let's Encrypt checks the domain there).\n\
              For port {port} give your own certificate: --tls-cert fullchain.pem --tls-key privkey.pem"
         ),
     };
-    let public_url = if port == 443 { format!("https://{domain}") } else { format!("https://{domain}:{port}") };
+    let public_url = if port == 443 {
+        format!("https://{domain}")
+    } else {
+        format!("https://{domain}:{port}")
+    };
     let mut notes = vec![];
     if let crate::config::Tls::Files { cert, key } = &tls {
         notes.push(Step::Note(format!(
@@ -290,16 +474,40 @@ pub fn server_linux_plan(
         },
     ];
     if let Some(src) = releases_src {
-        steps.push(Step::CopyDir { from: src.to_path_buf(), to: data.join("releases") });
+        steps.push(Step::CopyDir {
+            from: src.to_path_buf(),
+            to: data.join("releases"),
+        });
     }
     steps.extend([
-        Step::try_run("useradd", &["--system", "--home", "/var/lib/farlink-server", "--shell", "/usr/sbin/nologin", "farlink"]),
-        Step::run("chown", &["-R", "farlink:farlink", "/var/lib/farlink-server"]),
+        Step::try_run(
+            "useradd",
+            &[
+                "--system",
+                "--home",
+                "/var/lib/farlink-server",
+                "--shell",
+                "/usr/sbin/nologin",
+                "farlink",
+            ],
+        ),
+        Step::run(
+            "chown",
+            &["-R", "farlink:farlink", "/var/lib/farlink-server"],
+        ),
         // The service replaces its own program when it updates itself.
         Step::run("chown", &["-R", "farlink:farlink", "/opt/farlink-server"]),
-        Step::WriteFile { path: "/etc/systemd/system/farlink-server.service".into(), contents: server_unit(&bin), mode: Some(0o644) },
+        Step::WriteFile {
+            path: "/etc/systemd/system/farlink-server.service".into(),
+            contents: server_unit(&bin),
+            mode: Some(0o644),
+        },
         // Keep connections fast after a pause (see `TCP_WARM_SYSCTL`).
-        Step::WriteFile { path: TCP_WARM_SYSCTL.into(), contents: TCP_WARM_CONTENTS.into(), mode: Some(0o644) },
+        Step::WriteFile {
+            path: TCP_WARM_SYSCTL.into(),
+            contents: TCP_WARM_CONTENTS.into(),
+            mode: Some(0o644),
+        },
         Step::try_run("sysctl", &["-p", TCP_WARM_SYSCTL]),
     ]);
     if Path::new(OLD_CADDY_SITE).exists() {
@@ -318,7 +526,10 @@ pub fn server_linux_plan(
         Step::run("systemctl", &["restart", "farlink-server.service"]),
         Step::try_run("ufw", &["allow", &format!("{port}/tcp")]),
         // Direct connections: viewers and helpers ask here for their public address.
-        Step::try_run("ufw", &["allow", &format!("{}/udp", crate::stun::DEFAULT_PORT)]),
+        Step::try_run(
+            "ufw",
+            &["allow", &format!("{}/udp", crate::stun::DEFAULT_PORT)],
+        ),
     ]);
     steps.extend(notes);
     if let Some(repo) = github {
@@ -342,7 +553,9 @@ pub fn execute(steps: &[Step], dry_run: bool) -> Result<()> {
             continue;
         }
         match step {
-            Step::Mkdir(p) => std::fs::create_dir_all(p).with_context(|| format!("creating {}", p.display()))?,
+            Step::Mkdir(p) => {
+                std::fs::create_dir_all(p).with_context(|| format!("creating {}", p.display()))?
+            }
             Step::CopySelf(to) => {
                 let me = std::env::current_exe()?;
                 if me != *to {
@@ -350,7 +563,8 @@ pub fn execute(steps: &[Step], dry_run: bool) -> Result<()> {
                     if to.exists() {
                         let _ = crate::update::replace_exe(to, &std::fs::read(&me)?);
                     } else {
-                        std::fs::copy(&me, to).with_context(|| format!("copying to {}", to.display()))?;
+                        std::fs::copy(&me, to)
+                            .with_context(|| format!("copying to {}", to.display()))?;
                     }
                 }
                 #[cfg(unix)]
@@ -364,11 +578,16 @@ pub fn execute(steps: &[Step], dry_run: bool) -> Result<()> {
                     copy_dir(from, to)?;
                 }
             }
-            Step::WriteFile { path, contents, mode } => {
+            Step::WriteFile {
+                path,
+                contents,
+                mode,
+            } => {
                 if let Some(dir) = path.parent() {
                     std::fs::create_dir_all(dir)?;
                 }
-                std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
+                std::fs::write(path, contents)
+                    .with_context(|| format!("writing {}", path.display()))?;
                 #[cfg(unix)]
                 if let Some(mode) = mode {
                     use std::os::unix::fs::PermissionsExt;
@@ -383,7 +602,11 @@ pub fn execute(steps: &[Step], dry_run: bool) -> Result<()> {
                     std::fs::write(path, updated)?;
                 }
             }
-            Step::Run { program, args, ignore_failure } => {
+            Step::Run {
+                program,
+                args,
+                ignore_failure,
+            } => {
                 let status = std::process::Command::new(program).args(args).status();
                 match status {
                     Ok(s) if s.success() => {}
@@ -450,30 +673,63 @@ mod tests {
 
     #[test]
     fn windows_plan_opens_firewall_and_installs_service() {
-        let steps = host_windows_plan("https://rd.example.com/", "tok123", Path::new(r"C:\Program Files"), Path::new(r"C:\ProgramData"));
+        let steps = host_windows_plan(
+            "https://rd.example.com/",
+            "tok123",
+            Path::new(r"C:\Program Files"),
+            Path::new(r"C:\ProgramData"),
+        );
         let cmds = runs(&steps);
-        let fw: Vec<_> = cmds.iter().filter(|c| c.contains("advfirewall firewall add rule")).collect();
+        let fw: Vec<_> = cmds
+            .iter()
+            .filter(|c| c.contains("advfirewall firewall add rule"))
+            .collect();
         assert_eq!(fw.len(), 2, "inbound and outbound rules");
-        assert!(fw.iter().any(|c| c.contains("dir=in")) && fw.iter().any(|c| c.contains("dir=out")));
+        assert!(
+            fw.iter().any(|c| c.contains("dir=in")) && fw.iter().any(|c| c.contains("dir=out"))
+        );
         assert!(fw.iter().all(|c| c.contains("farlink-host.exe")));
         // Old rule removed first so re-installing doesn't duplicate rules.
         let del = cmds.iter().position(|c| c.contains("delete rule")).unwrap();
         let add = cmds.iter().position(|c| c.contains("add rule")).unwrap();
         assert!(del < add);
-        assert!(cmds.iter().any(|c| c.starts_with("sc.exe create FarlinkHost") && c.contains("service")));
-        assert!(cmds.iter().any(|c| c.contains("failure FarlinkHost") && c.contains("restart/3000")));
+        assert!(
+            cmds.iter()
+                .any(|c| c.starts_with("sc.exe create FarlinkHost") && c.contains("service"))
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("failure FarlinkHost") && c.contains("restart/3000"))
+        );
         assert!(cmds.iter().any(|c| c.contains("SoftwareSASGeneration")));
         let mp = cmds.iter().position(|c| {
-            c.starts_with("powershell.exe") && c.contains("Add-MpPreference -ExclusionPath 'C:\\Program Files") && c.contains("ProgramData")
+            c.starts_with("powershell.exe")
+                && c.contains("Add-MpPreference -ExclusionPath 'C:\\Program Files")
+                && c.contains("ProgramData")
         });
-        let copy = steps.iter().position(|s| matches!(s, Step::CopySelf(_))).unwrap();
-        assert!(mp.is_some(), "Defender exclusion for the install folders: {cmds:?}");
-        assert!(steps.iter().position(|s| s.describe().contains("Add-MpPreference")).unwrap() < copy, "before copying");
+        let copy = steps
+            .iter()
+            .position(|s| matches!(s, Step::CopySelf(_)))
+            .unwrap();
+        assert!(
+            mp.is_some(),
+            "Defender exclusion for the install folders: {cmds:?}"
+        );
+        assert!(
+            steps
+                .iter()
+                .position(|s| s.describe().contains("Add-MpPreference"))
+                .unwrap()
+                < copy,
+            "before copying"
+        );
         assert_eq!(cmds.last().unwrap(), "sc.exe start FarlinkHost");
         let cfg = steps
             .iter()
             .find_map(|s| match s {
-                Step::WriteFile { path, contents, .. } if path.ends_with("host.json") => Some(contents.clone()),
+                Step::WriteFile { path, contents, .. } if path.ends_with("host.json") => {
+                    Some(contents.clone())
+                }
                 _ => None,
             })
             .unwrap();
@@ -484,7 +740,10 @@ mod tests {
 
     #[test]
     fn windows_uninstall_removes_service_and_rule() {
-        let cmds = runs(&host_windows_uninstall_plan(Path::new("C:/PF"), Path::new("C:/PD")));
+        let cmds = runs(&host_windows_uninstall_plan(
+            Path::new("C:/PF"),
+            Path::new("C:/PD"),
+        ));
         assert!(cmds.iter().any(|c| c == "sc.exe delete FarlinkHost"));
         assert!(cmds.iter().any(|c| c.contains("Remove-MpPreference")));
         assert!(cmds.iter().any(|c| c.contains("delete rule")));
@@ -494,7 +753,10 @@ mod tests {
     fn linux_plan_uses_user_session_service() {
         let steps = host_linux_plan("https://rd.example.com", "tok", "ana", 1000);
         let cmds = runs(&steps);
-        assert!(cmds.contains(&"chown -R ana:ana /opt/farlink".to_string()), "user can self-update");
+        assert!(
+            cmds.contains(&"chown -R ana:ana /opt/farlink".to_string()),
+            "user can self-update"
+        );
         assert!(cmds.contains(&"systemctl --global enable farlink-host.service".to_string()));
         assert!(cmds.iter().any(|c| c.contains("/run/user/1000") && c.contains("restart farlink-host.service")));
         assert!(linux_user_unit().contains("ExecStart=/opt/farlink/farlink-host run"));
@@ -505,7 +767,9 @@ mod tests {
         let cfg = steps
             .iter()
             .find_map(|s| match s {
-                Step::WriteFile { path, contents, .. } if path.ends_with("config.json") => Some(contents.clone()),
+                Step::WriteFile { path, contents, .. } if path.ends_with("config.json") => {
+                    Some(contents.clone())
+                }
                 _ => None,
             })
             .unwrap();
@@ -516,44 +780,83 @@ mod tests {
     fn server_plan_needs_valid_domain_and_sets_up_https() {
         assert!(server_linux_plan("not a domain", 443, None, None, None).is_err());
         assert!(server_linux_plan("localhost", 443, None, None, None).is_err());
-        let steps = server_linux_plan("remote.example.com", 443, None, None, Some(Path::new("/tmp/rel"))).unwrap();
+        let steps = server_linux_plan(
+            "remote.example.com",
+            443,
+            None,
+            None,
+            Some(Path::new("/tmp/rel")),
+        )
+        .unwrap();
         let cfg = written_config(&steps);
         assert_eq!(cfg.public_url, "https://remote.example.com");
         assert_eq!(cfg.bind, "0.0.0.0:443");
-        assert!(matches!(&cfg.tls, crate::config::Tls::Auto { domain, .. } if domain == "remote.example.com"));
+        assert!(
+            matches!(&cfg.tls, crate::config::Tls::Auto { domain, .. } if domain == "remote.example.com")
+        );
         assert!(steps.iter().any(|s| matches!(s, Step::CopyDir { .. })));
-        assert!(server_unit(Path::new("/x")).contains("CAP_NET_BIND_SERVICE"), "port 443 without root");
+        assert!(
+            server_unit(Path::new("/x")).contains("CAP_NET_BIND_SERVICE"),
+            "port 443 without root"
+        );
         let cmds = runs(&steps);
         assert!(cmds.contains(&"ufw allow 443/tcp".to_string()));
-        assert!(!cmds.iter().any(|c| c.contains("80/tcp")), "port 80 is left alone");
+        assert!(
+            !cmds.iter().any(|c| c.contains("80/tcp")),
+            "port 80 is left alone"
+        );
         assert!(
             steps.iter().any(|s| matches!(s, Step::WriteFile { path, contents, .. }
                 if path == Path::new(TCP_WARM_SYSCTL) && contents.contains("net.ipv4.tcp_slow_start_after_idle = 0"))),
             "connections stay at speed after a pause"
         );
         assert!(cmds.contains(&format!("sysctl -p {TCP_WARM_SYSCTL}")));
-        assert!(!cmds.iter().any(|c| c.contains("apt-get install")), "no Caddy any more");
+        assert!(
+            !cmds.iter().any(|c| c.contains("apt-get install")),
+            "no Caddy any more"
+        );
         assert_eq!(cfg.update_from_github, None);
-        assert!(server_unit(Path::new("/x")).contains("ReadWritePaths=/var/lib/farlink-server /opt/farlink-server"));
-        assert!(cmds.contains(&"chown -R farlink:farlink /opt/farlink-server".to_string()), "can replace itself");
-        let steps = server_linux_plan("remote.example.com", 443, None, Some("artem/farlink"), None).unwrap();
-        assert_eq!(written_config(&steps).update_from_github.as_deref(), Some("artem/farlink"));
-        assert!(server_linux_plan("remote.example.com", 443, None, Some("not a repo"), None).is_err());
+        assert!(
+            server_unit(Path::new("/x"))
+                .contains("ReadWritePaths=/var/lib/farlink-server /opt/farlink-server")
+        );
+        assert!(
+            cmds.contains(&"chown -R farlink:farlink /opt/farlink-server".to_string()),
+            "can replace itself"
+        );
+        let steps = server_linux_plan("remote.example.com", 443, None, Some("artem/farlink"), None)
+            .unwrap();
+        assert_eq!(
+            written_config(&steps).update_from_github.as_deref(),
+            Some("artem/farlink")
+        );
+        assert!(
+            server_linux_plan("remote.example.com", 443, None, Some("not a repo"), None).is_err()
+        );
     }
 
     #[test]
     fn server_plan_on_another_port_needs_certificate_files() {
         let err = server_linux_plan("remote.example.com", 8443, None, None, None).unwrap_err();
         assert!(err.to_string().contains("--tls-cert"), "{err}");
-        let files = Some(("/etc/ssl/rd/fullchain.pem".into(), "/etc/ssl/rd/privkey.pem".into()));
+        let files = Some((
+            "/etc/ssl/rd/fullchain.pem".into(),
+            "/etc/ssl/rd/privkey.pem".into(),
+        ));
         let steps = server_linux_plan("remote.example.com", 8443, files, None, None).unwrap();
         let cfg = written_config(&steps);
         assert_eq!(cfg.public_url, "https://remote.example.com:8443");
         assert_eq!(cfg.bind, "0.0.0.0:8443");
-        assert!(matches!(&cfg.tls, crate::config::Tls::Files { cert, .. } if cert.ends_with("fullchain.pem")));
+        assert!(
+            matches!(&cfg.tls, crate::config::Tls::Files { cert, .. } if cert.ends_with("fullchain.pem"))
+        );
         let cmds = runs(&steps);
         assert!(cmds.contains(&"ufw allow 8443/tcp".to_string()));
-        assert!(!cmds.iter().any(|c| c.contains("443/tcp") && !c.contains("8443")));
+        assert!(
+            !cmds
+                .iter()
+                .any(|c| c.contains("443/tcp") && !c.contains("8443"))
+        );
     }
 
     #[test]
@@ -578,8 +881,15 @@ mod tests {
         let f = dir.join("deep/conf.txt");
         let steps = vec![
             Step::Mkdir(dir.join("a")),
-            Step::WriteFile { path: f.clone(), contents: "hello".into(), mode: Some(0o600) },
-            Step::EnsureLine { path: f.clone(), line: "more".into() },
+            Step::WriteFile {
+                path: f.clone(),
+                contents: "hello".into(),
+                mode: Some(0o600),
+            },
+            Step::EnsureLine {
+                path: f.clone(),
+                line: "more".into(),
+            },
             Step::try_run("this-program-does-not-exist", &[]),
         ];
         execute(&steps, false).unwrap();

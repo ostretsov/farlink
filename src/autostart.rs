@@ -18,7 +18,11 @@ pub fn is_enabled() -> bool {
 
 /// Turn starting at login on (for `exe`) or off.
 pub fn set(enabled: bool, exe: &Path) -> anyhow::Result<()> {
-    if enabled { imp::write(exe) } else { imp::remove() }
+    if enabled {
+        imp::write(exe)
+    } else {
+        imp::remove()
+    }
 }
 
 /// Points an enabled entry at `exe` if it runs another file (the app moved).
@@ -38,13 +42,17 @@ pub fn command(exe: &Path) -> String {
 /// what GNOME's "Startup Applications" writes when switched off.
 fn entry_enabled(text: &str) -> bool {
     !text.lines().map(|l| l.replace(' ', "")).any(|l| {
-        l.eq_ignore_ascii_case("Hidden=true") || l.eq_ignore_ascii_case("X-GNOME-Autostart-enabled=false")
+        l.eq_ignore_ascii_case("Hidden=true")
+            || l.eq_ignore_ascii_case("X-GNOME-Autostart-enabled=false")
     })
 }
 
 /// Quotes a path for an XDG `Exec` key or a Windows command line.
 fn quote(arg: &str) -> String {
-    let plain = !arg.is_empty() && arg.chars().all(|c| c.is_alphanumeric() || "/\\._-+,:@".contains(c));
+    let plain = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_alphanumeric() || "/\\._-+,:@".contains(c));
     if plain && !cfg!(windows) {
         return arg.to_string();
     }
@@ -160,7 +168,10 @@ mod imp {
                 (value.len() * 2) as u32,
             )
         };
-        anyhow::ensure!(rc == ERROR_SUCCESS, "could not write the Run registry value (error {rc})");
+        anyhow::ensure!(
+            rc == ERROR_SUCCESS,
+            "could not write the Run registry value (error {rc})"
+        );
         Ok(())
     }
 
@@ -168,7 +179,10 @@ mod imp {
         let (key, name) = (wide(RUN_KEY), wide(crate::PRODUCT));
         let rc = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr()) };
         // 2 = ERROR_FILE_NOT_FOUND: already off.
-        anyhow::ensure!(rc == ERROR_SUCCESS || rc == 2, "could not remove the Run registry value (error {rc})");
+        anyhow::ensure!(
+            rc == ERROR_SUCCESS || rc == 2,
+            "could not remove the Run registry value (error {rc})"
+        );
         Ok(())
     }
 }
@@ -195,6 +209,8 @@ mod tests {
     #[test]
     fn switched_off_entries_count_as_off() {
         assert!(!entry_enabled("[Desktop Entry]\nHidden=true\n"));
-        assert!(!entry_enabled("[Desktop Entry]\nX-GNOME-Autostart-enabled = false\n"));
+        assert!(!entry_enabled(
+            "[Desktop Entry]\nX-GNOME-Autostart-enabled = false\n"
+        ));
     }
 }

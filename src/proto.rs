@@ -48,7 +48,13 @@ pub enum MouseButton {
 pub enum InputEvent {
     /// `x`, `y` are 0..1 inside monitor `mon`.
     MouseMove { mon: u8, x: f32, y: f32 },
-    MouseButton { mon: u8, x: f32, y: f32, button: MouseButton, down: bool },
+    MouseButton {
+        mon: u8,
+        x: f32,
+        y: f32,
+        button: MouseButton,
+        down: bool,
+    },
     /// Wheel steps; positive `dy` scrolls up.
     Scroll { dx: f32, dy: f32 },
     /// A named key (see [`crate::keys`]) pressed or released.
@@ -67,7 +73,13 @@ pub enum InputEvent {
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum SessionMsg {
     /// host -> viewer, first message.
-    Hello { hostname: String, os: String, version: String, monitors: Vec<MonitorInfo>, view_only: bool },
+    Hello {
+        hostname: String,
+        os: String,
+        version: String,
+        monitors: Vec<MonitorInfo>,
+        view_only: bool,
+    },
     /// host -> viewer when monitors were added/removed/re-arranged.
     Monitors { monitors: Vec<MonitorInfo> },
     /// host -> viewer, a short notice for the status bar.
@@ -96,17 +108,32 @@ pub enum SessionMsg {
     /// viewer -> host: list a folder. Empty path = starting places (drives / home).
     FsList { req: u32, path: String },
     /// host -> viewer.
-    FsListing { req: u32, path: String, parent: Option<String>, entries: Vec<FsEntry>, error: Option<String> },
+    FsListing {
+        req: u32,
+        path: String,
+        parent: Option<String>,
+        entries: Vec<FsEntry>,
+        error: Option<String>,
+    },
     /// viewer -> host: send me this file (binary [`FileChunk`]s follow).
     FsDownload { req: u32, path: String },
     /// host -> viewer: a download starts.
     FsBegin { req: u32, name: String, size: u64 },
     /// viewer -> host: a file of `size` bytes follows as [`FileChunk`]s.
-    FsUpload { req: u32, dir: String, name: String, size: u64 },
+    FsUpload {
+        req: u32,
+        dir: String,
+        name: String,
+        size: u64,
+    },
     /// viewer -> host: make a folder.
     FsMkdir { req: u32, path: String },
     /// host -> viewer: an upload / mkdir finished (or a download failed).
-    FsDone { req: u32, path: String, error: Option<String> },
+    FsDone {
+        req: u32,
+        path: String,
+        error: Option<String>,
+    },
 
     /// Text copied on one side, for the other side's clipboard (both
     /// directions, control sessions only: the relay drops it otherwise).
@@ -122,7 +149,14 @@ pub enum SessionMsg {
     /// host -> viewer: a pointer shape, sent once per `id`. `rgba` is
     /// base64 of `width * height` straight (not premultiplied) RGBA pixels;
     /// (`hot_x`, `hot_y`) is the point that touches things.
-    PointerShape { id: u32, width: u32, height: u32, hot_x: u32, hot_y: u32, rgba: String },
+    PointerShape {
+        id: u32,
+        width: u32,
+        height: u32,
+        hot_x: u32,
+        hot_y: u32,
+        rgba: String,
+    },
     /// host -> viewer: the pointer's hot spot in virtual-desktop pixels (as
     /// [`MonitorInfo`] positions) and its shape (`0` = hidden).
     Pointer { x: i32, y: i32, shape: u32 },
@@ -204,7 +238,13 @@ impl SessionMsg {
 impl SessionMsg {
     /// File requests from the viewer (handled by [`crate::files`]).
     pub fn is_file_request(&self) -> bool {
-        matches!(self, SessionMsg::FsList { .. } | SessionMsg::FsDownload { .. } | SessionMsg::FsUpload { .. } | SessionMsg::FsMkdir { .. })
+        matches!(
+            self,
+            SessionMsg::FsList { .. }
+                | SessionMsg::FsDownload { .. }
+                | SessionMsg::FsUpload { .. }
+                | SessionMsg::FsMkdir { .. }
+        )
     }
 }
 
@@ -236,7 +276,13 @@ impl FileChunk {
             return None;
         }
         let req = u32::from_le_bytes([msg[1], msg[2], msg[3], msg[4]]);
-        Some((FileChunk { req, last: msg[5] & 1 != 0 }, &msg[FILE_HEADER_LEN..]))
+        Some((
+            FileChunk {
+                req,
+                last: msg[5] & 1 != 0,
+            },
+            &msg[FILE_HEADER_LEN..],
+        ))
     }
 }
 
@@ -257,7 +303,11 @@ pub enum AgentMsg {
         monitors: Vec<MonitorInfo>,
     },
     /// relay -> host after a successful register.
-    Registered { machine_id: String, secret: String, name: String },
+    Registered {
+        machine_id: String,
+        secret: String,
+        name: String,
+    },
     /// relay -> host: refused (bad token, machine removed).
     Rejected { reason: String },
     /// relay -> host: someone wants to see this machine; open a session socket.
@@ -391,7 +441,11 @@ impl TileHeader {
             h: u16_at(14),
             seq: u32::from_le_bytes([msg[16], msg[17], msg[18], msg[19]]),
         };
-        if h.w == 0 || h.h == 0 || h.x as u32 + h.w as u32 > h.frame_w as u32 || h.y as u32 + h.h as u32 > h.frame_h as u32 {
+        if h.w == 0
+            || h.h == 0
+            || h.x as u32 + h.w as u32 > h.frame_w as u32
+            || h.y as u32 + h.h as u32 > h.frame_h as u32
+        {
             return None;
         }
         Some((h, &msg[TILE_HEADER_LEN..]))
@@ -448,18 +502,51 @@ mod tests {
     #[test]
     fn json_messages_round_trip() {
         let msgs = vec![
-            SessionMsg::Input { event: InputEvent::MouseButton { mon: 1, x: 0.5, y: 0.25, button: MouseButton::Left, down: true } },
-            SessionMsg::Input { event: InputEvent::Key { key: "Enter".into(), down: false } },
-            SessionMsg::Input { event: InputEvent::CtrlAltDel },
+            SessionMsg::Input {
+                event: InputEvent::MouseButton {
+                    mon: 1,
+                    x: 0.5,
+                    y: 0.25,
+                    button: MouseButton::Left,
+                    down: true,
+                },
+            },
+            SessionMsg::Input {
+                event: InputEvent::Key {
+                    key: "Enter".into(),
+                    down: false,
+                },
+            },
+            SessionMsg::Input {
+                event: InputEvent::CtrlAltDel,
+            },
             SessionMsg::Ack { seq: 9 },
             SessionMsg::Refresh,
-            SessionMsg::Closed { reason: "Access withdrawn".into() },
-            SessionMsg::Timing { capture_ms: 4.5, encode_ms: 9.25, rtt_ms: Some(31.0), pace_fps: Some(12.5) },
-            SessionMsg::Timing { capture_ms: 0.0, encode_ms: 0.0, rtt_ms: None, pace_fps: None },
-            SessionMsg::DirectInfo { stun_port: 3478, stun_servers: vec!["stun.cloudflare.com:3478".into()] },
+            SessionMsg::Closed {
+                reason: "Access withdrawn".into(),
+            },
+            SessionMsg::Timing {
+                capture_ms: 4.5,
+                encode_ms: 9.25,
+                rtt_ms: Some(31.0),
+                pace_fps: Some(12.5),
+            },
+            SessionMsg::Timing {
+                capture_ms: 0.0,
+                encode_ms: 0.0,
+                rtt_ms: None,
+                pace_fps: None,
+            },
+            SessionMsg::DirectInfo {
+                stun_port: 3478,
+                stun_servers: vec!["stun.cloudflare.com:3478".into()],
+            },
             SessionMsg::DirectOffer {
                 fp: "ab01".into(),
-                addrs: vec!["192.168.1.5:40000".parse().unwrap(), "203.0.113.4:61000".parse().unwrap()],
+                addrs: vec![
+                    "192.168.1.5:40000".parse().unwrap(),
+                    "203.0.113.4:61000".parse().unwrap(),
+                ],
                 hard_nat: false,
                 attempt: 2,
             },
@@ -471,51 +558,121 @@ mod tests {
             assert_eq!(back, m);
         }
         let s = serde_json::to_string(&SessionMsg::Ack { seq: 3 }).unwrap();
-        assert_eq!(s, r#"{"t":"ack","seq":3}"#, "browser viewer relies on this shape");
+        assert_eq!(
+            s, r#"{"t":"ack","seq":3}"#,
+            "browser viewer relies on this shape"
+        );
     }
 
     #[test]
     fn ping_is_control_input_in_the_shape_browsers_send() {
-        let ping = SessionMsg::Input { event: InputEvent::Ping { mon: 1, x: 0.5, y: 0.25 } };
+        let ping = SessionMsg::Input {
+            event: InputEvent::Ping {
+                mon: 1,
+                x: 0.5,
+                y: 0.25,
+            },
+        };
         // web/viewer.js sends exactly this.
         let from_browser = r#"{"t":"input","event":{"k":"ping","mon":1,"x":0.5,"y":0.25}}"#;
-        assert_eq!(serde_json::from_str::<SessionMsg>(from_browser).unwrap(), ping);
+        assert_eq!(
+            serde_json::from_str::<SessionMsg>(from_browser).unwrap(),
+            ping
+        );
         assert_eq!(serde_json::to_string(&ping).unwrap(), from_browser);
         assert!(ping.is_control(), "view-only viewers can't ping");
     }
 
     #[test]
     fn file_chunks_round_trip() {
-        let c = FileChunk { req: 77, last: true };
+        let c = FileChunk {
+            req: 77,
+            last: true,
+        };
         let msg = c.encode(b"abc");
         assert_eq!(FileChunk::decode(&msg), Some((c, &b"abc"[..])));
-        assert!(FileChunk::decode(b"T12345").is_none(), "picture tiles are not file chunks");
+        assert!(
+            FileChunk::decode(b"T12345").is_none(),
+            "picture tiles are not file chunks"
+        );
         assert!(FileChunk::decode(b"F1").is_none());
     }
 
     #[test]
     fn only_input_is_control() {
-        assert!(SessionMsg::FsList { req: 1, path: "/".into() }.is_control(), "view-only can't browse files");
-        assert!(SessionMsg::FsUpload { req: 1, dir: "/".into(), name: "a".into(), size: 1 }.is_control());
+        assert!(
+            SessionMsg::FsList {
+                req: 1,
+                path: "/".into()
+            }
+            .is_control(),
+            "view-only can't browse files"
+        );
+        assert!(
+            SessionMsg::FsUpload {
+                req: 1,
+                dir: "/".into(),
+                name: "a".into(),
+                size: 1
+            }
+            .is_control()
+        );
         assert!(!SessionMsg::Watch { monitors: vec![0] }.is_control());
-        assert!(SessionMsg::Input { event: InputEvent::Text { text: "x".into() } }.is_control());
+        assert!(
+            SessionMsg::Input {
+                event: InputEvent::Text { text: "x".into() }
+            }
+            .is_control()
+        );
         assert!(!SessionMsg::Refresh.is_control());
-        assert!(!SessionMsg::Quality { quality: Quality::default() }.is_control());
+        assert!(
+            !SessionMsg::Quality {
+                quality: Quality::default()
+            }
+            .is_control()
+        );
     }
 
     #[test]
     fn preview_messages_round_trip() {
-        let shot = PreviewShot { index: 1, width: 480, height: 270, jpeg: "/9j/".into() };
-        let msgs = [AgentMsg::PreviewRequest { req: 5, full: None }, AgentMsg::PreviewRequest { req: 6, full: Some(1) }, AgentMsg::Preview { req: 5, shots: vec![shot.clone()] }];
+        let shot = PreviewShot {
+            index: 1,
+            width: 480,
+            height: 270,
+            jpeg: "/9j/".into(),
+        };
+        let msgs = [
+            AgentMsg::PreviewRequest { req: 5, full: None },
+            AgentMsg::PreviewRequest {
+                req: 6,
+                full: Some(1),
+            },
+            AgentMsg::Preview {
+                req: 5,
+                shots: vec![shot.clone()],
+            },
+        ];
         for m in msgs {
             let s = serde_json::to_string(&m).unwrap();
             assert_eq!(serde_json::from_str::<AgentMsg>(&s).unwrap(), m);
         }
-        assert_eq!(serde_json::to_string(&AgentMsg::PreviewRequest { req: 5, full: None }).unwrap(), r#"{"t":"preview_request","req":5}"#);
+        assert_eq!(
+            serde_json::to_string(&AgentMsg::PreviewRequest { req: 5, full: None }).unwrap(),
+            r#"{"t":"preview_request","req":5}"#
+        );
         // Older relays ask without `full`.
-        assert_eq!(serde_json::from_str::<AgentMsg>(r#"{"t":"preview_request","req":5}"#).unwrap(), AgentMsg::PreviewRequest { req: 5, full: None });
-        let p = Preview { taken: 1, shots: vec![shot] };
-        assert_eq!(serde_json::from_str::<Preview>(&serde_json::to_string(&p).unwrap()).unwrap(), p);
+        assert_eq!(
+            serde_json::from_str::<AgentMsg>(r#"{"t":"preview_request","req":5}"#).unwrap(),
+            AgentMsg::PreviewRequest { req: 5, full: None }
+        );
+        let p = Preview {
+            taken: 1,
+            shots: vec![shot],
+        };
+        assert_eq!(
+            serde_json::from_str::<Preview>(&serde_json::to_string(&p).unwrap()).unwrap(),
+            p
+        );
     }
 
     #[test]

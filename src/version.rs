@@ -16,12 +16,26 @@ impl Version {
         let core = s.split(['-', '+', ' ']).next()?;
         let mut parts = core.split('.');
         let major = parts.next()?.parse().ok()?;
-        let minor = parts.next().map(|p| p.parse()).transpose().ok()?.unwrap_or(0);
-        let patch = parts.next().map(|p| p.parse()).transpose().ok()?.unwrap_or(0);
+        let minor = parts
+            .next()
+            .map(|p| p.parse())
+            .transpose()
+            .ok()?
+            .unwrap_or(0);
+        let patch = parts
+            .next()
+            .map(|p| p.parse())
+            .transpose()
+            .ok()?
+            .unwrap_or(0);
         if parts.next().is_some() {
             return None;
         }
-        Some(Version { major, minor, patch })
+        Some(Version {
+            major,
+            minor,
+            patch,
+        })
     }
 }
 
@@ -45,10 +59,38 @@ mod tests {
 
     #[test]
     fn parses_common_forms() {
-        assert_eq!(Version::parse("1.2.3"), Some(Version { major: 1, minor: 2, patch: 3 }));
-        assert_eq!(Version::parse("v2.0"), Some(Version { major: 2, minor: 0, patch: 0 }));
-        assert_eq!(Version::parse("3"), Some(Version { major: 3, minor: 0, patch: 0 }));
-        assert_eq!(Version::parse("1.2.3-beta.1"), Some(Version { major: 1, minor: 2, patch: 3 }));
+        assert_eq!(
+            Version::parse("1.2.3"),
+            Some(Version {
+                major: 1,
+                minor: 2,
+                patch: 3
+            })
+        );
+        assert_eq!(
+            Version::parse("v2.0"),
+            Some(Version {
+                major: 2,
+                minor: 0,
+                patch: 0
+            })
+        );
+        assert_eq!(
+            Version::parse("3"),
+            Some(Version {
+                major: 3,
+                minor: 0,
+                patch: 0
+            })
+        );
+        assert_eq!(
+            Version::parse("1.2.3-beta.1"),
+            Some(Version {
+                major: 1,
+                minor: 2,
+                patch: 3
+            })
+        );
         assert_eq!(Version::parse("abc"), None);
         assert_eq!(Version::parse("1.2.3.4"), None);
     }

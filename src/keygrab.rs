@@ -39,7 +39,9 @@ impl Forward {
         if matches!(keysym, ALT_L | ALT_R | META_L | META_R) {
             return (None, !down);
         }
-        let Some(name) = crate::keys::name_for_keysym(keysym) else { return (None, false) };
+        let Some(name) = crate::keys::name_for_keysym(keysym) else {
+            return (None, false);
+        };
         match name.as_str() {
             "Shift" if self.held.shift == down => return (None, false),
             "Control" if self.held.ctrl == down => return (None, false),
@@ -71,7 +73,11 @@ impl AltGrab {
             let thread = x11::start(Box::new(send), Forward { held }, stop.clone(), done.clone())
                 .map_err(|e| log::debug!("Alt+Tab not grabbed: {e:#}"))
                 .ok()?;
-            Some(AltGrab { stop, done, thread: Some(thread) })
+            Some(AltGrab {
+                stop,
+                done,
+                thread: Some(thread),
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -102,7 +108,9 @@ mod x11 {
     use std::time::{Duration, Instant};
     use x11rb::connection::Connection;
     use x11rb::protocol::Event;
-    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, GrabMode, GrabStatus, InputFocus, Window};
+    use x11rb::protocol::xproto::{
+        AtomEnum, ConnectionExt as _, GrabMode, GrabStatus, InputFocus, Window,
+    };
     use x11rb::rust_connection::RustConnection;
 
     /// Longest a grab may last, in case Alt's release is never seen.
@@ -117,29 +125,46 @@ mod x11 {
         let (conn, screen) = RustConnection::connect(None).context("connecting to X")?;
         let root = conn.setup().roots[screen].root;
         let focus = conn.get_input_focus()?.reply()?.focus;
-        if focus == u32::from(InputFocus::POINTER_ROOT) || focus == x11rb::NONE || !ours(&conn, focus, root)? {
+        if focus == u32::from(InputFocus::POINTER_ROOT)
+            || focus == x11rb::NONE
+            || !ours(&conn, focus, root)?
+        {
             bail!("the focused window is not ours");
         }
         let keysyms = keymap(&conn)?;
         // On the focused window itself, so the window keeps the focus.
         let status = conn
-            .grab_keyboard(false, focus, x11rb::CURRENT_TIME, GrabMode::ASYNC, GrabMode::ASYNC)?
+            .grab_keyboard(
+                false,
+                focus,
+                x11rb::CURRENT_TIME,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+            )?
             .reply()?
             .status;
         if status != GrabStatus::SUCCESS {
             bail!("keyboard grab refused: {status:?}");
         }
-        let thread = std::thread::Builder::new().name("alt-grab".into()).spawn(move || {
-            let held = run(&conn, &keysyms, fwd, &stop, &*send);
-            let _ = conn.ungrab_keyboard(x11rb::CURRENT_TIME);
-            let _ = conn.flush();
-            *done.lock().unwrap() = Some(held);
-        })?;
+        let thread = std::thread::Builder::new()
+            .name("alt-grab".into())
+            .spawn(move || {
+                let held = run(&conn, &keysyms, fwd, &stop, &*send);
+                let _ = conn.ungrab_keyboard(x11rb::CURRENT_TIME);
+                let _ = conn.flush();
+                *done.lock().unwrap() = Some(held);
+            })?;
         Ok(thread)
     }
 
     /// Forward keys until Alt is let go (or [`AltGrab`] is dropped).
-    fn run(conn: &RustConnection, keysyms: &Keysyms, mut fwd: Forward, stop: &AtomicBool, send: &dyn Fn(InputEvent)) -> Held {
+    fn run(
+        conn: &RustConnection,
+        keysyms: &Keysyms,
+        mut fwd: Forward,
+        stop: &AtomicBool,
+        send: &dyn Fn(InputEvent),
+    ) -> Held {
         let started = Instant::now();
         let mut checked = Instant::now() - Duration::from_secs(1);
         while !stop.load(Ordering::SeqCst) && started.elapsed() < MAX_GRAB {
@@ -196,13 +221,18 @@ mod x11 {
     fn keymap(conn: &RustConnection) -> Result<Keysyms> {
         let (min, max) = (conn.setup().min_keycode, conn.setup().max_keycode);
         let r = conn.get_keyboard_mapping(min, max - min + 1)?.reply()?;
-        Ok(Keysyms { min, per: (r.keysyms_per_keycode as usize).max(1), syms: r.keysyms })
+        Ok(Keysyms {
+            min,
+            per: (r.keysyms_per_keycode as usize).max(1),
+            syms: r.keysyms,
+        })
     }
 
     fn alt_down(conn: &RustConnection, keysyms: &Keysyms) -> Result<bool> {
         let keys = conn.query_keymap()?.reply()?.keys;
         Ok((0..=255u8).any(|code| {
-            keys[code as usize / 8] & (1 << (code % 8)) != 0 && matches!(keysyms.get(code), ALT_L | ALT_R | META_L | META_R)
+            keys[code as usize / 8] & (1 << (code % 8)) != 0
+                && matches!(keysyms.get(code), ALT_L | ALT_R | META_L | META_R)
         }))
     }
 
@@ -216,7 +246,9 @@ mod x11 {
             if w == root || w == x11rb::NONE {
                 break;
             }
-            let p = conn.get_property(false, w, pid_atom, AtomEnum::CARDINAL, 0, 1)?.reply()?;
+            let p = conn
+                .get_property(false, w, pid_atom, AtomEnum::CARDINAL, 0, 1)?
+                .reply()?;
             if let Some(pid) = p.value32().and_then(|mut v| v.next()) {
                 return Ok(pid == std::process::id());
             }
@@ -231,7 +263,10 @@ mod tests {
     use super::*;
 
     fn key(name: &str, down: bool) -> Option<InputEvent> {
-        Some(InputEvent::Key { key: name.into(), down })
+        Some(InputEvent::Key {
+            key: name.into(),
+            down,
+        })
     }
 
     #[test]
@@ -239,35 +274,74 @@ mod tests {
         let mut f = Forward::default();
         assert_eq!(f.key(0xff09, true), (key("Tab", true), false));
         assert_eq!(f.key(0xff09, false), (key("Tab", false), false));
-        assert_eq!(f.key(0xff09, true), (key("Tab", true), false), "Tab again: next window");
+        assert_eq!(
+            f.key(0xff09, true),
+            (key("Tab", true), false),
+            "Tab again: next window"
+        );
         assert_eq!(f.key(0xff09, false), (key("Tab", false), false));
-        assert_eq!(f.key(ALT_L, false), (None, true), "Alt itself is let go by the viewer");
+        assert_eq!(
+            f.key(ALT_L, false),
+            (None, true),
+            "Alt itself is let go by the viewer"
+        );
     }
 
     #[test]
     fn alt_shift_tab_goes_backwards() {
         let mut f = Forward::default();
         assert_eq!(f.key(0xffe1, true), (key("Shift", true), false));
-        assert_eq!(f.key(0xfe20, true), (key("Tab", true), false), "Shift+Tab's own keysym");
+        assert_eq!(
+            f.key(0xfe20, true),
+            (key("Tab", true), false),
+            "Shift+Tab's own keysym"
+        );
         assert_eq!(f.key(0xfe20, false), (key("Tab", false), false));
-        assert_eq!(f.key(0xffe2, false), (key("Shift", false), false), "right Shift counts too");
+        assert_eq!(
+            f.key(0xffe2, false),
+            (key("Shift", false), false),
+            "right Shift counts too"
+        );
         assert_eq!(f.held, Held::default());
     }
 
     #[test]
     fn modifiers_already_down_are_not_pressed_twice() {
-        let mut f = Forward { held: Held { shift: false, ctrl: true } };
-        assert_eq!(f.key(0xffe3, true), (None, false), "Ctrl was down before the grab (key repeat)");
+        let mut f = Forward {
+            held: Held {
+                shift: false,
+                ctrl: true,
+            },
+        };
+        assert_eq!(
+            f.key(0xffe3, true),
+            (None, false),
+            "Ctrl was down before the grab (key repeat)"
+        );
         assert_eq!(f.key(0xffc1, true), (key("F4", true), false));
         assert_eq!(f.key(0xffe3, false), (key("Control", false), false));
-        assert_eq!(f.held, Held { shift: false, ctrl: false });
+        assert_eq!(
+            f.held,
+            Held {
+                shift: false,
+                ctrl: false
+            }
+        );
     }
 
     #[test]
     fn other_alt_keys_and_unknown_symbols() {
         let mut f = Forward::default();
-        assert_eq!(f.key(ALT_R, true), (None, false), "Alt pressed again: nothing");
-        assert_eq!(f.key(META_L, false), (None, true), "Alt that the layout calls Meta");
+        assert_eq!(
+            f.key(ALT_R, true),
+            (None, false),
+            "Alt pressed again: nothing"
+        );
+        assert_eq!(
+            f.key(META_L, false),
+            (None, true),
+            "Alt that the layout calls Meta"
+        );
         assert_eq!(f.key(0x6c1, true), (None, false), "no key name");
         assert_eq!(f.key(0xff1b, true), (key("Escape", true), false));
         assert_eq!(f.key(0x66, true), (key("F", true), false));
@@ -282,32 +356,72 @@ mod tests {
     fn x11_alt_tab_is_grabbed_and_forwarded() {
         use std::time::{Duration, Instant};
         use x11rb::connection::Connection;
-        use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, CreateWindowAux, InputFocus, PropMode, WindowClass};
+        use x11rb::protocol::xproto::{
+            AtomEnum, ConnectionExt as _, CreateWindowAux, InputFocus, PropMode, WindowClass,
+        };
         use x11rb::protocol::xtest::ConnectionExt as _;
         use x11rb::wrapper::ConnectionExt as _;
 
         let (conn, screen) = x11rb::rust_connection::RustConnection::connect(None).unwrap();
         let root = conn.setup().roots[screen].root;
         let win = conn.generate_id().unwrap();
-        conn.create_window(0, win, root, 0, 0, 200, 100, 0, WindowClass::INPUT_OUTPUT, 0, &CreateWindowAux::new()).unwrap();
-        let pid = conn.intern_atom(false, b"_NET_WM_PID").unwrap().reply().unwrap().atom;
-        conn.change_property32(PropMode::REPLACE, win, pid, AtomEnum::CARDINAL, &[std::process::id()]).unwrap();
+        conn.create_window(
+            0,
+            win,
+            root,
+            0,
+            0,
+            200,
+            100,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            0,
+            &CreateWindowAux::new(),
+        )
+        .unwrap();
+        let pid = conn
+            .intern_atom(false, b"_NET_WM_PID")
+            .unwrap()
+            .reply()
+            .unwrap()
+            .atom;
+        conn.change_property32(
+            PropMode::REPLACE,
+            win,
+            pid,
+            AtomEnum::CARDINAL,
+            &[std::process::id()],
+        )
+        .unwrap();
         conn.map_window(win).unwrap();
         conn.sync().unwrap();
         std::thread::sleep(Duration::from_millis(300));
-        conn.set_input_focus(InputFocus::PARENT, win, x11rb::CURRENT_TIME).unwrap();
+        conn.set_input_focus(InputFocus::PARENT, win, x11rb::CURRENT_TIME)
+            .unwrap();
         conn.sync().unwrap();
         std::thread::sleep(Duration::from_millis(100));
 
-        let map = conn.get_keyboard_mapping(conn.setup().min_keycode, conn.setup().max_keycode - conn.setup().min_keycode + 1).unwrap().reply().unwrap();
+        let map = conn
+            .get_keyboard_mapping(
+                conn.setup().min_keycode,
+                conn.setup().max_keycode - conn.setup().min_keycode + 1,
+            )
+            .unwrap()
+            .reply()
+            .unwrap();
         let code = |ks: u32| {
             let i = map.keysyms.iter().position(|&k| k == ks).unwrap();
             conn.setup().min_keycode + (i / map.keysyms_per_keycode as usize) as u8
         };
         let (alt, tab) = (code(ALT_L), code(0xff09));
         let press = |c: u8, down: bool| {
-            let t = if down { x11rb::protocol::xproto::KEY_PRESS_EVENT } else { x11rb::protocol::xproto::KEY_RELEASE_EVENT };
-            conn.xtest_fake_input(t, c, x11rb::CURRENT_TIME, root, 0, 0, 0).unwrap();
+            let t = if down {
+                x11rb::protocol::xproto::KEY_PRESS_EVENT
+            } else {
+                x11rb::protocol::xproto::KEY_RELEASE_EVENT
+            };
+            conn.xtest_fake_input(t, c, x11rb::CURRENT_TIME, root, 0, 0, 0)
+                .unwrap();
             conn.sync().unwrap();
             std::thread::sleep(Duration::from_millis(30));
         };
@@ -328,8 +442,15 @@ mod tests {
         while grab.finished().is_none() && t0.elapsed() < Duration::from_secs(2) {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(grab.finished(), Some(Held::default()), "letting go of Alt ends the grab");
-        assert_eq!(*got.lock().unwrap(), vec![key("Tab", true).unwrap(), key("Tab", false).unwrap()]);
+        assert_eq!(
+            grab.finished(),
+            Some(Held::default()),
+            "letting go of Alt ends the grab"
+        );
+        assert_eq!(
+            *got.lock().unwrap(),
+            vec![key("Tab", true).unwrap(), key("Tab", false).unwrap()]
+        );
         drop(grab);
         conn.destroy_window(win).unwrap();
         conn.sync().unwrap();

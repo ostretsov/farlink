@@ -56,7 +56,14 @@ pub fn response(tx: &TxId, addr: SocketAddr) -> Vec<u8> {
     let port = addr.port() ^ (MAGIC >> 16) as u16;
     let (family, ip): (u8, Vec<u8>) = match addr.ip() {
         IpAddr::V4(v4) => (1, (u32::from(v4) ^ MAGIC).to_be_bytes().to_vec()),
-        IpAddr::V6(v6) => (2, v6.octets().iter().zip(xor_key(tx)).map(|(a, k)| a ^ k).collect()),
+        IpAddr::V6(v6) => (
+            2,
+            v6.octets()
+                .iter()
+                .zip(xor_key(tx))
+                .map(|(a, k)| a ^ k)
+                .collect(),
+        ),
     };
     let value_len = 4 + ip.len() as u16;
     let mut b = header(BINDING_SUCCESS, 4 + value_len, tx);
@@ -88,7 +95,9 @@ pub fn parse_response(buf: &[u8], tx: &TxId) -> Option<SocketAddr> {
         if t == XOR_MAPPED_ADDRESS && len >= 8 {
             let port = u16::from_be_bytes([value[2], value[3]]) ^ (MAGIC >> 16) as u16;
             let ip = match (value[1], len) {
-                (1, 8) => IpAddr::V4(Ipv4Addr::from(u32::from_be_bytes(value[4..8].try_into().ok()?) ^ MAGIC)),
+                (1, 8) => IpAddr::V4(Ipv4Addr::from(
+                    u32::from_be_bytes(value[4..8].try_into().ok()?) ^ MAGIC,
+                )),
                 (2, 20) => {
                     let mut o = [0u8; 16];
                     for (i, (a, k)) in value[4..20].iter().zip(xor_key(tx)).enumerate() {
@@ -106,13 +115,21 @@ pub fn parse_response(buf: &[u8], tx: &TxId) -> Option<SocketAddr> {
 }
 
 /// Ask `server` how it sees `sock` (three tries, `timeout` in all).
-pub async fn query(sock: &tokio::net::UdpSocket, server: SocketAddr, timeout: Duration) -> Option<SocketAddr> {
+pub async fn query(
+    sock: &tokio::net::UdpSocket,
+    server: SocketAddr,
+    timeout: Duration,
+) -> Option<SocketAddr> {
     query_many(sock, &[server], timeout).await.pop().flatten()
 }
 
 /// Ask every server at once from the same socket (three tries each,
 /// `timeout` in all); the answers in the order of `servers`.
-pub async fn query_many(sock: &tokio::net::UdpSocket, servers: &[SocketAddr], timeout: Duration) -> Vec<Option<SocketAddr>> {
+pub async fn query_many(
+    sock: &tokio::net::UdpSocket,
+    servers: &[SocketAddr],
+    timeout: Duration,
+) -> Vec<Option<SocketAddr>> {
     let txs: Vec<TxId> = servers
         .iter()
         .map(|_| {
@@ -131,7 +148,9 @@ pub async fn query_many(sock: &tokio::net::UdpSocket, servers: &[SocketAddr], ti
         }
         let _ = tokio::time::timeout(timeout / 3, async {
             while seen.iter().any(Option::is_none) {
-                let Ok((n, from)) = sock.recv_from(&mut buf).await else { return };
+                let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+                    return;
+                };
                 for (i, server) in servers.iter().enumerate() {
                     if from == *server
                         && seen[i].is_none()
@@ -162,7 +181,9 @@ pub fn hard_nat(seen: &[SocketAddr]) -> bool {
 pub async fn serve(sock: tokio::net::UdpSocket) {
     let mut buf = [0u8; 512];
     loop {
-        let Ok((n, from)) = sock.recv_from(&mut buf).await else { continue };
+        let Ok((n, from)) = sock.recv_from(&mut buf).await else {
+            continue;
+        };
         if let Some(tx) = parse_request(&buf[..n]) {
             let _ = sock.send_to(&response(&tx, from), from).await;
         }
@@ -179,7 +200,11 @@ mod tests {
         assert_eq!(parse_request(&request(&tx)), Some(tx));
         for addr in ["203.0.113.7:51234", "[2001:db8::42]:9", "0.0.0.0:0"] {
             let addr: SocketAddr = addr.parse().unwrap();
-            assert_eq!(parse_response(&response(&tx, addr), &tx), Some(addr), "{addr}");
+            assert_eq!(
+                parse_response(&response(&tx, addr), &tx),
+                Some(addr),
+                "{addr}"
+            );
         }
     }
 
@@ -187,8 +212,16 @@ mod tests {
     fn rejects_other_messages() {
         let tx: TxId = [1; 12];
         let addr: SocketAddr = "198.51.100.1:7".parse().unwrap();
-        assert_eq!(parse_response(&response(&tx, addr), &[2; 12]), None, "other transaction");
-        assert_eq!(parse_request(&response(&tx, addr)), None, "an answer is no request");
+        assert_eq!(
+            parse_response(&response(&tx, addr), &[2; 12]),
+            None,
+            "other transaction"
+        );
+        assert_eq!(
+            parse_request(&response(&tx, addr)),
+            None,
+            "an answer is no request"
+        );
         assert_eq!(parse_request(b"hello, this is no STUN message"), None);
         assert_eq!(parse_request(&[0u8; 5]), None);
         let mut cut = response(&tx, addr);

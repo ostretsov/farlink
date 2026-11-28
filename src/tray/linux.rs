@@ -29,12 +29,20 @@ impl ksni::Tray for SniTray {
     fn icon_pixmap(&self) -> Vec<Icon> {
         ICON_SIZES
             .iter()
-            .map(|&size| Icon { width: size as i32, height: size as i32, data: icon::argb(size) })
+            .map(|&size| Icon {
+                width: size as i32,
+                height: size as i32,
+                data: icon::argb(size),
+            })
             .collect()
     }
 
     fn tool_tip(&self) -> ToolTip {
-        ToolTip { title: crate::PRODUCT.into(), description: "See and control your computers".into(), ..Default::default() }
+        ToolTip {
+            title: crate::PRODUCT.into(),
+            description: "See and control your computers".into(),
+            ..Default::default()
+        }
     }
 
     // Left click opens the window (trays that call Activate do this).
@@ -79,7 +87,11 @@ pub fn start(shared: Arc<Shared>, retry_for: Duration) -> Handle {
         .spawn(move || {
             let started = Instant::now();
             loop {
-                match (SniTray { shared: shared.clone() }).spawn() {
+                match (SniTray {
+                    shared: shared.clone(),
+                })
+                .spawn()
+                {
                     Ok(tray) => {
                         if shared.stop.load(Ordering::SeqCst) {
                             tray.shutdown().wait();
@@ -89,7 +101,9 @@ pub fn start(shared: Arc<Shared>, retry_for: Duration) -> Handle {
                         shared.set_status(TrayStatus::Ready);
                         return;
                     }
-                    Err(e) if started.elapsed() >= retry_for || shared.stop.load(Ordering::SeqCst) => {
+                    Err(e)
+                        if started.elapsed() >= retry_for || shared.stop.load(Ordering::SeqCst) =>
+                    {
                         log::warn!("no system tray: {e}");
                         shared.set_status(TrayStatus::Failed);
                         return;

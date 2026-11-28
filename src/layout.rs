@@ -46,7 +46,10 @@ impl LayoutStore {
     }
 
     pub fn get(&self, machine: &str, monitor: &str) -> Option<WindowPlace> {
-        self.machines.get(machine)?.get(monitor).map(|p| p.sanitized())
+        self.machines
+            .get(machine)?
+            .get(monitor)
+            .map(|p| p.sanitized())
     }
 
     /// Remember a place. Returns true if something changed (small jitters of
@@ -78,7 +81,9 @@ impl LayoutStore {
 
     /// Forget where one monitor's window goes (it opens side by side again).
     pub fn forget_monitor(&mut self, machine: &str, monitor: &str) -> bool {
-        let Some(m) = self.machines.get_mut(machine) else { return false };
+        let Some(m) = self.machines.get_mut(machine) else {
+            return false;
+        };
         let removed = m.remove(monitor).is_some();
         if m.is_empty() {
             self.machines.remove(machine);
@@ -93,7 +98,13 @@ impl LayoutStore {
 
 /// First-time placement: remote monitors side by side, in their real order,
 /// each sized to keep the remote aspect ratio within `area` (local screen).
-pub fn default_place(index: usize, count: usize, remote_w: u32, remote_h: u32, area: (f32, f32)) -> WindowPlace {
+pub fn default_place(
+    index: usize,
+    count: usize,
+    remote_w: u32,
+    remote_h: u32,
+    area: (f32, f32),
+) -> WindowPlace {
     let count = count.max(1) as f32;
     let margin = 24.0;
     let slot_w = ((area.0 - margin * (count + 1.0)) / count).max(320.0);
@@ -120,7 +131,14 @@ mod tests {
     use super::*;
 
     fn place(x: f32) -> WindowPlace {
-        WindowPlace { x, y: 10.0, w: 800.0, h: 600.0, fullscreen: false, maximized: false }
+        WindowPlace {
+            x,
+            y: 10.0,
+            w: 800.0,
+            h: 600.0,
+            fullscreen: false,
+            maximized: false,
+        }
     }
 
     #[test]
@@ -170,7 +188,15 @@ mod tests {
 
     #[test]
     fn broken_values_are_repaired() {
-        let p = WindowPlace { x: f32::NAN, y: -99_999.0, w: 5.0, h: f32::INFINITY, fullscreen: false, maximized: false }.sanitized();
+        let p = WindowPlace {
+            x: f32::NAN,
+            y: -99_999.0,
+            w: 5.0,
+            h: f32::INFINITY,
+            fullscreen: false,
+            maximized: false,
+        }
+        .sanitized();
         assert_eq!(p.x, 40.0);
         assert_eq!(p.y, -16_000.0);
         assert_eq!(p.w, 320.0);
@@ -180,9 +206,15 @@ mod tests {
     #[test]
     fn missing_or_corrupt_file_gives_empty_store() {
         let dir = crate::util::unique_temp_dir("farlink-layout");
-        assert_eq!(LayoutStore::load(&dir.join("none.json")), LayoutStore::default());
+        assert_eq!(
+            LayoutStore::load(&dir.join("none.json")),
+            LayoutStore::default()
+        );
         std::fs::write(dir.join("bad.json"), "{not json").unwrap();
-        assert_eq!(LayoutStore::load(&dir.join("bad.json")), LayoutStore::default());
+        assert_eq!(
+            LayoutStore::load(&dir.join("bad.json")),
+            LayoutStore::default()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

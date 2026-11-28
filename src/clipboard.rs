@@ -28,7 +28,9 @@ pub trait ClipboardBackend: Send {
 /// process: on X11 the copied text exists only while its owner is alive.
 static SYSTEM: Mutex<Option<arboard::Clipboard>> = Mutex::new(None);
 
-fn with_system<R>(f: impl FnOnce(&mut arboard::Clipboard) -> Result<R, arboard::Error>) -> Result<R> {
+fn with_system<R>(
+    f: impl FnOnce(&mut arboard::Clipboard) -> Result<R, arboard::Error>,
+) -> Result<R> {
     let mut guard = SYSTEM.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         *guard = Some(arboard::Clipboard::new()?);
@@ -104,7 +106,11 @@ impl ClipboardSync {
     }
 
     pub fn for_host(demo: bool) -> ClipboardSync {
-        if demo { ClipboardSync::new(Box::new(DemoClipboard)) } else { ClipboardSync::new(Box::new(SystemClipboard)) }
+        if demo {
+            ClipboardSync::new(Box::new(DemoClipboard))
+        } else {
+            ClipboardSync::new(Box::new(SystemClipboard))
+        }
     }
 
     /// The other side copied `text`: put it on this clipboard.
@@ -132,10 +138,17 @@ impl ClipboardSync {
 /// Host side: send text copied on this computer to the viewer until `stop`.
 /// Nothing is sent while the session is view-only (and what was copied
 /// meanwhile is not sent later either).
-pub fn poll_loop(sync: Arc<Mutex<ClipboardSync>>, tx: tokio::sync::mpsc::Sender<Message>, view_only: Arc<AtomicBool>, stop: Arc<AtomicBool>) {
+pub fn poll_loop(
+    sync: Arc<Mutex<ClipboardSync>>,
+    tx: tokio::sync::mpsc::Sender<Message>,
+    view_only: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) {
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(POLL);
-        let Some(text) = sync.lock().unwrap().changed() else { continue };
+        let Some(text) = sync.lock().unwrap().changed() else {
+            continue;
+        };
         if view_only.load(Ordering::Relaxed) {
             continue;
         }
@@ -168,10 +181,17 @@ mod tests {
         let mem = Mem::default();
         *mem.0.lock().unwrap() = Some("before".into());
         let mut sync = ClipboardSync::new(Box::new(mem.clone()));
-        assert_eq!(sync.changed(), None, "what was copied before the session stays");
+        assert_eq!(
+            sync.changed(),
+            None,
+            "what was copied before the session stays"
+        );
 
         sync.receive("from viewer\nline 2".into());
-        assert_eq!(mem.0.lock().unwrap().as_deref(), Some("from viewer\r\nline 2"));
+        assert_eq!(
+            mem.0.lock().unwrap().as_deref(),
+            Some("from viewer\r\nline 2")
+        );
         assert_eq!(sync.changed(), None, "received text is not sent back");
 
         *mem.0.lock().unwrap() = Some("copied here".into());
@@ -181,7 +201,11 @@ mod tests {
         *mem.0.lock().unwrap() = Some("x".repeat(MAX_TEXT + 1));
         assert_eq!(sync.changed(), None, "too long to share");
         sync.receive("y".repeat(MAX_TEXT + 1));
-        assert_eq!(mem.0.lock().unwrap().as_ref().map(|t| t.len()), Some(MAX_TEXT + 1), "too long text from the viewer is ignored");
+        assert_eq!(
+            mem.0.lock().unwrap().as_ref().map(|t| t.len()),
+            Some(MAX_TEXT + 1),
+            "too long text from the viewer is ignored"
+        );
     }
 
     /// Real clipboard of this machine (needs a display):

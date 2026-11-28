@@ -7,25 +7,25 @@
 //! changed). Where that is not available (older systems, turned screens,
 //! briefly after a desktop switch) GDI `BitBlt` is used instead.
 
+use super::dxgi::Duplicator;
 use super::{Desktop, PointerImage, PointerPos, to_absolute};
 use crate::codec::Frame;
 use crate::keys;
 use crate::proto::{InputEvent, MonitorInfo, MouseButton};
-use super::dxgi::Duplicator;
 use anyhow::{Result, bail};
 use std::collections::HashMap;
 use std::mem::{size_of, zeroed};
-use std::time::{Duration, Instant};
 use std::ptr::{null, null_mut};
+use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::StationsAndDesktops::*;
 use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
-use windows_sys::core::BOOL;
 use windows_sys::Win32::UI::HiDpi::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
+use windows_sys::core::BOOL;
 
 /// Named event the service waits on to send Ctrl+Alt+Del for us.
 pub const SAS_EVENT: &str = "Global\\FarlinkSendSAS";
@@ -113,7 +113,10 @@ impl WinDesktop {
         }
         match Duplicator::new() {
             Ok(d) => {
-                log::info!("screen capture: DXGI desktop duplication ({} screens)", d.outputs.len());
+                log::info!(
+                    "screen capture: DXGI desktop duplication ({} screens)",
+                    d.outputs.len()
+                );
                 self.dxgi = Some(d);
             }
             Err(e) => {
@@ -125,7 +128,11 @@ impl WinDesktop {
 
     /// The DXGI output showing monitor `m`, if any.
     fn output_index(&self, m: &MonitorInfo) -> Option<usize> {
-        self.dxgi.as_ref()?.outputs.iter().position(|o| o.x == m.x && o.y == m.y && o.width == m.width && o.height == m.height)
+        self.dxgi
+            .as_ref()?
+            .outputs
+            .iter()
+            .position(|o| o.x == m.x && o.y == m.y && o.width == m.width && o.height == m.height)
     }
 
     /// Cheap pointer check for `changed()`: position + shape. Uses the
@@ -136,7 +143,12 @@ impl WinDesktop {
             let mut ci: CURSORINFO = zeroed();
             ci.cbSize = size_of::<CURSORINFO>() as u32;
             if GetCursorInfo(&mut ci) != 0 {
-                return (ci.ptScreenPos.x, ci.ptScreenPos.y, ci.hCursor as usize, ci.flags & CURSOR_SHOWING != 0);
+                return (
+                    ci.ptScreenPos.x,
+                    ci.ptScreenPos.y,
+                    ci.hCursor as usize,
+                    ci.flags & CURSOR_SHOWING != 0,
+                );
             }
             let mut pos: POINT = zeroed();
             if GetCursorPos(&mut pos) != 0 {
@@ -172,26 +184,48 @@ impl WinDesktop {
                 draw_pointer_on(surf.dc, &p, m.x, m.y);
             }
         }
-        Ok(Frame::from_bgra(m.width, m.height, surf.pixels(), w as usize * 4))
+        Ok(Frame::from_bgra(
+            m.width,
+            m.height,
+            surf.pixels(),
+            w as usize * 4,
+        ))
     }
 
     fn send(&self, inputs: &[INPUT]) {
         unsafe {
-            SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<INPUT>() as i32);
+            SendInput(
+                inputs.len() as u32,
+                inputs.as_ptr(),
+                size_of::<INPUT>() as i32,
+            );
         }
     }
 
     fn mouse(flags: u32, dx: i32, dy: i32, data: i32) -> INPUT {
         let mut i: INPUT = unsafe { zeroed() };
         i.r#type = INPUT_MOUSE;
-        i.Anonymous.mi = MOUSEINPUT { dx, dy, mouseData: data as _, dwFlags: flags, time: 0, dwExtraInfo: 0 };
+        i.Anonymous.mi = MOUSEINPUT {
+            dx,
+            dy,
+            mouseData: data as _,
+            dwFlags: flags,
+            time: 0,
+            dwExtraInfo: 0,
+        };
         i
     }
 
     fn key(vk: u16, scan: u16, flags: u32) -> INPUT {
         let mut i: INPUT = unsafe { zeroed() };
         i.r#type = INPUT_KEYBOARD;
-        i.Anonymous.ki = KEYBDINPUT { wVk: vk, wScan: scan, dwFlags: flags, time: 0, dwExtraInfo: 0 };
+        i.Anonymous.ki = KEYBDINPUT {
+            wVk: vk,
+            wScan: scan,
+            dwFlags: flags,
+            time: 0,
+            dwExtraInfo: 0,
+        };
         i
     }
 
@@ -207,11 +241,18 @@ impl WinDesktop {
         };
         let nx = ((ax - vx) as i64 * 65535 / (vw as i64 - 1)) as i32;
         let ny = ((ay - vy) as i64 * 65535 / (vh as i64 - 1)) as i32;
-        Some(Self::mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, nx, ny, 0))
+        Some(Self::mouse(
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            nx,
+            ny,
+            0,
+        ))
     }
 
     fn named_key(&self, name: &str, down: bool) {
-        let Some((vk, ext)) = keys::windows_vk(name) else { return };
+        let Some((vk, ext)) = keys::windows_vk(name) else {
+            return;
+        };
         let scan = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as u16;
         let mut flags = if down { 0 } else { KEYEVENTF_KEYUP };
         if ext {
@@ -252,7 +293,15 @@ pub fn send_sas() {
 unsafe fn desktop_name(desk: HDESK) -> String {
     let mut buf = [0u16; 128];
     let mut need = 0u32;
-    let ok = unsafe { GetUserObjectInformationW(desk as HANDLE, UOI_NAME, buf.as_mut_ptr() as *mut _, (buf.len() * 2) as u32, &mut need) };
+    let ok = unsafe {
+        GetUserObjectInformationW(
+            desk as HANDLE,
+            UOI_NAME,
+            buf.as_mut_ptr() as *mut _,
+            (buf.len() * 2) as u32,
+            &mut need,
+        )
+    };
     if ok == 0 {
         return String::new();
     }
@@ -292,7 +341,14 @@ impl GdiSurface {
                 bail!("cannot create a {w}x{h} picture");
             }
             let old = SelectObject(dc, bmp as HGDIOBJ);
-            Ok(GdiSurface { dc, bmp, old, bits: bits as *mut u8, w, h })
+            Ok(GdiSurface {
+                dc,
+                bmp,
+                old,
+                bits: bits as *mut u8,
+                w,
+                h,
+            })
         }
     }
 
@@ -359,9 +415,21 @@ unsafe fn pointer_now() -> Option<Pointer> {
             cursor = arrow;
         }
         let mut bm: BITMAP = zeroed();
-        let (w, h) = if !ii.hbmColor.is_null() && GetObjectW(ii.hbmColor as HGDIOBJ, size_of::<BITMAP>() as i32, &mut bm as *mut _ as *mut _) != 0 {
+        let (w, h) = if !ii.hbmColor.is_null()
+            && GetObjectW(
+                ii.hbmColor as HGDIOBJ,
+                size_of::<BITMAP>() as i32,
+                &mut bm as *mut _ as *mut _,
+            ) != 0
+        {
             (bm.bmWidth, bm.bmHeight)
-        } else if !ii.hbmMask.is_null() && GetObjectW(ii.hbmMask as HGDIOBJ, size_of::<BITMAP>() as i32, &mut bm as *mut _ as *mut _) != 0 {
+        } else if !ii.hbmMask.is_null()
+            && GetObjectW(
+                ii.hbmMask as HGDIOBJ,
+                size_of::<BITMAP>() as i32,
+                &mut bm as *mut _ as *mut _,
+            ) != 0
+        {
             (bm.bmWidth, bm.bmHeight / 2) // AND mask on top of XOR mask
         } else {
             (32, 32)
@@ -385,9 +453,14 @@ fn note_pointer_fallback(info_ok: bool, flags: u32) {
     static NOTED: AtomicBool = AtomicBool::new(false);
     if !NOTED.swap(true, Ordering::Relaxed) {
         if info_ok {
-            log::info!("Windows reports the mouse pointer hidden (flags {flags:#x}); drawing an arrow instead");
+            log::info!(
+                "Windows reports the mouse pointer hidden (flags {flags:#x}); drawing an arrow instead"
+            );
         } else {
-            log::info!("cannot read the mouse pointer ({}); drawing an arrow instead", std::io::Error::last_os_error());
+            log::info!(
+                "cannot read the mouse pointer ({}); drawing an arrow instead",
+                std::io::Error::last_os_error()
+            );
         }
     }
 }
@@ -396,7 +469,17 @@ fn note_pointer_fallback(info_ok: bool, flags: u32) {
 /// Windows handles every pointer kind (colour, black/white, inverting) itself.
 unsafe fn draw_pointer_on(dc: HDC, p: &Pointer, ox: i32, oy: i32) {
     unsafe {
-        DrawIconEx(dc, p.left - ox, p.top - oy, p.cursor, 0, 0, 0, null_mut(), DI_NORMAL);
+        DrawIconEx(
+            dc,
+            p.left - ox,
+            p.top - oy,
+            p.cursor,
+            0,
+            0,
+            0,
+            null_mut(),
+            DI_NORMAL,
+        );
     }
 }
 
@@ -472,7 +555,9 @@ unsafe fn free_icon_info(ii: &ICONINFO) {
 /// Draw the pointer into a captured RGBA picture of monitor `m` (DXGI
 /// pictures don't contain it).
 fn draw_pointer(frame: &mut Frame, m: &MonitorInfo) {
-    let Some(p) = (unsafe { pointer_now() }) else { return };
+    let Some(p) = (unsafe { pointer_now() }) else {
+        return;
+    };
     let (left, top, w, h) = (p.left - m.x, p.top - m.y, p.w, p.h);
     let x0 = left.max(0);
     let y0 = top.max(0);
@@ -482,12 +567,15 @@ fn draw_pointer(frame: &mut Frame, m: &MonitorInfo) {
         return;
     }
     let (rw, rh) = (x1 - x0, y1 - y0);
-    let Ok(mut surf) = GdiSurface::new(rw, rh) else { return };
+    let Ok(mut surf) = GdiSurface::new(rw, rh) else {
+        return;
+    };
     let fw = frame.width as usize;
     {
         let px = surf.pixels();
         for row in 0..rh as usize {
-            let src = &frame.rgba[((y0 as usize + row) * fw + x0 as usize) * 4..][..rw as usize * 4];
+            let src =
+                &frame.rgba[((y0 as usize + row) * fw + x0 as usize) * 4..][..rw as usize * 4];
             let dst = &mut px[row * rw as usize * 4..][..rw as usize * 4];
             for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
                 d[0] = s[2];
@@ -501,7 +589,8 @@ fn draw_pointer(frame: &mut Frame, m: &MonitorInfo) {
     let px = surf.pixels();
     for row in 0..rh as usize {
         let src = &px[row * rw as usize * 4..][..rw as usize * 4];
-        let dst = &mut frame.rgba[((y0 as usize + row) * fw + x0 as usize) * 4..][..rw as usize * 4];
+        let dst =
+            &mut frame.rgba[((y0 as usize + row) * fw + x0 as usize) * 4..][..rw as usize * 4];
         for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
             d[0] = s[2];
             d[1] = s[1];
@@ -511,17 +600,28 @@ fn draw_pointer(frame: &mut Frame, m: &MonitorInfo) {
     }
 }
 
-unsafe extern "system" fn enum_monitor(hmon: HMONITOR, _hdc: HDC, _rc: *mut RECT, data: LPARAM) -> BOOL {
+unsafe extern "system" fn enum_monitor(
+    hmon: HMONITOR,
+    _hdc: HDC,
+    _rc: *mut RECT,
+    data: LPARAM,
+) -> BOOL {
     unsafe {
         let list = &mut *(data as *mut Vec<MonitorInfo>);
         let mut info: MONITORINFOEXW = zeroed();
         info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
         if GetMonitorInfoW(hmon, &mut info as *mut MONITORINFOEXW as *mut MONITORINFO) != 0 {
             let r = info.monitorInfo.rcMonitor;
-            let len = info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len());
+            let len = info
+                .szDevice
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(info.szDevice.len());
             list.push(MonitorInfo {
                 index: 0,
-                name: String::from_utf16_lossy(&info.szDevice[..len]).trim_start_matches("\\\\.\\").to_string(),
+                name: String::from_utf16_lossy(&info.szDevice[..len])
+                    .trim_start_matches("\\\\.\\")
+                    .to_string(),
                 x: r.left,
                 y: r.top,
                 width: (r.right - r.left).max(1) as u32,
@@ -538,7 +638,12 @@ impl Desktop for WinDesktop {
         self.follow_input_desktop();
         let mut list: Vec<MonitorInfo> = Vec::new();
         unsafe {
-            EnumDisplayMonitors(null_mut(), null(), Some(enum_monitor), &mut list as *mut _ as LPARAM);
+            EnumDisplayMonitors(
+                null_mut(),
+                null(),
+                Some(enum_monitor),
+                &mut list as *mut _ as LPARAM,
+            );
         }
         if list.is_empty() {
             bail!("no monitors found");
@@ -566,7 +671,9 @@ impl Desktop for WinDesktop {
             changed = pointer != self.pointer;
             self.pointer = pointer;
         }
-        let Some(d) = self.dxgi.as_mut() else { return true }; // GDI can't tell
+        let Some(d) = self.dxgi.as_mut() else {
+            return true;
+        }; // GDI can't tell
         for o in &mut d.outputs {
             match o.poll() {
                 Ok(c) => changed |= c,
@@ -604,7 +711,11 @@ impl Desktop for WinDesktop {
     fn pointer(&mut self) -> Option<PointerPos> {
         let p = unsafe { pointer_now() }?;
         self.cursor = p.cursor as usize;
-        Some(PointerPos { x: p.left + p.hot_x, y: p.top + p.hot_y, shape: p.cursor as usize as u64 })
+        Some(PointerPos {
+            x: p.left + p.hot_x,
+            y: p.top + p.hot_y,
+            shape: p.cursor as usize as u64,
+        })
     }
 
     fn pointer_image(&mut self) -> Option<PointerImage> {
@@ -630,7 +741,13 @@ impl Desktop for WinDesktop {
                     self.send(&[i]);
                 }
             }
-            InputEvent::MouseButton { mon, x, y, button, down } => {
+            InputEvent::MouseButton {
+                mon,
+                x,
+                y,
+                button,
+                down,
+            } => {
                 let flag = match (button, down) {
                     (MouseButton::Left, true) => MOUSEEVENTF_LEFTDOWN,
                     (MouseButton::Left, false) => MOUSEEVENTF_LEFTUP,

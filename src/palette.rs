@@ -73,9 +73,17 @@ impl Palette {
         if colors.is_empty() {
             colors.push([0, 0, 0]);
         }
-        let exact = colors.iter().enumerate().map(|(i, c)| (key(c[0], c[1], c[2]), i as u8)).collect();
+        let exact = colors
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (key(c[0], c[1], c[2]), i as u8))
+            .collect();
         let cells = (0..64 * 64 * 64).map(|_| AtomicU16::new(0)).collect();
-        Palette { colors, exact, cells }
+        Palette {
+            colors,
+            exact,
+            cells,
+        }
     }
 
     pub fn colors(&self) -> &[[u8; 3]] {
@@ -149,8 +157,16 @@ impl Palette {
             far += is_far as usize;
             indexed.push(idx);
         }
-        let far_share = if indexed.is_empty() { 0.0 } else { far as f32 / indexed.len() as f32 };
-        Mapped { palette, indexed, far_share }
+        let far_share = if indexed.is_empty() {
+            0.0
+        } else {
+            far as f32 / indexed.len() as f32
+        };
+        Mapped {
+            palette,
+            indexed,
+            far_share,
+        }
     }
 }
 
@@ -165,9 +181,16 @@ pub fn build(hist: &[(u32, u32)], max: usize) -> Vec<[u8; 3]> {
     let mut sorted: Vec<(u32, u32)> = hist.to_vec();
     sorted.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     // Exact: colours covering at least 0.1 % of the screen each, at most half the palette.
-    let popular = sorted.iter().take(max / 2).take_while(|h| h.1 as u64 * 1000 >= total).count();
+    let popular = sorted
+        .iter()
+        .take(max / 2)
+        .take_while(|h| h.1 as u64 * 1000 >= total)
+        .count();
     let mut out: Vec<[u8; 3]> = sorted[..popular].iter().map(|&(k, _)| rgb(k)).collect();
-    let rest: Vec<([u8; 3], u32)> = sorted[popular..].iter().map(|&(k, n)| (rgb(k), n)).collect();
+    let rest: Vec<([u8; 3], u32)> = sorted[popular..]
+        .iter()
+        .map(|&(k, n)| (rgb(k), n))
+        .collect();
     out.extend(median_cut(rest, max - popular));
     out
 }
@@ -181,7 +204,9 @@ fn median_cut(colors: Vec<([u8; 3], u32)>, n: usize) -> Vec<[u8; 3]> {
     fn measure(b: &[([u8; 3], u32)]) -> (usize, u8) {
         let mut best = (0, 0);
         for ch in 0..3 {
-            let (lo, hi) = b.iter().fold((255u8, 0u8), |(lo, hi), c| (lo.min(c.0[ch]), hi.max(c.0[ch])));
+            let (lo, hi) = b.iter().fold((255u8, 0u8), |(lo, hi), c| {
+                (lo.min(c.0[ch]), hi.max(c.0[ch]))
+            });
             if hi - lo >= best.1 {
                 best = (ch, hi - lo);
             }
@@ -221,7 +246,9 @@ fn median_cut(colors: Vec<([u8; 3], u32)>, n: usize) -> Vec<[u8; 3]> {
         .iter()
         .map(|b| {
             let n: u64 = b.iter().map(|c| c.1 as u64).sum::<u64>().max(1);
-            let avg = |ch: usize| ((b.iter().map(|c| c.0[ch] as u64 * c.1 as u64).sum::<u64>() + n / 2) / n) as u8;
+            let avg = |ch: usize| {
+                ((b.iter().map(|c| c.0[ch] as u64 * c.1 as u64).sum::<u64>() + n / 2) / n) as u8
+            };
             [avg(0), avg(1), avg(2)]
         })
         .collect()
@@ -260,7 +287,10 @@ impl PaletteLearner {
     /// Count the colours of a captured picture (cheap: a sample, not often).
     pub fn observe(&mut self, f: &Frame, now: Instant) {
         // Not often; pictures taken at the same moment (several monitors) all count.
-        if self.observed.is_some_and(|t| t != now && now.duration_since(t) < Self::OBSERVE_EVERY) {
+        if self
+            .observed
+            .is_some_and(|t| t != now && now.duration_since(t) < Self::OBSERVE_EVERY)
+        {
             return;
         }
         self.observed = Some(now);
@@ -331,7 +361,10 @@ impl PaletteLearner {
                 }
             };
         }
-        if self.built.is_some_and(|t| now.duration_since(t) < Self::REBUILD_EVERY) {
+        if self
+            .built
+            .is_some_and(|t| now.duration_since(t) < Self::REBUILD_EVERY)
+        {
             return false;
         }
         self.built = Some(now);
@@ -347,7 +380,11 @@ impl PaletteLearner {
         let work = move || {
             let _ = tx.send(better_palette(&old, &hist));
         };
-        if std::thread::Builder::new().name("palette".into()).spawn(work).is_err() {
+        if std::thread::Builder::new()
+            .name("palette".into())
+            .spawn(work)
+            .is_err()
+        {
             self.pending = None;
         }
         false
@@ -400,14 +437,18 @@ mod tests {
     #[test]
     fn common_colours_stay_true_and_the_rest_is_close() {
         // A white page with blue text shades and a smooth grey ramp of 1000 colours.
-        let mut hist: Vec<(u32, u32)> = vec![(key(255, 255, 255), 50_000), (key(0, 102, 204), 5_000)];
+        let mut hist: Vec<(u32, u32)> =
+            vec![(key(255, 255, 255), 50_000), (key(0, 102, 204), 5_000)];
         for i in 0..1000u32 {
             let v = (i * 255 / 999) as u8;
             hist.push((key(v, v, (i % 7) as u8), 3));
         }
         let colors = build(&hist, MAX_COLORS);
         assert!(colors.len() <= MAX_COLORS && colors.len() > 200);
-        assert!(colors.contains(&[255, 255, 255]) && colors.contains(&[0, 102, 204]), "common colours are exact");
+        assert!(
+            colors.contains(&[255, 255, 255]) && colors.contains(&[0, 102, 204]),
+            "common colours are exact"
+        );
         let p = Palette::new(colors);
         assert!(p.error(&hist) < 16.0, "error {}", p.error(&hist));
         let i = p.nearest(255, 255, 255) as usize;
@@ -418,12 +459,23 @@ mod tests {
     fn a_part_far_from_the_palette_says_so() {
         let p = Palette::new(vec![[0, 0, 0], [255, 255, 255]]);
         let text = frame_of(&[[0, 0, 0], [255, 255, 255], [250, 250, 250]], 30, 30);
-        assert!(p.map(&text).far_share <= MAX_FAR_SHARE, "nearly white is close enough");
+        assert!(
+            p.map(&text).far_share <= MAX_FAR_SHARE,
+            "nearly white is close enough"
+        );
         let photo = frame_of(&[[200, 30, 30], [30, 200, 30], [255, 255, 255]], 30, 30);
         let m = p.map(&photo);
-        assert!(m.far_share > 0.6, "red and green are far from black and white: {}", m.far_share);
+        assert!(
+            m.far_share > 0.6,
+            "red and green are far from black and white: {}",
+            m.far_share
+        );
         assert_eq!(m.palette.len() % 3, 0);
-        assert!(m.indexed.iter().all(|&i| (i as usize) < m.palette.len() / 3));
+        assert!(
+            m.indexed
+                .iter()
+                .all(|&i| (i as usize) < m.palette.len() / 3)
+        );
     }
 
     #[test]
@@ -442,7 +494,10 @@ mod tests {
         let colourful = frame_of(&colours, 256, 64);
         l.observe(&colourful, at(500));
         assert!(!l.step(at(500)));
-        assert!(Arc::ptr_eq(&first, &l.palette().unwrap()), "same palette until the next look for a better one");
+        assert!(
+            Arc::ptr_eq(&first, &l.palette().unwrap()),
+            "same palette until the next look for a better one"
+        );
 
         // ...but a few seconds later a better palette is worked out and taken.
         let mut replaced = false;
@@ -471,9 +526,15 @@ mod tests {
 
     #[test]
     fn median_cut_never_loses_or_invents_groups() {
-        let colors: Vec<([u8; 3], u32)> = (0..50u8).map(|i| ([i * 5, 255 - i * 5, i], 1 + i as u32)).collect();
+        let colors: Vec<([u8; 3], u32)> = (0..50u8)
+            .map(|i| ([i * 5, 255 - i * 5, i], 1 + i as u32))
+            .collect();
         assert_eq!(median_cut(colors.clone(), 8).len(), 8);
-        assert_eq!(median_cut(colors.clone(), 500).len(), 50, "no more groups than colours");
+        assert_eq!(
+            median_cut(colors.clone(), 500).len(),
+            50,
+            "no more groups than colours"
+        );
         assert_eq!(median_cut(vec![([1, 2, 3], 9)], 4), vec![[1, 2, 3]]);
         assert!(median_cut(Vec::new(), 4).is_empty());
     }

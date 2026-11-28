@@ -2,7 +2,10 @@
 
 use crate::codec::Canvas;
 use crate::codec::Frame;
-use crate::proto::{FileChunk, FsEntry, InputEvent, MonitorInfo, PREVIEW_MAX, Preview, PreviewShot, SessionMsg, TileHeader};
+use crate::proto::{
+    FileChunk, FsEntry, InputEvent, MonitorInfo, PREVIEW_MAX, Preview, PreviewShot, SessionMsg,
+    TileHeader,
+};
 use crate::quality::Quality;
 use crate::server::Overview;
 use crate::util::{url_encode, ws_url};
@@ -49,9 +52,14 @@ impl Api {
     /// Sign in. `username` empty = administrator; otherwise a person.
     pub fn login(server: &str, username: &str, password: &str) -> Result<String> {
         let url = format!("{}/api/login", server.trim_end_matches('/'));
-        let mut r = ureq::post(&url).send_json(json!({ "username": username, "password": password })).map_err(api_error)?;
+        let mut r = ureq::post(&url)
+            .send_json(json!({ "username": username, "password": password }))
+            .map_err(api_error)?;
         let v: serde_json::Value = r.body_mut().read_json()?;
-        v["token"].as_str().map(str::to_string).context("unexpected server answer")
+        v["token"]
+            .as_str()
+            .map(str::to_string)
+            .context("unexpected server answer")
     }
 
     fn url(&self, path: &str) -> String {
@@ -63,48 +71,70 @@ impl Api {
     }
 
     pub fn overview(&self) -> Result<Overview> {
-        let mut r = ureq::get(&self.url("/api/overview")).header("Authorization", &self.auth()).call().map_err(api_error)?;
+        let mut r = ureq::get(&self.url("/api/overview"))
+            .header("Authorization", &self.auth())
+            .call()
+            .map_err(api_error)?;
         Ok(r.body_mut().read_json()?)
     }
 
     /// Small pictures of a computer's screens (taken by its helper right now).
     pub fn preview(&self, machine_id: &str) -> Result<Preview> {
-        let mut r = ureq::get(&self.url(&format!("/api/machines/{}/preview", url_encode(machine_id))))
-            .header("Authorization", &self.auth())
-            .call()
-            .map_err(|e| match e {
-                ureq::Error::StatusCode(503) => anyhow!("This computer is offline right now"),
-                ureq::Error::StatusCode(504) => anyhow!("No preview from this computer (its helper may be too old)"),
-                e => api_error(e),
-            })?;
+        let mut r =
+            ureq::get(&self.url(&format!("/api/machines/{}/preview", url_encode(machine_id))))
+                .header("Authorization", &self.auth())
+                .call()
+                .map_err(|e| match e {
+                    ureq::Error::StatusCode(503) => anyhow!("This computer is offline right now"),
+                    ureq::Error::StatusCode(504) => {
+                        anyhow!("No preview from this computer (its helper may be too old)")
+                    }
+                    e => api_error(e),
+                })?;
         Ok(r.body_mut().read_json()?)
     }
 
     /// One screen at full size, taken by the computer's helper right now.
     /// Older helpers answer with the small preview pictures instead.
     pub fn screenshot(&self, machine_id: &str, index: u8) -> Result<Frame> {
-        let mut r = ureq::get(&self.url(&format!("/api/machines/{}/screenshot/{index}", url_encode(machine_id))))
-            .header("Authorization", &self.auth())
-            .config()
-            .timeout_global(Some(std::time::Duration::from_secs(60)))
-            .build()
-            .call()
-            .map_err(|e| match e {
-                ureq::Error::StatusCode(503) => anyhow!("This computer is offline right now"),
-                ureq::Error::StatusCode(504) => anyhow!("The computer did not send the screenshot"),
-                e => api_error(e),
-            })?;
+        let mut r = ureq::get(&self.url(&format!(
+            "/api/machines/{}/screenshot/{index}",
+            url_encode(machine_id)
+        )))
+        .header("Authorization", &self.auth())
+        .config()
+        .timeout_global(Some(std::time::Duration::from_secs(60)))
+        .build()
+        .call()
+        .map_err(|e| match e {
+            ureq::Error::StatusCode(503) => anyhow!("This computer is offline right now"),
+            ureq::Error::StatusCode(504) => anyhow!("The computer did not send the screenshot"),
+            e => api_error(e),
+        })?;
         let p: Preview = r.body_mut().with_config().limit(64 << 20).read_json()?;
-        decode_preview(&p).into_iter().find(|(i, _)| *i == index).map(|(_, f)| f).ok_or_else(|| anyhow!("The computer sent no picture of this screen"))
+        decode_preview(&p)
+            .into_iter()
+            .find(|(i, _)| *i == index)
+            .map(|(_, f)| f)
+            .ok_or_else(|| anyhow!("The computer sent no picture of this screen"))
     }
 
-    pub fn create_grant(&self, machine_id: &str, minutes: u64, view_only: bool, label: &str) -> Result<String> {
+    pub fn create_grant(
+        &self,
+        machine_id: &str,
+        minutes: u64,
+        view_only: bool,
+        label: &str,
+    ) -> Result<String> {
         let mut r = ureq::post(&self.url("/api/grants"))
             .header("Authorization", &self.auth())
             .send_json(json!({ "machine_id": machine_id, "minutes": minutes, "view_only": view_only, "label": label }))
             .map_err(api_error)?;
         let v: serde_json::Value = r.body_mut().read_json()?;
-        v["url"].as_str().map(str::to_string).context("unexpected server answer")
+        v["url"]
+            .as_str()
+            .map(str::to_string)
+            .context("unexpected server answer")
     }
 
     /// Give a computer a new display name (administrator only).
@@ -128,8 +158,12 @@ impl Api {
     /// Make a computer's helper install the published version now
     /// (administrator only). Returns that version.
     pub fn update_machine(&self, machine_id: &str) -> Result<String> {
-        let v = self.post_reading_error(&format!("/api/machines/{}/update", url_encode(machine_id)))?;
-        v["version"].as_str().map(str::to_string).context("unexpected server answer")
+        let v =
+            self.post_reading_error(&format!("/api/machines/{}/update", url_encode(machine_id)))?;
+        v["version"]
+            .as_str()
+            .map(str::to_string)
+            .context("unexpected server answer")
     }
 
     /// Update every online helper older than the published version. Returns how many.
@@ -159,12 +193,17 @@ impl Api {
     }
 
     pub fn revoke(&self, token: &str) -> Result<()> {
-        ureq::delete(&self.url(&format!("/api/grants/{token}"))).header("Authorization", &self.auth()).call().map_err(api_error)?;
+        ureq::delete(&self.url(&format!("/api/grants/{token}")))
+            .header("Authorization", &self.auth())
+            .call()
+            .map_err(api_error)?;
         Ok(())
     }
 
     pub fn logout(&self) {
-        let _ = ureq::post(&self.url("/api/logout")).header("Authorization", &self.auth()).send_empty();
+        let _ = ureq::post(&self.url("/api/logout"))
+            .header("Authorization", &self.auth())
+            .send_empty();
     }
 }
 
@@ -185,12 +224,24 @@ pub fn demo_preview(monitors: &[MonitorInfo], tick: u32) -> Preview {
     let shots = monitors
         .iter()
         .filter_map(|m| {
-            let f = crate::desktop::TestPattern::render(m, tick, Some((m.width as i32 / 2, m.height as i32 / 2)));
+            let f = crate::desktop::TestPattern::render(
+                m,
+                tick,
+                Some((m.width as i32 / 2, m.height as i32 / 2)),
+            );
             let (width, height, jpeg) = crate::codec::thumbnail_jpeg(&f, PREVIEW_MAX, 70).ok()?;
-            Some(PreviewShot { index: m.index, width, height, jpeg: crate::util::base64_encode(&jpeg) })
+            Some(PreviewShot {
+                index: m.index,
+                width,
+                height,
+                jpeg: crate::util::base64_encode(&jpeg),
+            })
         })
         .collect();
-    Preview { taken: crate::util::now_secs(), shots }
+    Preview {
+        taken: crate::util::now_secs(),
+        shots,
+    }
 }
 
 /// A temporary access link: `https://server/g/<token>`.
@@ -209,13 +260,21 @@ pub fn parse_link(link: &str) -> Option<GuestLink> {
     if token.is_empty() || !token.chars().all(|c| c.is_ascii_alphanumeric()) {
         return None;
     }
-    Some(GuestLink { server: server.to_string(), token: token.to_string() })
+    Some(GuestLink {
+        server: server.to_string(),
+        token: token.to_string(),
+    })
 }
 
 /// Where a session connects.
 #[derive(Debug, Clone)]
 pub enum Target {
-    Admin { server: String, token: String, machine_id: String, view_only: bool },
+    Admin {
+        server: String,
+        token: String,
+        machine_id: String,
+        view_only: bool,
+    },
     Guest(GuestLink),
     /// In-process pretend computer (no network).
     Demo,
@@ -224,9 +283,19 @@ pub enum Target {
 impl Target {
     pub fn url(&self) -> Option<String> {
         match self {
-            Target::Admin { server, token, machine_id, view_only } => Some(ws_url(
+            Target::Admin {
                 server,
-                &format!("/ws/view/{}?token={}&view_only={}", url_encode(machine_id), url_encode(token), if *view_only { 1 } else { 0 }),
+                token,
+                machine_id,
+                view_only,
+            } => Some(ws_url(
+                server,
+                &format!(
+                    "/ws/view/{}?token={}&view_only={}",
+                    url_encode(machine_id),
+                    url_encode(token),
+                    if *view_only { 1 } else { 0 }
+                ),
             )),
             Target::Guest(g) => Some(ws_url(&g.server, &format!("/ws/guest/{}", g.token))),
             Target::Demo => None,
@@ -328,11 +397,25 @@ impl SessionShared {
 
     fn file_message(&mut self, m: SessionMsg) {
         match m {
-            SessionMsg::FsListing { path, parent, entries, error, .. } => {
-                self.remote_dir = RemoteDir { path, parent, entries, error, loading: false };
+            SessionMsg::FsListing {
+                path,
+                parent,
+                entries,
+                error,
+                ..
+            } => {
+                self.remote_dir = RemoteDir {
+                    path,
+                    parent,
+                    entries,
+                    error,
+                    loading: false,
+                };
             }
             SessionMsg::FsBegin { req, name, size } => {
-                let Some((dir, file)) = self.downloads.get_mut(&req) else { return };
+                let Some((dir, file)) = self.downloads.get_mut(&req) else {
+                    return;
+                };
                 let name = crate::files::safe_name(&name).unwrap_or_else(|| "download".into());
                 let path = crate::files::unique_path(dir, &name);
                 let opened = std::fs::File::create(&path);
@@ -366,7 +449,9 @@ impl SessionShared {
 
     fn file_chunk(&mut self, c: FileChunk, data: &[u8]) {
         use std::io::Write;
-        let Some((_, Some(file))) = self.downloads.get_mut(&c.req) else { return };
+        let Some((_, Some(file))) = self.downloads.get_mut(&c.req) else {
+            return;
+        };
         let res = file.write_all(data);
         let last = c.last;
         if let Some(t) = self.transfer(c.req) {
@@ -422,11 +507,22 @@ impl SessionShared {
     /// Like [`apply`](Self::apply), with the picture part already decoded by
     /// [`decode_picture`] (done before taking the lock, so the UI never waits
     /// for decoding).
-    pub fn apply_decoded(&mut self, msg: &Message, decoded: Option<crate::codec::Frame>, quality: &Quality) -> Vec<SessionMsg> {
+    pub fn apply_decoded(
+        &mut self,
+        msg: &Message,
+        decoded: Option<crate::codec::Frame>,
+        quality: &Quality,
+    ) -> Vec<SessionMsg> {
         let mut replies = Vec::new();
         match msg {
             Message::Text(t) => match serde_json::from_str::<SessionMsg>(t) {
-                Ok(SessionMsg::Hello { hostname, os, monitors, view_only, .. }) => {
+                Ok(SessionMsg::Hello {
+                    hostname,
+                    os,
+                    monitors,
+                    view_only,
+                    ..
+                }) => {
                     self.hostname = hostname;
                     self.os = os;
                     self.monitors = monitors;
@@ -451,20 +547,44 @@ impl SessionShared {
                     self.remote_clipboard = Some(text.clone());
                     self.clipboard_in = Some(text);
                 }
-                Ok(SessionMsg::PointerShape { id, width, height, hot_x, hot_y, rgba }) => {
+                Ok(SessionMsg::PointerShape {
+                    id,
+                    width,
+                    height,
+                    hot_x,
+                    hot_y,
+                    rgba,
+                }) => {
                     if let Some(rgba) = crate::util::base64_decode(&rgba)
                         && (1..=256).contains(&width)
                         && (1..=256).contains(&height)
                         && rgba.len() == (width * height * 4) as usize
                         && id != 0
                     {
-                        let img = crate::desktop::PointerImage { width, height, hot_x: hot_x.min(width - 1), hot_y: hot_y.min(height - 1), rgba };
+                        let img = crate::desktop::PointerImage {
+                            width,
+                            height,
+                            hot_x: hot_x.min(width - 1),
+                            hot_y: hot_y.min(height - 1),
+                            rgba,
+                        };
                         self.pointer_shapes.insert(id, img);
                     }
                 }
                 Ok(SessionMsg::Pointer { x, y, shape }) => self.pointer = Some((x, y, shape)),
-                Ok(SessionMsg::Timing { capture_ms, encode_ms, rtt_ms, pace_fps }) => {
-                    let clean = |v: f32| if v.is_finite() { v.clamp(0.0, 60_000.0) } else { 0.0 };
+                Ok(SessionMsg::Timing {
+                    capture_ms,
+                    encode_ms,
+                    rtt_ms,
+                    pace_fps,
+                }) => {
+                    let clean = |v: f32| {
+                        if v.is_finite() {
+                            v.clamp(0.0, 60_000.0)
+                        } else {
+                            0.0
+                        }
+                    };
                     self.latency.host = Some(HostTiming {
                         capture_ms: clean(capture_ms),
                         encode_ms: clean(encode_ms),
@@ -472,7 +592,11 @@ impl SessionShared {
                         pace_fps: pace_fps.map(|v| clean(v).min(1000.0)),
                     });
                 }
-                Ok(m @ (SessionMsg::FsListing { .. } | SessionMsg::FsBegin { .. } | SessionMsg::FsDone { .. })) => self.file_message(m),
+                Ok(
+                    m @ (SessionMsg::FsListing { .. }
+                    | SessionMsg::FsBegin { .. }
+                    | SessionMsg::FsDone { .. }),
+                ) => self.file_message(m),
                 _ => {}
             },
             Message::Binary(b) => {
@@ -480,8 +604,15 @@ impl SessionShared {
                 if let Some((c, data)) = FileChunk::decode(b) {
                     self.file_chunk(c, data);
                 } else if let Some((h, data)) = TileHeader::decode(b) {
-                    match decoded.map(Ok).unwrap_or_else(|| crate::codec::decode_tile(h.format, data)) {
-                        Ok(tile) => self.canvases.entry(h.monitor).or_default().apply_tile(&h, &tile),
+                    match decoded
+                        .map(Ok)
+                        .unwrap_or_else(|| crate::codec::decode_tile(h.format, data))
+                    {
+                        Ok(tile) => self
+                            .canvases
+                            .entry(h.monitor)
+                            .or_default()
+                            .apply_tile(&h, &tile),
                         Err(e) => log::debug!("bad tile: {e}"),
                     }
                     if h.is_last() {
@@ -497,8 +628,13 @@ impl SessionShared {
             let mons = self.monitors.len().max(1) as f32;
             self.fps = self.window_frames as f32 / secs / mons;
             self.kbps = self.window_bytes as f32 / 1024.0 / secs;
-            let avg = |(sum, n): (f32, u32), old: Option<f32>| if n > 0 { Some(sum / n as f32) } else { old };
-            self.latency.decode_ms = avg(std::mem::take(&mut self.window_decode), self.latency.decode_ms);
+            let avg = |(sum, n): (f32, u32), old: Option<f32>| {
+                if n > 0 { Some(sum / n as f32) } else { old }
+            };
+            self.latency.decode_ms = avg(
+                std::mem::take(&mut self.window_decode),
+                self.latency.decode_ms,
+            );
             self.latency.draw_ms = avg(std::mem::take(&mut self.window_draw), self.latency.draw_ms);
             self.window_start = Instant::now();
             self.window_bytes = 0;
@@ -541,10 +677,18 @@ fn receive(shared: &Mutex<SessionShared>, msg: &Message, quality: &Quality) -> V
 pub enum Route {
     /// Through the Farlink server. `encrypted` = wss (HTTPS); `why`: why
     /// there is no direct path (`None`: not known yet).
-    Relay { server: String, encrypted: bool, why: Option<String> },
+    Relay {
+        server: String,
+        encrypted: bool,
+        why: Option<String>,
+    },
     /// Straight to the remote computer at `peer` over QUIC (see
     /// [`crate::direct`]); the server at `server` still watches over the session.
-    Direct { server: String, encrypted: bool, peer: std::net::SocketAddr },
+    Direct {
+        server: String,
+        encrypted: bool,
+        peer: std::net::SocketAddr,
+    },
     /// The pretend computer inside this program.
     Demo,
 }
@@ -555,18 +699,35 @@ impl Route {
         let encrypted = url.starts_with("wss://");
         let rest = url.split_once("://").map_or(url, |(_, r)| r);
         let server = rest.split(['/', '?']).next().unwrap_or(rest).to_string();
-        Route::Relay { server, encrypted, why: None }
+        Route::Relay {
+            server,
+            encrypted,
+            why: None,
+        }
     }
 
     /// The route now, given the direct-path state.
     pub fn with(&self, direct: &crate::direct::DirectState) -> Route {
         let (server, encrypted) = match self {
-            Route::Relay { server, encrypted, .. } | Route::Direct { server, encrypted, .. } => (server.clone(), *encrypted),
+            Route::Relay {
+                server, encrypted, ..
+            }
+            | Route::Direct {
+                server, encrypted, ..
+            } => (server.clone(), *encrypted),
             Route::Demo => return Route::Demo,
         };
         match direct.remote() {
-            Some(peer) => Route::Direct { server, encrypted, peer },
-            None => Route::Relay { server, encrypted, why: direct.why_not().map(str::to_string) },
+            Some(peer) => Route::Direct {
+                server,
+                encrypted,
+                peer,
+            },
+            None => Route::Relay {
+                server,
+                encrypted,
+                why: direct.why_not().map(str::to_string),
+            },
         }
     }
 
@@ -587,15 +748,28 @@ impl Route {
     /// One line for the hover text.
     pub fn describe(&self) -> String {
         match self {
-            Route::Relay { server, encrypted, why } => format!(
+            Route::Relay {
+                server,
+                encrypted,
+                why,
+            } => format!(
                 "Connection: all traffic goes through the relay {server} ({}){}",
-                if *encrypted { "encrypted, HTTPS" } else { "NOT encrypted, plain HTTP" },
-                why.as_ref().map_or(String::new(), |w| format!("\nNo direct path: {w}"))
+                if *encrypted {
+                    "encrypted, HTTPS"
+                } else {
+                    "NOT encrypted, plain HTTP"
+                },
+                why.as_ref()
+                    .map_or(String::new(), |w| format!("\nNo direct path: {w}"))
             ),
             Route::Direct { server, peer, .. } => format!(
                 "Connection: direct peer-to-peer to {peer} ({}), encrypted (QUIC, certificates exchanged through {server}). \
                  The server only watches over the session",
-                if crate::direct::is_lan(peer.ip()) { "same local network" } else { "across the internet" }
+                if crate::direct::is_lan(peer.ip()) {
+                    "same local network"
+                } else {
+                    "across the internet"
+                }
             ),
             Route::Demo => "Connection: pretend computer inside this program (no network)".into(),
         }
@@ -629,7 +803,13 @@ impl Latency {
     /// `None` until the host has sent a round trip.
     pub fn total_ms(&self) -> Option<f32> {
         let h = self.host?;
-        Some(h.capture_ms + h.encode_ms + h.rtt_ms? + self.decode_ms.unwrap_or(0.0) + self.draw_ms.unwrap_or(0.0))
+        Some(
+            h.capture_ms
+                + h.encode_ms
+                + h.rtt_ms?
+                + self.decode_ms.unwrap_or(0.0)
+                + self.draw_ms.unwrap_or(0.0),
+        )
     }
 
     /// The breakdown, one part per line.
@@ -642,7 +822,9 @@ impl Latency {
                 ms(self.draw_ms)
             );
         };
-        let pace = h.pace_fps.map_or(String::new(), |f| format!("\nPictures per second (automatic): up to {f:.0}"));
+        let pace = h.pace_fps.map_or(String::new(), |f| {
+            format!("\nPictures per second (automatic): up to {f:.0}")
+        });
         format!(
             "≈ {} from a click to seeing its result\n\nRead screen (remote): {}\nCompress (remote): {}\nNetwork round trip: {}\nDecode here: {}\nOn screen here: {}{pace}",
             ms(self.total_ms()),
@@ -684,7 +866,12 @@ pub struct SessionHandle {
 
 impl SessionHandle {
     /// Start connecting. `repaint` is called whenever something changed.
-    pub fn start(target: Target, quality: Quality, view_only: bool, repaint: Arc<dyn Fn() + Send + Sync>) -> SessionHandle {
+    pub fn start(
+        target: Target,
+        quality: Quality,
+        view_only: bool,
+        repaint: Arc<dyn Fn() + Send + Sync>,
+    ) -> SessionHandle {
         let shared = Arc::new(Mutex::new(SessionShared::new(view_only)));
         shared.lock().unwrap().route = Route::for_url(target.url().as_deref());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -699,7 +886,12 @@ impl SessionHandle {
                 runtime().spawn(demo_task(s2, rx, raw_rx, quality, view_only, r2));
             }
         }
-        SessionHandle { shared, tx, raw, repaint }
+        SessionHandle {
+            shared,
+            tx,
+            raw,
+            repaint,
+        }
     }
 
     pub fn send(&self, m: SessionMsg) {
@@ -723,12 +915,18 @@ impl SessionHandle {
         }
         {
             let mut s = self.shared.lock().unwrap();
-            if s.view_only || s.remote_clipboard.as_deref().is_some_and(|r| crate::clipboard::same_text(r, text)) {
+            if s.view_only
+                || s.remote_clipboard
+                    .as_deref()
+                    .is_some_and(|r| crate::clipboard::same_text(r, text))
+            {
                 return;
             }
             s.remote_clipboard = Some(text.to_string());
         }
-        self.send(SessionMsg::Clipboard { text: text.to_string() });
+        self.send(SessionMsg::Clipboard {
+            text: text.to_string(),
+        });
     }
 
     /// Switch between "only watch" and "control" (ignored for locked links).
@@ -752,12 +950,18 @@ impl SessionHandle {
             s.remote_changed = false;
             s.take_req()
         };
-        self.send(SessionMsg::FsList { req, path: path.to_string() });
+        self.send(SessionMsg::FsList {
+            req,
+            path: path.to_string(),
+        });
     }
 
     pub fn mkdir_remote(&self, path: &str) {
         let req = self.shared.lock().unwrap().take_req();
-        self.send(SessionMsg::FsMkdir { req, path: path.to_string() });
+        self.send(SessionMsg::FsMkdir {
+            req,
+            path: path.to_string(),
+        });
     }
 
     /// Copy a remote file into `local_dir` (never overwrites).
@@ -777,12 +981,18 @@ impl SessionHandle {
             });
             req
         };
-        self.send(SessionMsg::FsDownload { req, path: remote.path.clone() });
+        self.send(SessionMsg::FsDownload {
+            req,
+            path: remote.path.clone(),
+        });
     }
 
     /// Copy a local file into the remote folder `remote_dir`.
     pub fn upload(&self, local: PathBuf, remote_dir: String) {
-        let name = local.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = local
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let size = std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
         let req = {
             let mut s = self.shared.lock().unwrap();
@@ -811,8 +1021,19 @@ impl SessionHandle {
                 Ok(f) => f,
                 Err(e) => return fail(e.to_string()),
             };
-            let announce = SessionMsg::FsUpload { req, dir: remote_dir, name, size };
-            if raw.send(Message::Text(serde_json::to_string(&announce).unwrap().into())).await.is_err() {
+            let announce = SessionMsg::FsUpload {
+                req,
+                dir: remote_dir,
+                name,
+                size,
+            };
+            if raw
+                .send(Message::Text(
+                    serde_json::to_string(&announce).unwrap().into(),
+                ))
+                .await
+                .is_err()
+            {
                 return fail("connection closed".into());
             }
             if size == 0 {
@@ -827,7 +1048,13 @@ impl SessionHandle {
                 };
                 sent += n as u64;
                 let last = n == 0 || sent >= size;
-                if raw.send(Message::Binary(FileChunk { req, last }.encode(&buf[..n]).into())).await.is_err() {
+                if raw
+                    .send(Message::Binary(
+                        FileChunk { req, last }.encode(&buf[..n]).into(),
+                    ))
+                    .await
+                    .is_err()
+                {
                     return fail("connection closed".into());
                 }
                 if let Some(t) = shared.lock().unwrap().transfer(req) {
@@ -865,7 +1092,9 @@ async fn network_task(
         Ok((ws, _)) => ws,
         Err(e) => {
             close(match e {
-                tokio_tungstenite::tungstenite::Error::Http(r) if r.status() == 401 => "Please sign in again".into(),
+                tokio_tungstenite::tungstenite::Error::Http(r) if r.status() == 401 => {
+                    "Please sign in again".into()
+                }
                 tokio_tungstenite::tungstenite::Error::Http(r) if r.status() == 403 => {
                     "This link has expired or the access was withdrawn".into()
                 }
@@ -878,7 +1107,9 @@ async fn network_task(
     let (mut sink, mut stream) = ws.split();
     let (mut direct, mut direct_events) = crate::direct::DirectState::new(true);
     let server = Route::for_url(Some(&url));
-    let server_url = url.replacen("wss://", "https://", 1).replacen("ws://", "http://", 1);
+    let server_url = url
+        .replacen("wss://", "https://", 1)
+        .replacen("ws://", "http://", 1);
     let mut relay_ping = tokio::time::interval(crate::direct::RELAY_PING);
     loop {
         // What to send (through `direct.send`: the direct path when in use).
@@ -950,7 +1181,11 @@ async fn network_task(
             ok &= sink.send(crate::direct::json(m)).await.is_ok();
         }
         // Acks go out before decoding, so the host's round trip is the network's.
-        let acks: Vec<Message> = inbox.iter().filter_map(ack_for).map(|a| crate::direct::json(&a)).collect();
+        let acks: Vec<Message> = inbox
+            .iter()
+            .filter_map(ack_for)
+            .map(|a| crate::direct::json(&a))
+            .collect();
         for m in acks.into_iter().chain(out) {
             for m in direct.send(m).await {
                 ok &= sink.send(m).await.is_ok();
@@ -976,7 +1211,9 @@ async fn network_task(
             }
         }
         repaint();
-        if matches!(shared.lock().unwrap().state, ConnState::Closed(_)) { break; }
+        if matches!(shared.lock().unwrap().state, ConnState::Closed(_)) {
+            break;
+        }
     }
     direct.broken();
     repaint();
@@ -989,13 +1226,23 @@ fn direct_signal(msg: &Message) -> Option<SessionMsg> {
     if !(t.contains(r#""t":"direct_"#) || t.contains(r#""t":"path_switch""#)) {
         return None;
     }
-    serde_json::from_str(t).ok().filter(|m| matches!(m, SessionMsg::DirectInfo { .. } | SessionMsg::DirectOffer { .. } | SessionMsg::PathSwitch { .. }))
+    serde_json::from_str(t).ok().filter(|m| {
+        matches!(
+            m,
+            SessionMsg::DirectInfo { .. }
+                | SessionMsg::DirectOffer { .. }
+                | SessionMsg::PathSwitch { .. }
+        )
+    })
 }
 
 /// Messages only the relay sends (never taken from the direct path).
 fn relay_message(msg: &Message) -> bool {
     let Message::Text(t) = msg else { return false };
-    matches!(serde_json::from_str::<SessionMsg>(t.as_str()), Ok(SessionMsg::Closed { .. } | SessionMsg::ViewMode { .. }))
+    matches!(
+        serde_json::from_str::<SessionMsg>(t.as_str()),
+        Ok(SessionMsg::Closed { .. } | SessionMsg::ViewMode { .. })
+    )
 }
 
 /// Same as a network session but talking to a pretend two-screen computer
@@ -1077,21 +1324,48 @@ mod tests {
     fn route_tells_relay_and_encryption() {
         assert_eq!(
             Route::for_url(Some("wss://rd.example.com/ws/view/m1?token=x")),
-            Route::Relay { server: "rd.example.com".into(), encrypted: true, why: None }
+            Route::Relay {
+                server: "rd.example.com".into(),
+                encrypted: true,
+                why: None
+            }
         );
         assert_eq!(
             Route::for_url(Some("ws://10.0.0.5:8470/ws/guest/ab")),
-            Route::Relay { server: "10.0.0.5:8470".into(), encrypted: false, why: None }
+            Route::Relay {
+                server: "10.0.0.5:8470".into(),
+                encrypted: false,
+                why: None
+            }
         );
         assert_eq!(Route::for_url(None), Route::Demo);
-        assert!(Route::for_url(Some("ws://h/x")).describe().contains("NOT encrypted"));
-        let why = Route::Relay { server: "s".into(), encrypted: true, why: Some("the remote computer is behind a strict NAT".into()) };
+        assert!(
+            Route::for_url(Some("ws://h/x"))
+                .describe()
+                .contains("NOT encrypted")
+        );
+        let why = Route::Relay {
+            server: "s".into(),
+            encrypted: true,
+            why: Some("the remote computer is behind a strict NAT".into()),
+        };
         assert_eq!(why.short(), "via relay");
-        assert!(why.describe().contains("No direct path: the remote computer is behind a strict NAT"));
-        let lan = Route::Direct { server: "s".into(), encrypted: true, peer: "192.168.1.9:4000".parse().unwrap() };
+        assert!(
+            why.describe()
+                .contains("No direct path: the remote computer is behind a strict NAT")
+        );
+        let lan = Route::Direct {
+            server: "s".into(),
+            encrypted: true,
+            peer: "192.168.1.9:4000".parse().unwrap(),
+        };
         assert_eq!(lan.short(), "direct (LAN)");
         assert!(lan.describe().contains("same local network"));
-        let p2p = Route::Direct { server: "s".into(), encrypted: true, peer: "203.0.113.9:4000".parse().unwrap() };
+        let p2p = Route::Direct {
+            server: "s".into(),
+            encrypted: true,
+            peer: "203.0.113.9:4000".parse().unwrap(),
+        };
         assert_eq!(p2p.short(), "direct (p2p)");
     }
 
@@ -1099,9 +1373,19 @@ mod tests {
     fn latency_adds_up_host_network_and_viewer_parts() {
         let mut s = SessionShared::new(false);
         assert_eq!(s.latency.total_ms(), None);
-        let t = serde_json::to_string(&SessionMsg::Timing { capture_ms: 3.0, encode_ms: 7.0, rtt_ms: Some(30.0), pace_fps: Some(14.0) }).unwrap();
+        let t = serde_json::to_string(&SessionMsg::Timing {
+            capture_ms: 3.0,
+            encode_ms: 7.0,
+            rtt_ms: Some(30.0),
+            pace_fps: Some(14.0),
+        })
+        .unwrap();
         s.apply(&Message::Text(t.into()), &Quality::default());
-        assert_eq!(s.latency.total_ms(), Some(40.0), "nothing measured here yet");
+        assert_eq!(
+            s.latency.total_ms(),
+            Some(40.0),
+            "nothing measured here yet"
+        );
         s.latency.decode_ms = Some(2.0);
         s.latency.draw_ms = Some(8.0);
         assert_eq!(s.latency.total_ms(), Some(50.0));
@@ -1118,7 +1402,8 @@ mod tests {
     #[test]
     fn drawn_measures_arrival_to_screen() {
         let mut s = SessionShared::new(false);
-        s.undrawn.insert(0, Instant::now() - std::time::Duration::from_millis(12));
+        s.undrawn
+            .insert(0, Instant::now() - std::time::Duration::from_millis(12));
         s.drawn(0);
         s.drawn(1); // nothing waiting: ignored
         assert_eq!(s.window_draw.1, 1);
@@ -1129,9 +1414,15 @@ mod tests {
     fn parses_temporary_links() {
         assert_eq!(
             parse_link(" https://rd.example.com/g/abc123 "),
-            Some(GuestLink { server: "https://rd.example.com".into(), token: "abc123".into() })
+            Some(GuestLink {
+                server: "https://rd.example.com".into(),
+                token: "abc123".into()
+            })
         );
-        assert_eq!(parse_link("http://10.0.0.2:8470/g/ff00/").unwrap().server, "http://10.0.0.2:8470");
+        assert_eq!(
+            parse_link("http://10.0.0.2:8470/g/ff00/").unwrap().server,
+            "http://10.0.0.2:8470"
+        );
         assert!(parse_link("https://rd.example.com/x/abc").is_none());
         assert!(parse_link("rd.example.com/g/abc").is_none());
         assert!(parse_link("https://rd.example.com/g/a b").is_none());
@@ -1139,9 +1430,20 @@ mod tests {
 
     #[test]
     fn target_urls() {
-        let t = Target::Admin { server: "https://rd.x.com".into(), token: "tk".into(), machine_id: "m1".into(), view_only: true };
-        assert_eq!(t.url().unwrap(), "wss://rd.x.com/ws/view/m1?token=tk&view_only=1");
-        let g = Target::Guest(GuestLink { server: "http://h:1".into(), token: "zz".into() });
+        let t = Target::Admin {
+            server: "https://rd.x.com".into(),
+            token: "tk".into(),
+            machine_id: "m1".into(),
+            view_only: true,
+        };
+        assert_eq!(
+            t.url().unwrap(),
+            "wss://rd.x.com/ws/view/m1?token=tk&view_only=1"
+        );
+        let g = Target::Guest(GuestLink {
+            server: "http://h:1".into(),
+            token: "zz".into(),
+        });
         assert_eq!(g.url().unwrap(), "ws://h:1/ws/guest/zz");
         assert!(Target::Demo.url().is_none());
     }
@@ -1157,10 +1459,16 @@ mod tests {
             monitors: crate::desktop::TestPattern::dual().monitors,
             view_only: true,
         };
-        let r = s.apply(&Message::Text(serde_json::to_string(&hello).unwrap().into()), &q);
+        let r = s.apply(
+            &Message::Text(serde_json::to_string(&hello).unwrap().into()),
+            &q,
+        );
         assert_eq!(
             r,
-            vec![SessionMsg::Quality { quality: q }, SessionMsg::PointerMode { local: true }],
+            vec![
+                SessionMsg::Quality { quality: q },
+                SessionMsg::PointerMode { local: true }
+            ],
             "sends our quality on hello and asks to draw the pointer here"
         );
         assert_eq!(s.state, ConnState::Live);
@@ -1174,7 +1482,10 @@ mod tests {
         for m in msgs {
             let m = Message::Binary(m.into());
             acks.extend(ack_for(&m));
-            assert!(s.apply(&m, &q).is_empty(), "acks go before decoding, not from apply");
+            assert!(
+                s.apply(&m, &q).is_empty(),
+                "acks go before decoding, not from apply"
+            );
         }
         assert_eq!(acks, vec![SessionMsg::Ack { seq: 7 }]);
         assert_eq!(ack_for(&Message::Text("{}".into())), None);
@@ -1182,19 +1493,52 @@ mod tests {
 
         // Pointer shapes are checked before use; positions are kept.
         let arrow = crate::desktop::PointerImage::arrow();
-        let shape = |id, rgba: String| SessionMsg::PointerShape { id, width: arrow.width, height: arrow.height, hot_x: 0, hot_y: 0, rgba };
-        for bad in [shape(0, crate::util::base64_encode(&arrow.rgba)), shape(2, "AAAA".into()), shape(3, "not base64!".into())] {
-            s.apply(&Message::Text(serde_json::to_string(&bad).unwrap().into()), &q);
+        let shape = |id, rgba: String| SessionMsg::PointerShape {
+            id,
+            width: arrow.width,
+            height: arrow.height,
+            hot_x: 0,
+            hot_y: 0,
+            rgba,
+        };
+        for bad in [
+            shape(0, crate::util::base64_encode(&arrow.rgba)),
+            shape(2, "AAAA".into()),
+            shape(3, "not base64!".into()),
+        ] {
+            s.apply(
+                &Message::Text(serde_json::to_string(&bad).unwrap().into()),
+                &q,
+            );
         }
         assert!(s.pointer_shapes.is_empty(), "broken shapes ignored");
-        s.apply(&Message::Text(serde_json::to_string(&shape(1, crate::util::base64_encode(&arrow.rgba))).unwrap().into()), &q);
+        s.apply(
+            &Message::Text(
+                serde_json::to_string(&shape(1, crate::util::base64_encode(&arrow.rgba)))
+                    .unwrap()
+                    .into(),
+            ),
+            &q,
+        );
         assert_eq!(s.pointer_shapes[&1], arrow);
-        let pos = SessionMsg::Pointer { x: 10, y: 20, shape: 1 };
-        s.apply(&Message::Text(serde_json::to_string(&pos).unwrap().into()), &q);
+        let pos = SessionMsg::Pointer {
+            x: 10,
+            y: 20,
+            shape: 1,
+        };
+        s.apply(
+            &Message::Text(serde_json::to_string(&pos).unwrap().into()),
+            &q,
+        );
         assert_eq!(s.pointer, Some((10, 20, 1)));
 
-        let closed = SessionMsg::Closed { reason: "bye".into() };
-        s.apply(&Message::Text(serde_json::to_string(&closed).unwrap().into()), &q);
+        let closed = SessionMsg::Closed {
+            reason: "bye".into(),
+        };
+        s.apply(
+            &Message::Text(serde_json::to_string(&closed).unwrap().into()),
+            &q,
+        );
         assert_eq!(s.state, ConnState::Closed("bye".into()));
     }
 
@@ -1204,7 +1548,13 @@ mod tests {
         let mut p = demo_preview(&mons, 1);
         assert_eq!(p.shots.len(), 2);
         let frames = decode_preview(&p);
-        assert_eq!(frames.iter().map(|(i, f)| (*i, f.width, f.height)).collect::<Vec<_>>(), vec![(0, 480, 270), (1, 480, 384)]);
+        assert_eq!(
+            frames
+                .iter()
+                .map(|(i, f)| (*i, f.width, f.height))
+                .collect::<Vec<_>>(),
+            vec![(0, 480, 270), (1, 480, 384)]
+        );
         p.shots[0].jpeg = "not base64!".into();
         p.shots[1].jpeg = crate::util::base64_encode(b"not a jpeg");
         assert!(decode_preview(&p).is_empty());

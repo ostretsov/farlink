@@ -70,7 +70,8 @@ pub fn valid_login(l: &str) -> bool {
     !l.is_empty()
         && l.len() <= 40
         && l != "admin"
-        && l.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+        && l.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -156,18 +157,24 @@ impl std::fmt::Display for StoreError {
 }
 
 pub fn hash_password(pw: &str) -> String {
-    Argon2::default().hash_password(pw.as_bytes()).map(|h| h.to_string()).unwrap_or_default()
+    Argon2::default()
+        .hash_password(pw.as_bytes())
+        .map(|h| h.to_string())
+        .unwrap_or_default()
 }
 
 /// Hash of a random password nobody knows, checked for unknown sign-in names.
 fn unknown_user_hash() -> &'static str {
-    static HASH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| hash_password(&random_token(16)));
+    static HASH: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| hash_password(&random_token(16)));
     &HASH
 }
 
 pub fn verify_password(pw: &str, hash: &str) -> bool {
     match PasswordHash::new(hash) {
-        Ok(parsed) => Argon2::default().verify_password(pw.as_bytes(), &parsed).is_ok(),
+        Ok(parsed) => Argon2::default()
+            .verify_password(pw.as_bytes(), &parsed)
+            .is_ok(),
         Err(_) => false,
     }
 }
@@ -193,12 +200,17 @@ impl Store {
             return None;
         }
         let token = random_token(24);
-        self.admin_sessions.insert(sha256_hex(token.as_bytes()), now + ADMIN_SESSION_SECS);
+        self.admin_sessions
+            .insert(sha256_hex(token.as_bytes()), now + ADMIN_SESSION_SECS);
         Some(token)
     }
 
     pub fn check_admin(&self, token: &str, now: u64) -> bool {
-        !token.is_empty() && self.admin_sessions.get(&sha256_hex(token.as_bytes())).is_some_and(|&exp| now < exp)
+        !token.is_empty()
+            && self
+                .admin_sessions
+                .get(&sha256_hex(token.as_bytes()))
+                .is_some_and(|&exp| now < exp)
     }
 
     pub fn logout(&mut self, token: &str) {
@@ -224,7 +236,10 @@ impl Store {
         now: u64,
     ) -> Result<(String, String, String), StoreError> {
         if let (Some(id), Some(secret)) = (machine_id, secret) {
-            let m = self.machines.get_mut(id).ok_or(StoreError::UnknownMachine)?;
+            let m = self
+                .machines
+                .get_mut(id)
+                .ok_or(StoreError::UnknownMachine)?;
             if !constant_time_eq(&m.secret_hash, &sha256_hex(secret.as_bytes())) {
                 return Err(StoreError::BadSecret);
             }
@@ -270,25 +285,42 @@ impl Store {
         if !self.enroll_token.is_empty() && constant_time_eq(token, &self.enroll_token) {
             return Some(None);
         }
-        self.users.values().find(|u| constant_time_eq(token, &u.enroll_token)).map(|u| Some(u.id.clone()))
+        self.users
+            .values()
+            .find(|u| constant_time_eq(token, &u.enroll_token))
+            .map(|u| Some(u.id.clone()))
     }
 
     // -------------------------------------------------------------- people
 
-    pub fn create_user(&mut self, name: &str, login: &str, password: &str, now: u64) -> Result<User, StoreError> {
+    pub fn create_user(
+        &mut self,
+        name: &str,
+        login: &str,
+        password: &str,
+        now: u64,
+    ) -> Result<User, StoreError> {
         let name = name.trim();
         let login = login.trim().to_lowercase();
         if name.is_empty() || name.len() > 80 {
-            return Err(StoreError::InvalidRequest("name must be 1-80 characters".into()));
+            return Err(StoreError::InvalidRequest(
+                "name must be 1-80 characters".into(),
+            ));
         }
         if !valid_login(&login) {
-            return Err(StoreError::InvalidRequest("sign-in name: lowercase letters, digits, . _ - (not 'admin')".into()));
+            return Err(StoreError::InvalidRequest(
+                "sign-in name: lowercase letters, digits, . _ - (not 'admin')".into(),
+            ));
         }
         if self.users.values().any(|u| u.login == login) {
-            return Err(StoreError::InvalidRequest(format!("sign-in name '{login}' is already used")));
+            return Err(StoreError::InvalidRequest(format!(
+                "sign-in name '{login}' is already used"
+            )));
         }
         if password.chars().count() < 8 {
-            return Err(StoreError::InvalidRequest("password needs at least 8 characters".into()));
+            return Err(StoreError::InvalidRequest(
+                "password needs at least 8 characters".into(),
+            ));
         }
         let u = User {
             id: random_token(8),
@@ -304,9 +336,14 @@ impl Store {
 
     pub fn set_user_password(&mut self, id: &str, password: &str) -> Result<(), StoreError> {
         if password.chars().count() < 8 {
-            return Err(StoreError::InvalidRequest("password needs at least 8 characters".into()));
+            return Err(StoreError::InvalidRequest(
+                "password needs at least 8 characters".into(),
+            ));
         }
-        let u = self.users.get_mut(id).ok_or(StoreError::InvalidRequest("no such person".into()))?;
+        let u = self
+            .users
+            .get_mut(id)
+            .ok_or(StoreError::InvalidRequest("no such person".into()))?;
         u.password_hash = hash_password(password);
         self.user_sessions.retain(|_, (uid, _)| uid != id);
         Ok(())
@@ -314,8 +351,14 @@ impl Store {
 
     /// Remove a person: their computers stay (admin only), their sign-ins end.
     pub fn delete_user(&mut self, id: &str) -> Result<(), StoreError> {
-        self.users.remove(id).ok_or(StoreError::InvalidRequest("no such person".into()))?;
-        for m in self.machines.values_mut().filter(|m| m.owner.as_deref() == Some(id)) {
+        self.users
+            .remove(id)
+            .ok_or(StoreError::InvalidRequest("no such person".into()))?;
+        for m in self
+            .machines
+            .values_mut()
+            .filter(|m| m.owner.as_deref() == Some(id))
+        {
             m.owner = None;
         }
         self.user_sessions.retain(|_, (uid, _)| uid != id);
@@ -329,7 +372,10 @@ impl Store {
         {
             return Err(StoreError::InvalidRequest("no such person".into()));
         }
-        self.machines.get_mut(machine_id).ok_or(StoreError::UnknownMachine)?.owner = owner.map(str::to_string);
+        self.machines
+            .get_mut(machine_id)
+            .ok_or(StoreError::UnknownMachine)?
+            .owner = owner.map(str::to_string);
         Ok(())
     }
 
@@ -350,10 +396,18 @@ impl Store {
     pub fn credentials(&self, login: &str) -> (String, Option<Who>, String) {
         let login = login.trim().to_lowercase();
         if login.is_empty() || login == "admin" {
-            return (self.admin_hash.clone(), Some(Who::Admin), "Administrator".to_string());
+            return (
+                self.admin_hash.clone(),
+                Some(Who::Admin),
+                "Administrator".to_string(),
+            );
         }
         match self.users.values().find(|u| u.login == login) {
-            Some(u) => (u.password_hash.clone(), Some(Who::User(u.id.clone())), u.name.clone()),
+            Some(u) => (
+                u.password_hash.clone(),
+                Some(Who::User(u.id.clone())),
+                u.name.clone(),
+            ),
             None => (unknown_user_hash().to_string(), None, String::new()),
         }
     }
@@ -371,7 +425,8 @@ impl Store {
                 if !self.users.contains_key(id) {
                     return None;
                 }
-                self.user_sessions.insert(key, (id.clone(), now + ADMIN_SESSION_SECS));
+                self.user_sessions
+                    .insert(key, (id.clone(), now + ADMIN_SESSION_SECS));
             }
         }
         Some(token)
@@ -393,32 +448,51 @@ impl Store {
     pub fn can_access(&self, who: &Who, machine_id: &str) -> bool {
         match who {
             Who::Admin => self.machines.contains_key(machine_id),
-            Who::User(uid) => self.machines.get(machine_id).is_some_and(|m| m.owner.as_deref() == Some(uid.as_str())),
+            Who::User(uid) => self
+                .machines
+                .get(machine_id)
+                .is_some_and(|m| m.owner.as_deref() == Some(uid.as_str())),
         }
     }
 
     pub fn display_name(&self, who: &Who) -> String {
         match who {
             Who::Admin => "Administrator".into(),
-            Who::User(uid) => self.users.get(uid).map(|u| u.name.clone()).unwrap_or_default(),
+            Who::User(uid) => self
+                .users
+                .get(uid)
+                .map(|u| u.name.clone())
+                .unwrap_or_default(),
         }
     }
 
     fn unique_name(&self, base: &str) -> String {
-        let base = if base.trim().is_empty() { "computer" } else { base.trim() };
+        let base = if base.trim().is_empty() {
+            "computer"
+        } else {
+            base.trim()
+        };
         let taken = |n: &str| self.machines.values().any(|m| m.name == n);
         if !taken(base) {
             return base.to_string();
         }
-        (2..).map(|i| format!("{base} ({i})")).find(|n| !taken(n)).unwrap()
+        (2..)
+            .map(|i| format!("{base} ({i})"))
+            .find(|n| !taken(n))
+            .unwrap()
     }
 
     pub fn rename_machine(&mut self, id: &str, name: &str) -> Result<(), StoreError> {
         let name = name.trim();
         if !valid_machine_name(name) {
-            return Err(StoreError::InvalidRequest("name must be 1-80 characters".into()));
+            return Err(StoreError::InvalidRequest(
+                "name must be 1-80 characters".into(),
+            ));
         }
-        self.machines.get_mut(id).ok_or(StoreError::UnknownMachine)?.name = name.to_string();
+        self.machines
+            .get_mut(id)
+            .ok_or(StoreError::UnknownMachine)?
+            .name = name.to_string();
         Ok(())
     }
 
@@ -426,9 +500,14 @@ impl Store {
     pub fn set_notes(&mut self, id: &str, notes: &str) -> Result<(), StoreError> {
         let notes = notes.trim_end().replace("\r\n", "\n");
         if notes.chars().count() > MAX_NOTES {
-            return Err(StoreError::InvalidRequest(format!("notes can be at most {MAX_NOTES} characters")));
+            return Err(StoreError::InvalidRequest(format!(
+                "notes can be at most {MAX_NOTES} characters"
+            )));
         }
-        self.machines.get_mut(id).ok_or(StoreError::UnknownMachine)?.notes = notes;
+        self.machines
+            .get_mut(id)
+            .ok_or(StoreError::UnknownMachine)?
+            .notes = notes;
         Ok(())
     }
 
@@ -455,7 +534,9 @@ impl Store {
             return Err(StoreError::UnknownMachine);
         }
         if minutes == 0 || minutes > MAX_GRANT_MINUTES {
-            return Err(StoreError::InvalidRequest("duration must be 1 minute to 30 days".into()));
+            return Err(StoreError::InvalidRequest(
+                "duration must be 1 minute to 30 days".into(),
+            ));
         }
         let g = Grant {
             token: random_token(20),
@@ -490,7 +571,11 @@ impl Store {
     pub fn prune(&mut self, now: u64) -> usize {
         let before = self.grants.len();
         self.grants.retain(|_, g| {
-            let ended = if g.revoked { g.created.max(g.expires.min(now)) } else { g.expires };
+            let ended = if g.revoked {
+                g.created.max(g.expires.min(now))
+            } else {
+                g.expires
+            };
             now < ended + 7 * 86_400
         });
         self.admin_sessions.retain(|_, exp| now < *exp);
@@ -525,7 +610,10 @@ mod tests {
         assert!(!s.check_admin(&t, 200));
         let t2 = s.login("correct horse", 0).unwrap();
         s.set_password("new");
-        assert!(!s.check_admin(&t2, 1), "changing password signs everyone out");
+        assert!(
+            !s.check_admin(&t2, 1),
+            "changing password signs everyone out"
+        );
         assert!(s.login("new", 0).is_some());
     }
 
@@ -533,26 +621,40 @@ mod tests {
     fn enrolment_then_reconnect_with_secret() {
         let mut s = Store::new("pw", 0);
         let tok = s.enroll_token.clone();
-        assert_eq!(s.register(Some("nope"), None, None, info("pc"), 0), Err(StoreError::BadEnrollToken));
+        assert_eq!(
+            s.register(Some("nope"), None, None, info("pc"), 0),
+            Err(StoreError::BadEnrollToken)
+        );
         let (id, secret, name) = s.register(Some(&tok), None, None, info("pc"), 10).unwrap();
         assert_eq!(name, "pc");
         assert!(s.set_notes(&id, "Reception\r\n").is_ok());
         assert_eq!(s.machines[&id].notes, "Reception");
         assert!(s.set_notes(&id, &"x".repeat(MAX_NOTES + 1)).is_err());
         assert!(s.set_notes("nope", "x").is_err());
-        let (id2, _, _) = s.register(None, Some(&id), Some(&secret), info("pc-renamed"), 20).unwrap();
+        let (id2, _, _) = s
+            .register(None, Some(&id), Some(&secret), info("pc-renamed"), 20)
+            .unwrap();
         assert_eq!(id, id2);
         assert_eq!(s.machines[&id].hostname, "pc-renamed");
         assert_eq!(s.machines[&id].last_seen, 20);
-        assert_eq!(s.register(None, Some(&id), Some("bad"), info("pc"), 30), Err(StoreError::BadSecret));
-        assert_eq!(s.register(None, Some("ghost"), Some(&secret), info("pc"), 30), Err(StoreError::UnknownMachine));
+        assert_eq!(
+            s.register(None, Some(&id), Some("bad"), info("pc"), 30),
+            Err(StoreError::BadSecret)
+        );
+        assert_eq!(
+            s.register(None, Some("ghost"), Some(&secret), info("pc"), 30),
+            Err(StoreError::UnknownMachine)
+        );
         // Second machine with the same hostname gets a distinct name.
         let (_, _, n2) = s.register(Some(&tok), None, None, info("pc"), 40).unwrap();
         assert_eq!(n2, "pc (2)");
         // Rotated token stops old install links.
         s.rotate_enroll_token(70);
         assert_eq!(s.enroll_created, 70);
-        assert_eq!(s.register(Some(&tok), None, None, info("x"), 50), Err(StoreError::BadEnrollToken));
+        assert_eq!(
+            s.register(Some(&tok), None, None, info("x"), 50),
+            Err(StoreError::BadEnrollToken)
+        );
     }
 
     #[test]
@@ -560,9 +662,14 @@ mod tests {
         let mut s = Store::new("pw", 0);
         let tok = s.enroll_token.clone();
         let (id, _, _) = s.register(Some(&tok), None, None, info("srv"), 0).unwrap();
-        assert_eq!(s.create_grant("ghost", 10, true, "", 0), Err(StoreError::UnknownMachine));
+        assert_eq!(
+            s.create_grant("ghost", 10, true, "", 0),
+            Err(StoreError::UnknownMachine)
+        );
         assert!(s.create_grant(&id, 0, true, "", 0).is_err());
-        let g = s.create_grant(&id, 60, true, "  Support for Ana  ", 1000).unwrap();
+        let g = s
+            .create_grant(&id, 60, true, "  Support for Ana  ", 1000)
+            .unwrap();
         assert_eq!(g.label, "Support for Ana");
         assert_eq!(g.expires, 1000 + 3600);
         assert!(s.active_grant(&g.token, 1000).is_some());
@@ -604,14 +711,24 @@ mod tests {
         let mut s = Store::new("admin-pw", 0);
         let anna = s.create_user("Anna", "Anna", "anna-secret", 0).unwrap();
         assert_eq!(anna.login, "anna");
-        assert!(s.create_user("Other Anna", "anna", "12345678", 0).is_err(), "sign-in names are unique");
+        assert!(
+            s.create_user("Other Anna", "anna", "12345678", 0).is_err(),
+            "sign-in names are unique"
+        );
         assert!(s.create_user("X", "admin", "12345678", 0).is_err());
         assert!(s.create_user("X", "x", "short", 0).is_err());
 
         let general = s.enroll_token.clone();
-        let (pc_anna, _, _) = s.register(Some(&anna.enroll_token), None, None, info("ANNA-PC"), 0).unwrap();
-        let (pc_office, _, _) = s.register(Some(&general), None, None, info("OFFICE"), 0).unwrap();
-        assert_eq!(s.machines[&pc_anna].owner.as_deref(), Some(anna.id.as_str()));
+        let (pc_anna, _, _) = s
+            .register(Some(&anna.enroll_token), None, None, info("ANNA-PC"), 0)
+            .unwrap();
+        let (pc_office, _, _) = s
+            .register(Some(&general), None, None, info("OFFICE"), 0)
+            .unwrap();
+        assert_eq!(
+            s.machines[&pc_anna].owner.as_deref(),
+            Some(anna.id.as_str())
+        );
         assert_eq!(s.machines[&pc_office].owner, None);
 
         assert!(s.login_as("anna", "wrong", 0).is_none());
@@ -628,13 +745,22 @@ mod tests {
         assert!(s.can_access(&who, &pc_office));
         s.delete_user(&anna.id).unwrap();
         assert_eq!(s.who(&tok, 1), None, "her sign-in ends");
-        assert_eq!(s.machines[&pc_anna].owner, None, "computers stay, admin-only");
-        assert!(s.enroll_owner(&anna.enroll_token).is_none(), "her install link stops working");
+        assert_eq!(
+            s.machines[&pc_anna].owner, None,
+            "computers stay, admin-only"
+        );
+        assert!(
+            s.enroll_owner(&anna.enroll_token).is_none(),
+            "her install link stops working"
+        );
 
         assert!(s.login_as("nobody", "anna-secret", 0).is_none());
         let (_, unknown, _) = s.credentials("nobody");
         assert_eq!(unknown, None, "unknown names are never signed in");
-        assert!(s.start_session(&Who::User(anna.id.clone()), 0).is_none(), "removed people get no session");
+        assert!(
+            s.start_session(&Who::User(anna.id.clone()), 0).is_none(),
+            "removed people get no session"
+        );
 
         let (atok, awho, _) = s.login_as("", "admin-pw", 0).unwrap();
         assert_eq!(awho, Who::Admin);

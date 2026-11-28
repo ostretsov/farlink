@@ -89,13 +89,24 @@ fn in_round_rect(u: f64, v: f64, (l, t, r, b): (f64, f64, f64, f64), radius: f64
 }
 
 /// The classic arrow pointer, tip at the top left, in screen-relative units.
-const ARROW: [(f64, f64); 7] = [(0.0, 0.0), (0.0, 0.80), (0.19, 0.62), (0.31, 0.90), (0.44, 0.84), (0.32, 0.57), (0.57, 0.57)];
+const ARROW: [(f64, f64); 7] = [
+    (0.0, 0.0),
+    (0.0, 0.80),
+    (0.19, 0.62),
+    (0.31, 0.90),
+    (0.44, 0.84),
+    (0.32, 0.57),
+    (0.57, 0.57),
+];
 /// Where the tip is and how tall the arrow is.
 const ARROW_TIP: (f64, f64) = (0.40, 0.265);
 const ARROW_SIZE: f64 = 0.35;
 
 fn in_pointer(u: f64, v: f64) -> bool {
-    let (x, y) = ((u - ARROW_TIP.0) / ARROW_SIZE, (v - ARROW_TIP.1) / ARROW_SIZE);
+    let (x, y) = (
+        (u - ARROW_TIP.0) / ARROW_SIZE,
+        (v - ARROW_TIP.1) / ARROW_SIZE,
+    );
     // Even-odd ray casting.
     let mut inside = false;
     let mut j = ARROW.len() - 1;
@@ -135,7 +146,11 @@ mod tests {
         let img = rgba(32);
         assert_eq!(pixel(&img, 32, 0, 0)[3], 0, "corner cut off");
         for (x, y) in [(16, 0), (0, 16), (31, 16), (16, 31)] {
-            assert_eq!(pixel(&img, 32, x, y), opaque(PURPLE), "edge ({x},{y}) is purple");
+            assert_eq!(
+                pixel(&img, 32, x, y),
+                opaque(PURPLE),
+                "edge ({x},{y}) is purple"
+            );
         }
         assert!(img.chunks(4).filter(|p| p[3] == 255).count() > 32 * 32 * 9 / 10);
     }
@@ -143,9 +158,17 @@ mod tests {
     #[test]
     fn white_monitor_dark_screen_white_pointer() {
         let img = rgba(48);
-        assert_eq!(pixel(&img, 48, 7, 20), opaque(FRAME), "left side of the frame");
+        assert_eq!(
+            pixel(&img, 48, 7, 20),
+            opaque(FRAME),
+            "left side of the frame"
+        );
         assert_eq!(pixel(&img, 48, 24, 35), opaque(FRAME), "stand");
-        assert_eq!(pixel(&img, 48, 34, 26), opaque(SCREEN), "screen right of the pointer");
+        assert_eq!(
+            pixel(&img, 48, 34, 26),
+            opaque(SCREEN),
+            "screen right of the pointer"
+        );
         assert_eq!(pixel(&img, 48, 20, 18), opaque(POINTER), "pointer");
     }
 

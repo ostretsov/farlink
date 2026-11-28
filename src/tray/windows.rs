@@ -3,8 +3,8 @@
 
 use super::{Shared, TrayEvent, TrayStatus, icon};
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject};
@@ -13,11 +13,12 @@ use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
-    DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, HICON, ICONINFO, MF_CHECKED,
-    MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
-    SM_CXSMICON, SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP,
-    WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
+    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
+    DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics,
+    HICON, ICONINFO, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
+    RegisterClassW, RegisterWindowMessageW, SM_CXSMICON, SetForegroundWindow, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_CONTEXTMENU,
+    WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
 };
 
 /// The icon's messages arrive as this window message.
@@ -89,7 +90,13 @@ unsafe fn run(shared: Arc<Shared>, retry_for: Duration, handle: Handle) {
         let size = GetSystemMetrics(SM_CXSMICON).clamp(16, 64) as u32;
         let icon = make_icon(size);
         let taskbar_created = RegisterWindowMessageW(wide("TaskbarCreated").as_ptr());
-        STATE.with(|s| *s.borrow_mut() = Some(State { shared: shared.clone(), icon, taskbar_created }));
+        STATE.with(|s| {
+            *s.borrow_mut() = Some(State {
+                shared: shared.clone(),
+                icon,
+                taskbar_created,
+            })
+        });
 
         // Explorer may not be up yet right after login.
         let started = Instant::now();
@@ -151,7 +158,13 @@ fn make_icon(size: u32) -> HICON {
     unsafe {
         let color = CreateBitmap(size as i32, size as i32, 1, 32, bgra.as_ptr().cast());
         let mask_bmp = CreateBitmap(size as i32, size as i32, 1, 1, mask.as_ptr().cast());
-        let info = ICONINFO { fIcon: 1, xHotspot: 0, yHotspot: 0, hbmMask: mask_bmp, hbmColor: color };
+        let info = ICONINFO {
+            fIcon: 1,
+            xHotspot: 0,
+            yHotspot: 0,
+            hbmMask: mask_bmp,
+            hbmColor: color,
+        };
         let icon = CreateIconIndirect(&info);
         DeleteObject(color);
         DeleteObject(mask_bmp);
@@ -167,14 +180,26 @@ unsafe fn show_menu(hwnd: HWND, shared: &Shared) {
         let quit = wide("Quit");
         AppendMenuW(menu, MF_STRING, ID_OPEN, open.as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
-        let checked = if shared.autostart.load(Ordering::SeqCst) { MF_CHECKED } else { 0 };
+        let checked = if shared.autostart.load(Ordering::SeqCst) {
+            MF_CHECKED
+        } else {
+            0
+        };
         AppendMenuW(menu, MF_STRING | checked, ID_AUTOSTART, autostart.as_ptr());
         AppendMenuW(menu, MF_STRING, ID_QUIT, quit.as_ptr());
         let mut pt = POINT { x: 0, y: 0 };
         GetCursorPos(&mut pt);
         // Without this the menu does not close when clicking elsewhere.
         SetForegroundWindow(hwnd);
-        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, std::ptr::null());
+        let cmd = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            pt.x,
+            pt.y,
+            0,
+            hwnd,
+            std::ptr::null(),
+        );
         PostMessageW(hwnd, WM_NULL, 0, 0);
         DestroyMenu(menu);
         match cmd as usize {
@@ -188,7 +213,11 @@ unsafe fn show_menu(hwnd: HWND, shared: &Shared) {
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
-        let state = STATE.with(|s| s.borrow().as_ref().map(|st| (st.shared.clone(), st.icon, st.taskbar_created)));
+        let state = STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .map(|st| (st.shared.clone(), st.icon, st.taskbar_created))
+        });
         if let Some((shared, icon, taskbar_created)) = state {
             match msg {
                 WM_TRAY => {
@@ -230,7 +259,12 @@ impl Handle {
         if hwnd != 0 {
             unsafe {
                 // SendMessage waits, so the icon is gone before the app exits.
-                windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(hwnd as HWND, WM_CLOSE, 0, 0);
+                windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
+                    hwnd as HWND,
+                    WM_CLOSE,
+                    0,
+                    0,
+                );
             }
         }
     }

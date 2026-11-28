@@ -77,7 +77,10 @@ pub fn host_config_path() -> PathBuf {
         let base = std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into());
         PathBuf::from(base).join("Farlink").join("host.json")
     } else {
-        dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("farlink").join("host.json")
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("farlink")
+            .join("host.json")
     }
 }
 
@@ -211,7 +214,9 @@ pub fn viewer_dir() -> PathBuf {
     if let Ok(p) = std::env::var("FARLINK_VIEWER_DIR") {
         return PathBuf::from(p);
     }
-    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("farlink")
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("farlink")
 }
 
 // ---------------------------------------------------------------- server
@@ -255,7 +260,10 @@ fn default_stun_port() -> u16 {
 }
 
 pub fn default_extra_stun() -> Vec<String> {
-    vec!["stun.cloudflare.com:3478".into(), "stun.l.google.com:19302".into()]
+    vec![
+        "stun.cloudflare.com:3478".into(),
+        "stun.l.google.com:19302".into(),
+    ]
 }
 
 /// Where the server's HTTPS certificate comes from.
@@ -311,10 +319,17 @@ mod tests {
         std::fs::write(&p, "{}").unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
         save_json(&p, &serde_json::json!({"secret": "x"})).unwrap();
-        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600, "replaced file is owner-only");
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "replaced file is owner-only"
+        );
         let fresh = dir.join("new.json");
         save_json(&fresh, &1).unwrap();
-        assert_eq!(std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -340,17 +355,36 @@ mod tests {
     fn server_tls_settings() {
         let old: ServerConfig =
             serde_json::from_str(r#"{"public_url":"https://x","bind":"127.0.0.1:8470","data_dir":"/d","releases_dir":"/d/r"}"#).unwrap();
-        assert_eq!(old.tls, Tls::Off, "configs written before built-in HTTPS still load");
+        assert_eq!(
+            old.tls,
+            Tls::Off,
+            "configs written before built-in HTTPS still load"
+        );
         let auto: ServerConfig = serde_json::from_str(
             r#"{"public_url":"https://x","bind":"0.0.0.0:443","data_dir":"/d","releases_dir":"/d/r",
                 "tls":{"mode":"auto","domain":"rd.example.com"}}"#,
         )
         .unwrap();
-        assert_eq!(auto.tls, Tls::Auto { domain: "rd.example.com".into(), email: String::new(), staging: false });
-        let back: ServerConfig = serde_json::from_str(&serde_json::to_string(&auto).unwrap()).unwrap();
+        assert_eq!(
+            auto.tls,
+            Tls::Auto {
+                domain: "rd.example.com".into(),
+                email: String::new(),
+                staging: false
+            }
+        );
+        let back: ServerConfig =
+            serde_json::from_str(&serde_json::to_string(&auto).unwrap()).unwrap();
         assert_eq!(back, auto);
-        let files: Tls = serde_json::from_str(r#"{"mode":"files","cert":"/c.pem","key":"/k.pem"}"#).unwrap();
-        assert_eq!(files, Tls::Files { cert: "/c.pem".into(), key: "/k.pem".into() });
+        let files: Tls =
+            serde_json::from_str(r#"{"mode":"files","cert":"/c.pem","key":"/k.pem"}"#).unwrap();
+        assert_eq!(
+            files,
+            Tls::Files {
+                cert: "/c.pem".into(),
+                key: "/k.pem".into()
+            }
+        );
     }
 
     #[test]
@@ -364,7 +398,10 @@ mod tests {
     fn hidden_controls_are_remembered() {
         let v: ViewerConfig = serde_json::from_str(r#"{"server_url":"https://x"}"#).unwrap();
         assert!(!v.hide_controls, "controls shown unless hidden before");
-        let v = ViewerConfig { hide_controls: true, ..ViewerConfig::default() };
+        let v = ViewerConfig {
+            hide_controls: true,
+            ..ViewerConfig::default()
+        };
         let back: ViewerConfig = serde_json::from_str(&serde_json::to_string(&v).unwrap()).unwrap();
         assert!(back.hide_controls);
     }
@@ -378,6 +415,12 @@ mod tests {
         v.remember_link("https://x/g/5");
         assert_eq!(v.recent_links.len(), 8);
         assert_eq!(v.recent_links[0], "https://x/g/5");
-        assert_eq!(v.recent_links.iter().filter(|l| *l == "https://x/g/5").count(), 1);
+        assert_eq!(
+            v.recent_links
+                .iter()
+                .filter(|l| *l == "https://x/g/5")
+                .count(),
+            1
+        );
     }
 }

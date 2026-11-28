@@ -25,8 +25,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -159,14 +159,23 @@ impl Relay {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Err(e) = std::fs::set_permissions(&cfg.data_dir, std::fs::Permissions::from_mode(0o700)) {
+            if let Err(e) =
+                std::fs::set_permissions(&cfg.data_dir, std::fs::Permissions::from_mode(0o700))
+            {
                 log::warn!("could not make {} private: {e}", cfg.data_dir.display());
             }
         }
         let state_path = cfg.data_dir.join("state.json");
         let (store, first_password) = load_or_init_store(&state_path)?;
-        let source = cfg.update_from_github.clone().filter(|r| !r.trim().is_empty());
-        let update_status = crate::server_update::UpdateStatus::load(&cfg.data_dir.join(UPDATE_STATUS), source, now_secs());
+        let source = cfg
+            .update_from_github
+            .clone()
+            .filter(|r| !r.trim().is_empty());
+        let update_status = crate::server_update::UpdateStatus::load(
+            &cfg.data_dir.join(UPDATE_STATUS),
+            source,
+            now_secs(),
+        );
         if let Err(e) = save_json(&cfg.data_dir.join(UPDATE_STATUS), &update_status) {
             log::warn!("saving update status: {e}");
         }
@@ -229,7 +238,11 @@ impl Relay {
     }
 
     pub fn install_url(&self) -> String {
-        format!("{}/install/{}", self.cfg.public_url.trim_end_matches('/'), self.enroll_token())
+        format!(
+            "{}/install/{}",
+            self.cfg.public_url.trim_end_matches('/'),
+            self.enroll_token()
+        )
     }
 
     pub fn grant_url(&self, token: &str) -> String {
@@ -266,16 +279,30 @@ impl Relay {
                 sha
             }
         };
-        Some(UpdateInfo { version, sha256: sha, size: meta.len(), path: format!("/download/{target}/{file}") })
+        Some(UpdateInfo {
+            version,
+            sha256: sha,
+            size: meta.len(),
+            path: format!("/download/{target}/{file}"),
+        })
     }
 
     /// Tell every connected host that is older than the published version.
     pub fn push_updates(&self) -> usize {
-        let Some(v) = self.release_version() else { return 0 };
+        let Some(v) = self.release_version() else {
+            return 0;
+        };
         let agents = self.agents.lock().unwrap();
         let mut n = 0;
         for a in agents.values() {
-            if crate::version::is_newer(&v, &a.version) && a.tx.send(AgentMsg::UpdateAvailable { version: v.clone(), force: false }).is_ok() {
+            if crate::version::is_newer(&v, &a.version)
+                && a.tx
+                    .send(AgentMsg::UpdateAvailable {
+                        version: v.clone(),
+                        force: false,
+                    })
+                    .is_ok()
+            {
                 n += 1;
             }
         }
@@ -285,35 +312,66 @@ impl Relay {
     /// Tell one online helper to install the published version now, even if
     /// it would not do so on its own. Returns that version.
     pub fn force_update(&self, machine_id: &str) -> Result<String, String> {
-        let v = self.release_version().ok_or("No version is published for computers yet")?;
+        let v = self
+            .release_version()
+            .ok_or("No version is published for computers yet")?;
         let agents = self.agents.lock().unwrap();
         let a = agents.get(machine_id).ok_or("This computer is offline")?;
         if a.version == v {
             return Err(format!("Already running {v}"));
         }
-        a.tx.send(AgentMsg::UpdateAvailable { version: v.clone(), force: true }).map_err(|_| "This computer is offline")?;
-        let asked = ForcedUpdate { version: v.clone(), asked: Instant::now(), error: None };
-        self.forced_updates.lock().unwrap().insert(machine_id.to_string(), asked);
-        log::info!("administrator asked {machine_id} to update {} -> {v}", a.version);
+        a.tx.send(AgentMsg::UpdateAvailable {
+            version: v.clone(),
+            force: true,
+        })
+        .map_err(|_| "This computer is offline")?;
+        let asked = ForcedUpdate {
+            version: v.clone(),
+            asked: Instant::now(),
+            error: None,
+        };
+        self.forced_updates
+            .lock()
+            .unwrap()
+            .insert(machine_id.to_string(), asked);
+        log::info!(
+            "administrator asked {machine_id} to update {} -> {v}",
+            a.version
+        );
         Ok(v)
     }
 
     /// [`Relay::force_update`] for every online helper older than the
     /// published version (except those already updating).
     pub fn force_update_all(&self) -> usize {
-        let Some(v) = self.release_version() else { return 0 };
+        let Some(v) = self.release_version() else {
+            return 0;
+        };
         let older: Vec<String> = {
             let agents = self.agents.lock().unwrap();
-            agents.iter().filter(|(_, a)| crate::version::is_newer(&v, &a.version)).map(|(id, _)| id.clone()).collect()
+            agents
+                .iter()
+                .filter(|(_, a)| crate::version::is_newer(&v, &a.version))
+                .map(|(id, _)| id.clone())
+                .collect()
         };
-        let older: Vec<String> = older.into_iter().filter(|id| !self.forced_update_state(id, true).0).collect();
-        older.iter().filter(|id| self.force_update(id).is_ok()).count()
+        let older: Vec<String> = older
+            .into_iter()
+            .filter(|id| !self.forced_update_state(id, true).0)
+            .collect();
+        older
+            .iter()
+            .filter(|id| self.force_update(id).is_ok())
+            .count()
     }
 
     /// (`updating`, last error) of an update the administrator asked for.
     fn forced_update_state(&self, machine_id: &str, online: bool) -> (bool, Option<String>) {
         match self.forced_updates.lock().unwrap().get(machine_id) {
-            Some(f) => (online && f.error.is_none() && f.asked.elapsed() < FORCED_UPDATE_WAIT, f.error.clone()),
+            Some(f) => (
+                online && f.error.is_none() && f.asked.elapsed() < FORCED_UPDATE_WAIT,
+                f.error.clone(),
+            ),
             None => (false, None),
         }
     }
@@ -321,7 +379,13 @@ impl Relay {
     fn update_failed(&self, machine_id: &str, version: String, error: String) {
         log::warn!("{machine_id} could not update to {version}: {error}");
         let mut forced = self.forced_updates.lock().unwrap();
-        let f = forced.entry(machine_id.to_string()).or_insert_with(|| ForcedUpdate { version, asked: Instant::now(), error: None });
+        let f = forced
+            .entry(machine_id.to_string())
+            .or_insert_with(|| ForcedUpdate {
+                version,
+                asked: Instant::now(),
+                error: None,
+            });
         f.error = Some(error);
     }
 
@@ -337,7 +401,13 @@ impl Relay {
     }
 
     pub fn session_list(&self) -> Vec<SessionView> {
-        let mut v: Vec<SessionView> = self.sessions.lock().unwrap().values().map(|s| s.view.clone()).collect();
+        let mut v: Vec<SessionView> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .map(|s| s.view.clone())
+            .collect();
         v.sort_by_key(|s| s.started);
         v
     }
@@ -354,7 +424,9 @@ impl Relay {
         if expired.is_empty() {
             return 0;
         }
-        self.kill_sessions("This temporary link has expired", |s| s.grant.as_ref().is_some_and(|g| expired.contains(g)))
+        self.kill_sessions("This temporary link has expired", |s| {
+            s.grant.as_ref().is_some_and(|g| expired.contains(g))
+        })
     }
 
     /// Ask the host for a session socket and wait for it.
@@ -368,15 +440,27 @@ impl Relay {
     ) -> std::result::Result<(String, WebSocket, watch::Receiver<Option<String>>), String> {
         let tx = {
             let agents = self.agents.lock().unwrap();
-            agents.get(machine_id).map(|a| a.tx.clone()).ok_or("This computer is offline right now")?
+            agents
+                .get(machine_id)
+                .map(|a| a.tx.clone())
+                .ok_or("This computer is offline right now")?
         };
         let session_id = random_token(12);
         let (otx, orx) = oneshot::channel();
-        self.pending
-            .lock()
-            .unwrap()
-            .insert(session_id.clone(), Pending { machine_id: machine_id.to_string(), tx: otx });
-        if tx.send(AgentMsg::OpenSession { session_id: session_id.clone(), view_only }).is_err() {
+        self.pending.lock().unwrap().insert(
+            session_id.clone(),
+            Pending {
+                machine_id: machine_id.to_string(),
+                tx: otx,
+            },
+        );
+        if tx
+            .send(AgentMsg::OpenSession {
+                session_id: session_id.clone(),
+                view_only,
+            })
+            .is_err()
+        {
             self.pending.lock().unwrap().remove(&session_id);
             return Err("This computer just went offline".into());
         }
@@ -388,9 +472,23 @@ impl Relay {
             }
         };
         let (kill_tx, kill_rx) = watch::channel(None);
-        let view =
-            SessionView { id: session_id.clone(), machine_id: machine_id.into(), who, view_only, started: now_secs(), direct: false, grant, user };
-        self.sessions.lock().unwrap().insert(session_id.clone(), SessionEntry { view, kill: kill_tx });
+        let view = SessionView {
+            id: session_id.clone(),
+            machine_id: machine_id.into(),
+            who,
+            view_only,
+            started: now_secs(),
+            direct: false,
+            grant,
+            user,
+        };
+        self.sessions.lock().unwrap().insert(
+            session_id.clone(),
+            SessionEntry {
+                view,
+                kill: kill_tx,
+            },
+        );
         Ok((session_id, host, kill_rx))
     }
 }
@@ -398,35 +496,68 @@ impl Relay {
 impl Relay {
     /// Small pictures of a machine's screens (from the cache or asked from the
     /// host); with `full`, that one screen at full size (never cached).
-    pub async fn preview(&self, machine_id: &str, full: Option<u8>) -> std::result::Result<Preview, (StatusCode, &'static str)> {
+    pub async fn preview(
+        &self,
+        machine_id: &str,
+        full: Option<u8>,
+    ) -> std::result::Result<Preview, (StatusCode, &'static str)> {
         if full.is_none()
             && let Some((at, p)) = self.preview_cache.lock().unwrap().get(machine_id)
             && at.elapsed() < PREVIEW_CACHE
         {
             return Ok(p.clone());
         }
-        let tx = self.agents.lock().unwrap().get(machine_id).map(|a| a.tx.clone());
-        let Some(tx) = tx else { return Err((StatusCode::SERVICE_UNAVAILABLE, "This computer is offline right now")) };
+        let tx = self
+            .agents
+            .lock()
+            .unwrap()
+            .get(machine_id)
+            .map(|a| a.tx.clone());
+        let Some(tx) = tx else {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "This computer is offline right now",
+            ));
+        };
         let req = self.preview_seq.fetch_add(1, Ordering::Relaxed);
         let (otx, orx) = oneshot::channel();
-        self.previews.lock().unwrap().insert(req, (machine_id.to_string(), otx));
+        self.previews
+            .lock()
+            .unwrap()
+            .insert(req, (machine_id.to_string(), otx));
         if tx.send(AgentMsg::PreviewRequest { req, full }).is_err() {
             self.previews.lock().unwrap().remove(&req);
-            return Err((StatusCode::SERVICE_UNAVAILABLE, "This computer just went offline"));
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "This computer just went offline",
+            ));
         }
-        let wait = if full.is_some() { SCREENSHOT_TIMEOUT } else { PREVIEW_TIMEOUT };
+        let wait = if full.is_some() {
+            SCREENSHOT_TIMEOUT
+        } else {
+            PREVIEW_TIMEOUT
+        };
         let shots = match tokio::time::timeout(wait, orx).await {
             Ok(Ok(shots)) => shots,
             _ => {
                 self.previews.lock().unwrap().remove(&req);
-                return Err((StatusCode::GATEWAY_TIMEOUT, "The computer did not send a preview"));
+                return Err((
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "The computer did not send a preview",
+                ));
             }
         };
-        let p = Preview { taken: now_secs(), shots };
+        let p = Preview {
+            taken: now_secs(),
+            shots,
+        };
         if full.is_some() {
             return Ok(p);
         }
-        self.preview_cache.lock().unwrap().insert(machine_id.to_string(), (Instant::now(), p.clone()));
+        self.preview_cache
+            .lock()
+            .unwrap()
+            .insert(machine_id.to_string(), (Instant::now(), p.clone()));
         Ok(p)
     }
 
@@ -442,25 +573,70 @@ impl Relay {
 }
 
 fn safe_segment(s: &str) -> bool {
-    !s.is_empty() && s.len() < 100 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') && !s.contains("..")
+    !s.is_empty()
+        && s.len() < 100
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        && !s.contains("..")
 }
 
 pub fn router(relay: Shared) -> Router {
     Router::new()
         .route("/", get(admin_page))
-        .route("/assets/app.css", get(|| async { ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], APP_CSS) }))
-        .route("/assets/icon.svg", get(|| async { ([(header::CONTENT_TYPE, "image/svg+xml"), (header::CACHE_CONTROL, "public, max-age=86400")], ICON_SVG) }))
-        .route("/assets/admin.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], ADMIN_JS) }))
-        .route("/assets/viewer.js", get(|| async { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], VIEWER_JS) }))
+        .route(
+            "/assets/app.css",
+            get(|| async { ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], APP_CSS) }),
+        )
+        .route(
+            "/assets/icon.svg",
+            get(|| async {
+                (
+                    [
+                        (header::CONTENT_TYPE, "image/svg+xml"),
+                        (header::CACHE_CONTROL, "public, max-age=86400"),
+                    ],
+                    ICON_SVG,
+                )
+            }),
+        )
+        .route(
+            "/assets/admin.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    ADMIN_JS,
+                )
+            }),
+        )
+        .route(
+            "/assets/viewer.js",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                    VIEWER_JS,
+                )
+            }),
+        )
         .route("/view/{machine}", get(admin_viewer_page))
         .route("/g/{token}", get(guest_page))
         // Never reveal an install link to someone who just guesses the address.
-        .route("/install", get(|| async { message_page("Install link needed", "Ask the administrator for the install link of this computer.") }))
+        .route(
+            "/install",
+            get(|| async {
+                message_page(
+                    "Install link needed",
+                    "Ask the administrator for the install link of this computer.",
+                )
+            }),
+        )
         .route("/app", get(app_download_page))
         .route("/install/{token}", get(install_page))
         .route("/install/{token}/linux.sh", get(install_linux))
         .route("/install/{token}/windows.ps1", get(install_windows))
-        .route("/install/{token}/install-windows.cmd", get(install_windows_cmd))
+        .route(
+            "/install/{token}/install-windows.cmd",
+            get(install_windows_cmd),
+        )
         .route("/download/{target}/{file}", get(download))
         .route("/api/update", get(api_update))
         .route("/api/login", post(api_login))
@@ -518,19 +694,29 @@ async fn security_headers(mut res: Response) -> Response {
 #[derive(Clone, Copy, Debug)]
 pub struct ClientAddr(pub std::net::SocketAddr);
 
-impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>> for ClientAddr {
+impl
+    axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>>
+    for ClientAddr
+{
     fn connect_info(s: axum::serve::IncomingStream<'_, tokio::net::TcpListener>) -> Self {
         ClientAddr(*s.remote_addr())
     }
 }
 
-impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, crate::tls::PlainListener>> for ClientAddr {
+impl
+    axum::extract::connect_info::Connected<
+        axum::serve::IncomingStream<'_, crate::tls::PlainListener>,
+    > for ClientAddr
+{
     fn connect_info(s: axum::serve::IncomingStream<'_, crate::tls::PlainListener>) -> Self {
         ClientAddr(*s.remote_addr())
     }
 }
 
-impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, crate::tls::TlsListener>> for ClientAddr {
+impl
+    axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, crate::tls::TlsListener>>
+    for ClientAddr
+{
     fn connect_info(s: axum::serve::IncomingStream<'_, crate::tls::TlsListener>) -> Self {
         ClientAddr(*s.remote_addr())
     }
@@ -540,7 +726,9 @@ impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, crat
 /// same machine the proxy's `X-Forwarded-For` / `X-Real-IP` counts; from
 /// anywhere else those headers are ignored (anyone could send them).
 fn client_key(ext: &axum::http::Extensions, headers: &HeaderMap) -> String {
-    let Some(axum::extract::ConnectInfo(ClientAddr(peer))) = ext.get::<axum::extract::ConnectInfo<ClientAddr>>() else {
+    let Some(axum::extract::ConnectInfo(ClientAddr(peer))) =
+        ext.get::<axum::extract::ConnectInfo<ClientAddr>>()
+    else {
         return "unknown".into();
     };
     if peer.ip().is_loopback() {
@@ -591,24 +779,41 @@ where
     if relay.cfg.stun_port != 0 {
         match tokio::net::UdpSocket::bind(("0.0.0.0", relay.cfg.stun_port)).await {
             Ok(sock) => {
-                relay.stun_live.store(relay.cfg.stun_port, Ordering::Relaxed);
+                relay
+                    .stun_live
+                    .store(relay.cfg.stun_port, Ordering::Relaxed);
                 tokio::spawn(crate::stun::serve(sock));
             }
-            Err(e) => log::warn!("direct connections off: cannot use UDP port {}: {e}", relay.cfg.stun_port),
+            Err(e) => log::warn!(
+                "direct connections off: cannot use UDP port {}: {e}",
+                relay.cfg.stun_port
+            ),
         }
     }
-    if let Some(repo) = relay.cfg.update_from_github.clone().filter(|r| !r.trim().is_empty()) {
+    if let Some(repo) = relay
+        .cfg
+        .update_from_github
+        .clone()
+        .filter(|r| !r.trim().is_empty())
+    {
         crate::server_update::spawn(relay.clone(), repo.trim().to_string());
     }
     let public = relay.cfg.public_url.trim().to_lowercase();
-    if !public.starts_with("https://") && !public.contains("://127.0.0.1") && !public.contains("://localhost") {
+    if !public.starts_with("https://")
+        && !public.contains("://127.0.0.1")
+        && !public.contains("://localhost")
+    {
         log::warn!(
             "the public address {} is not https://: passwords, sign-ins and computer keys travel unencrypted. \
              Use HTTPS (--tls-domain or certificate files) unless this is a closed test network",
             relay.cfg.public_url
         );
     }
-    axum::serve(listener, router(relay).into_make_service_with_connect_info::<ClientAddr>()).await?;
+    axum::serve(
+        listener,
+        router(relay).into_make_service_with_connect_info::<ClientAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -634,19 +839,35 @@ fn who(relay: &Relay, headers: &HeaderMap) -> Option<Who> {
 }
 
 fn unauthorized() -> Response {
-    (StatusCode::UNAUTHORIZED, Json(json!({"error": "Please sign in again"}))).into_response()
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error": "Please sign in again"})),
+    )
+        .into_response()
 }
 
 fn bad(msg: impl ToString) -> Response {
-    (StatusCode::BAD_REQUEST, Json(json!({"error": msg.to_string()}))).into_response()
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": msg.to_string()})),
+    )
+        .into_response()
 }
 
 fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 fn message_page(title: &str, text: &str) -> Html<String> {
-    Html(MESSAGE_HTML.replace("{{TITLE}}", &html_escape(title)).replace("{{TEXT}}", &html_escape(text)))
+    Html(
+        MESSAGE_HTML
+            .replace("{{TITLE}}", &html_escape(title))
+            .replace("{{TEXT}}", &html_escape(text)),
+    )
 }
 
 /// Viewer page configuration (JSON embedded in the page).
@@ -679,7 +900,11 @@ async fn admin_page() -> Html<&'static str> {
 /// tells nothing about the computer: the script asks for its name signed in.
 async fn admin_viewer_page(Path(machine): Path<String>) -> Response {
     if !safe_segment(&machine) {
-        return message_page("Not found", "This computer is not registered on this server.").into_response();
+        return message_page(
+            "Not found",
+            "This computer is not registered on this server.",
+        )
+        .into_response();
     }
     viewer_page(json!({"mode": "admin", "machine": machine, "name": ""})).into_response()
 }
@@ -688,7 +913,11 @@ async fn guest_page(State(r): State<Shared>, Path(token): Path<String>) -> Respo
     let now = now_secs();
     let info = r.read_store(|s| {
         s.active_grant(&token, now).map(|g| {
-            let name = s.machines.get(&g.machine_id).map(|m| m.name.clone()).unwrap_or_default();
+            let name = s
+                .machines
+                .get(&g.machine_id)
+                .map(|m| m.name.clone())
+                .unwrap_or_default();
             (name, g.view_only, g.expires, g.label.clone())
         })
     });
@@ -709,9 +938,15 @@ fn valid_enroll(r: &Relay, token: &str) -> bool {
 }
 
 async fn install_page(State(r): State<Shared>, Path(token): Path<String>) -> Response {
-    let Some(owner) = r.read_store(|s| s.enroll_owner(&token).map(|o| o.and_then(|id| s.users.get(&id).map(|u| u.name.clone()))))
-    else {
-        return message_page("Install link not valid", "Ask the administrator for a fresh install link.").into_response();
+    let Some(owner) = r.read_store(|s| {
+        s.enroll_owner(&token)
+            .map(|o| o.and_then(|id| s.users.get(&id).map(|u| u.name.clone())))
+    }) else {
+        return message_page(
+            "Install link not valid",
+            "Ask the administrator for a fresh install link.",
+        )
+        .into_response();
     };
     let base = r.cfg.public_url.trim_end_matches('/').to_string();
     let for_whom = match owner {
@@ -726,7 +961,10 @@ async fn install_page(State(r): State<Shared>, Path(token): Path<String>) -> Res
         .replace("{{FOR}}", &for_whom)
         .replace("{{SERVER}}", &html_escape(&base))
         .replace("{{TOKEN}}", &html_escape(&token))
-        .replace("{{VERSION}}", &html_escape(&r.release_version().unwrap_or_else(|| crate::VERSION.into())));
+        .replace(
+            "{{VERSION}}",
+            &html_escape(&r.release_version().unwrap_or_else(|| crate::VERSION.into())),
+        );
     Html(page).into_response()
 }
 
@@ -815,17 +1053,31 @@ pub fn windows_cmd(server: &str, token: &str) -> String {
 
 async fn install_linux(State(r): State<Shared>, Path(token): Path<String>) -> Response {
     if !valid_enroll(&r, &token) {
-        return (StatusCode::NOT_FOUND, "echo 'This install link is not valid any more'; exit 1\n").into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            "echo 'This install link is not valid any more'; exit 1\n",
+        )
+            .into_response();
     }
-    ([(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")], linux_script(r.cfg.public_url.trim_end_matches('/'), &token))
+    (
+        [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
+        linux_script(r.cfg.public_url.trim_end_matches('/'), &token),
+    )
         .into_response()
 }
 
 async fn install_windows(State(r): State<Shared>, Path(token): Path<String>) -> Response {
     if !valid_enroll(&r, &token) {
-        return (StatusCode::NOT_FOUND, "Write-Host 'This install link is not valid any more'\n").into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            "Write-Host 'This install link is not valid any more'\n",
+        )
+            .into_response();
     }
-    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], windows_script(r.cfg.public_url.trim_end_matches('/'), &token))
+    (
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        windows_script(r.cfg.public_url.trim_end_matches('/'), &token),
+    )
         .into_response()
 }
 
@@ -836,15 +1088,23 @@ async fn install_windows_cmd(State(r): State<Shared>, Path(token): Path<String>)
     (
         [
             (header::CONTENT_TYPE, "application/octet-stream".to_string()),
-            (header::CONTENT_DISPOSITION, "attachment; filename=\"install-farlink.cmd\"".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"install-farlink.cmd\"".to_string(),
+            ),
         ],
         windows_cmd(r.cfg.public_url.trim_end_matches('/'), &token),
     )
         .into_response()
 }
 
-async fn download(State(r): State<Shared>, Path((target, file)): Path<(String, String)>) -> Response {
-    let allowed = PUBLISHED_APPS.iter().any(|a| crate::util::published_file(a, &target).as_deref() == Some(file.as_str()));
+async fn download(
+    State(r): State<Shared>,
+    Path((target, file)): Path<(String, String)>,
+) -> Response {
+    let allowed = PUBLISHED_APPS
+        .iter()
+        .any(|a| crate::util::published_file(a, &target).as_deref() == Some(file.as_str()));
     if !allowed || !safe_segment(&target) {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
@@ -852,12 +1112,19 @@ async fn download(State(r): State<Shared>, Path((target, file)): Path<(String, S
         Ok(bytes) => (
             [
                 (header::CONTENT_TYPE, "application/octet-stream".to_string()),
-                (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{file}\"")),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{file}\""),
+                ),
             ],
             bytes,
         )
             .into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "This program has not been published on the server yet").into_response(),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            "This program has not been published on the server yet",
+        )
+            .into_response(),
     }
 }
 
@@ -868,7 +1135,11 @@ async fn api_update(State(r): State<Shared>, Query(q): Query<HashMap<String, Str
     let target = q.get("target").map(String::as_str).unwrap_or("");
     match r.release_info(app, target) {
         Some(info) => Json(info).into_response(),
-        None => (StatusCode::NOT_FOUND, Json(json!({"error": "nothing published"}))).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "nothing published"})),
+        )
+            .into_response(),
     }
 }
 
@@ -880,12 +1151,25 @@ struct LoginReq {
     password: String,
 }
 
-async fn api_login(State(r): State<Shared>, ext: axum::http::Extensions, headers: HeaderMap, Json(req): Json<LoginReq>) -> Response {
+async fn api_login(
+    State(r): State<Shared>,
+    ext: axum::http::Extensions,
+    headers: HeaderMap,
+    Json(req): Json<LoginReq>,
+) -> Response {
     let addr = client_key(&ext, &headers);
-    if let Some(wait) = r.login_guard.lock().unwrap().blocked(&addr, &req.username, now_secs()) {
+    if let Some(wait) = r
+        .login_guard
+        .lock()
+        .unwrap()
+        .blocked(&addr, &req.username, now_secs())
+    {
         log::warn!("sign-in from {addr} refused: too many wrong passwords");
         let mins = wait.div_ceil(60).max(1);
-        let msg = format!("Too many wrong passwords. Try again in {mins} minute{}.", if mins == 1 { "" } else { "s" });
+        let msg = format!(
+            "Too many wrong passwords. Try again in {mins} minute{}.",
+            if mins == 1 { "" } else { "s" }
+        );
         return (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": msg}))).into_response();
     }
     let ok = if req.username.len() > MAX_CREDENTIAL || req.password.len() > MAX_CREDENTIAL {
@@ -893,12 +1177,18 @@ async fn api_login(State(r): State<Shared>, ext: axum::http::Extensions, headers
     } else {
         // The slow password check runs outside the state lock and on a
         // blocking thread, a few at a time.
-        let Ok(_slot) = r.login_slots.acquire().await else { return unauthorized() };
+        let Ok(_slot) = r.login_slots.acquire().await else {
+            return unauthorized();
+        };
         let (hash, who, name) = r.read_store(|s| s.credentials(&req.username));
         let pw = req.password.clone();
-        let right = tokio::task::spawn_blocking(move || crate::grants::verify_password(&pw, &hash)).await.unwrap_or(false);
+        let right = tokio::task::spawn_blocking(move || crate::grants::verify_password(&pw, &hash))
+            .await
+            .unwrap_or(false);
         match who {
-            Some(who) if right => r.with_store(|s| s.start_session(&who, now_secs())).map(|t| (t, who, name)),
+            Some(who) if right => r
+                .with_store(|s| s.start_session(&who, now_secs()))
+                .map(|t| (t, who, name)),
             _ => None,
         }
     };
@@ -909,10 +1199,17 @@ async fn api_login(State(r): State<Shared>, ext: axum::http::Extensions, headers
             Json(json!({"token": t, "role": role, "name": name})).into_response()
         }
         None => {
-            r.login_guard.lock().unwrap().failed(&addr, &req.username, now_secs());
+            r.login_guard
+                .lock()
+                .unwrap()
+                .failed(&addr, &req.username, now_secs());
             log::info!("wrong password from {addr}");
             tokio::time::sleep(Duration::from_millis(800)).await; // slow down guessing
-            (StatusCode::UNAUTHORIZED, Json(json!({"error": "Wrong password"}))).into_response()
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "Wrong password"})),
+            )
+                .into_response()
         }
     }
 }
@@ -1040,11 +1337,16 @@ fn admin_role() -> String {
 pub fn overview_for(r: &Relay, who: &Who) -> Overview {
     let mut o = overview(r);
     if let Who::User(uid) = who {
-        o.machines.retain(|m| m.machine.owner.as_deref() == Some(uid.as_str()));
+        o.machines
+            .retain(|m| m.machine.owner.as_deref() == Some(uid.as_str()));
         // Notes are the administrator's own.
         o.machines.iter_mut().for_each(|m| m.machine.notes.clear());
         let mine: Vec<String> = o.machines.iter().map(|m| m.machine.id.clone()).collect();
-        o.sessions.retain(|s| s["machine_id"].as_str().is_some_and(|id| mine.iter().any(|m| m == id)));
+        o.sessions.retain(|s| {
+            s["machine_id"]
+                .as_str()
+                .is_some_and(|id| mine.iter().any(|m| m == id))
+        });
         o.grants.clear();
         o.users.clear();
         o.install_url.clear();
@@ -1075,12 +1377,35 @@ pub fn overview(r: &Relay) -> Overview {
                     machine: m.into(),
                     online,
                     sessions: sessions.iter().filter(|x| x.machine_id == m.id).count(),
-                    up_to_date: release.as_ref().is_none_or(|v| !crate::version::is_newer(v, &m.version)),
-                    owner_name: m.owner.as_ref().and_then(|o| s.users.get(o)).map(|u| u.name.clone()),
+                    up_to_date: release
+                        .as_ref()
+                        .is_none_or(|v| !crate::version::is_newer(v, &m.version)),
+                    owner_name: m
+                        .owner
+                        .as_ref()
+                        .and_then(|o| s.users.get(o))
+                        .map(|u| u.name.clone()),
                     updating,
                     update_error,
-                    stats: if online { r.agents.lock().unwrap().get(&m.id).and_then(|a| a.stats.clone()) } else { None },
-                    load: if online { r.load.lock().unwrap().get(&m.id).map(|h| h.recent(now_secs())).unwrap_or_default() } else { Vec::new() },
+                    stats: if online {
+                        r.agents
+                            .lock()
+                            .unwrap()
+                            .get(&m.id)
+                            .and_then(|a| a.stats.clone())
+                    } else {
+                        None
+                    },
+                    load: if online {
+                        r.load
+                            .lock()
+                            .unwrap()
+                            .get(&m.id)
+                            .map(|h| h.recent(now_secs()))
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    },
                 }
             })
             .collect();
@@ -1092,18 +1417,34 @@ pub fn overview(r: &Relay) -> Overview {
                 name: u.name.clone(),
                 login: u.login.clone(),
                 install_url: format!("{base}/install/{}", u.enroll_token),
-                machines: s.machines.values().filter(|m| m.owner.as_deref() == Some(u.id.as_str())).map(|m| m.id.clone()).collect(),
+                machines: s
+                    .machines
+                    .values()
+                    .filter(|m| m.owner.as_deref() == Some(u.id.as_str()))
+                    .map(|m| m.id.clone())
+                    .collect(),
             })
             .collect();
         users.sort_by_key(|u| u.name.to_lowercase());
-        machines.sort_by(|a, b| b.online.cmp(&a.online).then(a.machine.name.to_lowercase().cmp(&b.machine.name.to_lowercase())));
+        machines.sort_by(|a, b| {
+            b.online.cmp(&a.online).then(
+                a.machine
+                    .name
+                    .to_lowercase()
+                    .cmp(&b.machine.name.to_lowercase()),
+            )
+        });
         let mut grants: Vec<GrantView> = s
             .grants
             .values()
             .map(|g| GrantView {
                 grant: g.clone(),
                 url: r.grant_url(&g.token),
-                machine_name: s.machines.get(&g.machine_id).map(|m| m.name.clone()).unwrap_or_else(|| "(removed)".into()),
+                machine_name: s
+                    .machines
+                    .get(&g.machine_id)
+                    .map(|m| m.name.clone())
+                    .unwrap_or_else(|| "(removed)".into()),
                 status: g.status(now).into(),
             })
             .collect();
@@ -1113,7 +1454,10 @@ pub fn overview(r: &Relay) -> Overview {
     Overview {
         machines,
         grants,
-        sessions: sessions.iter().map(|s| serde_json::to_value(s).unwrap()).collect(),
+        sessions: sessions
+            .iter()
+            .map(|s| serde_json::to_value(s).unwrap())
+            .collect(),
         install_url: r.install_url(),
         install_created: r.read_store(|s| s.enroll_created),
         server_version: crate::VERSION.into(),
@@ -1123,7 +1467,8 @@ pub fn overview(r: &Relay) -> Overview {
         user_name: "Administrator".into(),
         users,
         server_update: r.update_status(),
-        slow_after_pause_fix: (crate::install::tcp_stays_warm() == Some(false)).then(|| crate::install::TCP_WARM_FIX.to_string()),
+        slow_after_pause_fix: (crate::install::tcp_stays_warm() == Some(false))
+            .then(|| crate::install::TCP_WARM_FIX.to_string()),
     }
 }
 
@@ -1141,26 +1486,40 @@ struct NewUserReq {
     password: String,
 }
 
-async fn api_create_user(State(r): State<Shared>, headers: HeaderMap, Json(req): Json<NewUserReq>) -> Response {
+async fn api_create_user(
+    State(r): State<Shared>,
+    headers: HeaderMap,
+    Json(req): Json<NewUserReq>,
+) -> Response {
     if !is_admin(&r, &headers) {
         return unauthorized();
     }
     match r.with_store(|s| s.create_user(&req.name, &req.login, &req.password, now_secs())) {
         Ok(u) => {
-            let url = format!("{}/install/{}", r.cfg.public_url.trim_end_matches('/'), u.enroll_token);
+            let url = format!(
+                "{}/install/{}",
+                r.cfg.public_url.trim_end_matches('/'),
+                u.enroll_token
+            );
             Json(json!({"id": u.id, "login": u.login, "install_url": url})).into_response()
         }
         Err(e) => bad(e),
     }
 }
 
-async fn api_delete_user(State(r): State<Shared>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+async fn api_delete_user(
+    State(r): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
     if !is_admin(&r, &headers) {
         return unauthorized();
     }
     match r.with_store(|s| s.delete_user(&id)) {
         Ok(()) => {
-            r.kill_sessions("Your access was removed by the administrator", |s| s.user.as_deref() == Some(id.as_str()));
+            r.kill_sessions("Your access was removed by the administrator", |s| {
+                s.user.as_deref() == Some(id.as_str())
+            });
             Json(json!({"ok": true})).into_response()
         }
         Err(e) => bad(e),
@@ -1172,14 +1531,21 @@ struct PasswordReq {
     password: String,
 }
 
-async fn api_user_password(State(r): State<Shared>, headers: HeaderMap, Path(id): Path<String>, Json(req): Json<PasswordReq>) -> Response {
+async fn api_user_password(
+    State(r): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<PasswordReq>,
+) -> Response {
     if !is_admin(&r, &headers) {
         return unauthorized();
     }
     match r.with_store(|s| s.set_user_password(&id, &req.password)) {
         Ok(()) => {
             // A new password signs them out everywhere, open screens too.
-            r.kill_sessions("Your password was changed. Please sign in again", |s| s.user.as_deref() == Some(id.as_str()));
+            r.kill_sessions("Your password was changed. Please sign in again", |s| {
+                s.user.as_deref() == Some(id.as_str())
+            });
             Json(json!({"ok": true})).into_response()
         }
         Err(e) => bad(e),
@@ -1192,7 +1558,12 @@ struct OwnerReq {
     user_id: Option<String>,
 }
 
-async fn api_set_owner(State(r): State<Shared>, headers: HeaderMap, Path(id): Path<String>, Json(req): Json<OwnerReq>) -> Response {
+async fn api_set_owner(
+    State(r): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<OwnerReq>,
+) -> Response {
     if !is_admin(&r, &headers) {
         return unauthorized();
     }
@@ -1214,7 +1585,12 @@ struct RenameReq {
     name: String,
 }
 
-async fn api_rename(State(r): State<Shared>, headers: HeaderMap, Path(id): Path<String>, Json(req): Json<RenameReq>) -> Response {
+async fn api_rename(
+    State(r): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<RenameReq>,
+) -> Response {
     if !is_admin(&r, &headers) {
         return unauthorized();
     }
@@ -1229,7 +1605,12 @@ struct NotesReq {
     notes: String,
 }
 
-async fn api_notes(State(r): State<Shared>, headers: HeaderMap, Path(id): Path<String>, Json(req): Json<NotesReq>) -> Response {
+async fn api_notes(
+    State(r): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<NotesReq>,
+) -> Response {
     if !is_admin(&r, &headers) {
         return unauthorized();
     }
@@ -1240,8 +1621,14 @@ async fn api_notes(State(r): State<Shared>, headers: HeaderMap, Path(id): Path<S
 }
 
 /// Small pictures of a computer's screens (admin, or the person it belongs to).
-async fn api_preview(State(r): State<Shared>, headers: HeaderMap, Path(id): Path<String>) -> Response {
-    let Some(who) = who(&r, &headers) else { return unauthorized() };
+async fn api_preview(
+    State(r): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(who) = who(&r, &headers) else {
+        return unauthorized();
+    };
     if !r.read_store(|s| s.can_access(&who, &id)) {
         return (StatusCode::FORBIDDEN, "not your computer").into_response();
     }
@@ -1252,8 +1639,14 @@ async fn api_preview(State(r): State<Shared>, headers: HeaderMap, Path(id): Path
 }
 
 /// One screen of a computer at full size, for "Take screenshot" (same access as previews).
-async fn api_screenshot(State(r): State<Shared>, headers: HeaderMap, Path((id, index)): Path<(String, u8)>) -> Response {
-    let Some(who) = who(&r, &headers) else { return unauthorized() };
+async fn api_screenshot(
+    State(r): State<Shared>,
+    headers: HeaderMap,
+    Path((id, index)): Path<(String, u8)>,
+) -> Response {
+    let Some(who) = who(&r, &headers) else {
+        return unauthorized();
+    };
     if !r.read_store(|s| s.can_access(&who, &id)) {
         return (StatusCode::FORBIDDEN, "not your computer").into_response();
     }
@@ -1264,7 +1657,11 @@ async fn api_screenshot(State(r): State<Shared>, headers: HeaderMap, Path((id, i
 }
 
 /// Make a computer's helper install the published version now (administrator).
-async fn api_update_machine(State(r): State<Shared>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+async fn api_update_machine(
+    State(r): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
     if !is_admin(&r, &headers) {
         return unauthorized();
     }
@@ -1285,16 +1682,24 @@ async fn api_update_all(State(r): State<Shared>, headers: HeaderMap) -> Response
     Json(json!({"ok": true, "updating": r.force_update_all()})).into_response()
 }
 
-async fn api_remove_machine(State(r): State<Shared>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+async fn api_remove_machine(
+    State(r): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
     if !is_admin(&r, &headers) {
         return unauthorized();
     }
     match r.with_store(|s| s.remove_machine(&id)) {
         Ok(_) => {
-            r.kill_sessions("This computer was removed by the administrator", |s| s.machine_id == id);
+            r.kill_sessions("This computer was removed by the administrator", |s| {
+                s.machine_id == id
+            });
             r.load.lock().unwrap().remove(&id);
             if let Some(a) = r.agents.lock().unwrap().remove(&id) {
-                let _ = a.tx.send(AgentMsg::Rejected { reason: "removed by administrator".into() });
+                let _ = a.tx.send(AgentMsg::Rejected {
+                    reason: "removed by administrator".into(),
+                });
             }
             Json(json!({"ok": true})).into_response()
         }
@@ -1311,26 +1716,51 @@ pub struct GrantReq {
     pub label: String,
 }
 
-async fn api_create_grant(State(r): State<Shared>, headers: HeaderMap, Json(req): Json<GrantReq>) -> Response {
+async fn api_create_grant(
+    State(r): State<Shared>,
+    headers: HeaderMap,
+    Json(req): Json<GrantReq>,
+) -> Response {
     if !is_admin(&r, &headers) {
         return unauthorized();
     }
-    match r.with_store(|s| s.create_grant(&req.machine_id, req.minutes, req.view_only, &req.label, now_secs())) {
-        Ok(g) => Json(json!({"token": g.token, "url": r.grant_url(&g.token), "expires": g.expires})).into_response(),
+    match r.with_store(|s| {
+        s.create_grant(
+            &req.machine_id,
+            req.minutes,
+            req.view_only,
+            &req.label,
+            now_secs(),
+        )
+    }) {
+        Ok(g) => {
+            Json(json!({"token": g.token, "url": r.grant_url(&g.token), "expires": g.expires}))
+                .into_response()
+        }
         Err(e) => bad(e),
     }
 }
 
-async fn api_revoke(State(r): State<Shared>, headers: HeaderMap, Path(token): Path<String>) -> Response {
+async fn api_revoke(
+    State(r): State<Shared>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+) -> Response {
     if !is_admin(&r, &headers) {
         return unauthorized();
     }
     let changed = r.with_store(|s| s.revoke(&token));
-    let ended = r.kill_sessions("The administrator withdrew this access", |s| s.grant.as_deref() == Some(token.as_str()));
+    let ended = r.kill_sessions("The administrator withdrew this access", |s| {
+        s.grant.as_deref() == Some(token.as_str())
+    });
     Json(json!({"ok": true, "withdrawn": changed, "sessions_ended": ended})).into_response()
 }
 
-async fn api_end_session(State(r): State<Shared>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+async fn api_end_session(
+    State(r): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
     if !is_admin(&r, &headers) {
         return unauthorized();
     }
@@ -1344,7 +1774,9 @@ async fn api_check_update(State(r): State<Shared>, headers: HeaderMap) -> Respon
         return unauthorized();
     }
     if r.update_status().source.is_none() {
-        return bad("Automatic updates are off. Set \"update_from_github\" in the server settings.");
+        return bad(
+            "Automatic updates are off. Set \"update_from_github\" in the server settings.",
+        );
     }
     r.set_update_status(|s| s.checking = true);
     r.update_now.notify_one();
@@ -1377,7 +1809,11 @@ async fn api_guest_info(State(r): State<Shared>, Path(token): Path<String>) -> R
     });
     match info {
         Some(v) => Json(v).into_response(),
-        None => (StatusCode::NOT_FOUND, Json(json!({"error": "This link has expired or was withdrawn"}))).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "This link has expired or was withdrawn"})),
+        )
+            .into_response(),
     }
 }
 
@@ -1385,7 +1821,9 @@ async fn api_guest_info(State(r): State<Shared>, Path(token): Path<String>) -> R
 
 async fn ws_agent(State(r): State<Shared>, ws: WebSocketUpgrade) -> Response {
     // Room for a full-size screenshot (PNG up to `codec::SCREENSHOT_PNG_MAX`, base64).
-    ws.max_message_size(24 << 20).max_frame_size(24 << 20).on_upgrade(move |socket| agent_loop(r, socket))
+    ws.max_message_size(24 << 20)
+        .max_frame_size(24 << 20)
+        .on_upgrade(move |socket| agent_loop(r, socket))
 }
 
 async fn agent_loop(r: Shared, socket: WebSocket) {
@@ -1394,26 +1832,70 @@ async fn agent_loop(r: Shared, socket: WebSocket) {
         Ok(Some(Ok(Message::Text(t)))) => serde_json::from_str::<AgentMsg>(t.as_str()).ok(),
         _ => None,
     };
-    let Some(AgentMsg::Register { enroll_token, machine_id, secret, hostname, os, version, target, monitors }) = first else {
+    let Some(AgentMsg::Register {
+        enroll_token,
+        machine_id,
+        secret,
+        hostname,
+        os,
+        version,
+        target,
+        monitors,
+    }) = first
+    else {
         return;
     };
-    let info = HostInfo { hostname, os, version: version.clone(), target, monitors };
-    let result = r.with_store(|s| s.register(enroll_token.as_deref(), machine_id.as_deref(), secret.as_deref(), info, now_secs()));
+    let info = HostInfo {
+        hostname,
+        os,
+        version: version.clone(),
+        target,
+        monitors,
+    };
+    let result = r.with_store(|s| {
+        s.register(
+            enroll_token.as_deref(),
+            machine_id.as_deref(),
+            secret.as_deref(),
+            info,
+            now_secs(),
+        )
+    });
     let (id, secret, name) = match result {
         Ok(v) => v,
         Err(e) => {
-            let msg = AgentMsg::Rejected { reason: e.to_string() };
-            let _ = sink.send(Message::Text(serde_json::to_string(&msg).unwrap().into())).await;
+            let msg = AgentMsg::Rejected {
+                reason: e.to_string(),
+            };
+            let _ = sink
+                .send(Message::Text(serde_json::to_string(&msg).unwrap().into()))
+                .await;
             return;
         }
     };
-    let reply = AgentMsg::Registered { machine_id: id.clone(), secret, name: name.clone() };
-    if sink.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await.is_err() {
+    let reply = AgentMsg::Registered {
+        machine_id: id.clone(),
+        secret,
+        name: name.clone(),
+    };
+    if sink
+        .send(Message::Text(serde_json::to_string(&reply).unwrap().into()))
+        .await
+        .is_err()
+    {
         return;
     }
     let (tx, mut rx) = mpsc::unbounded_channel();
     let conn = random_token(8);
-    if let Some(old) = r.agents.lock().unwrap().insert(id.clone(), AgentConn { tx: tx.clone(), conn: conn.clone(), version: version.clone(), stats: None }) {
+    if let Some(old) = r.agents.lock().unwrap().insert(
+        id.clone(),
+        AgentConn {
+            tx: tx.clone(),
+            conn: conn.clone(),
+            version: version.clone(),
+            stats: None,
+        },
+    ) {
         drop(old); // an older connection of the same machine; it will notice and stop
     }
     log::info!("'{name}' online ({version})");
@@ -1427,7 +1909,10 @@ async fn agent_loop(r: Shared, socket: WebSocket) {
     if let Some(v) = r.release_version()
         && crate::version::is_newer(&v, &version)
     {
-        let _ = tx.send(AgentMsg::UpdateAvailable { version: v, force: false });
+        let _ = tx.send(AgentMsg::UpdateAvailable {
+            version: v,
+            force: false,
+        });
     }
     loop {
         tokio::select! {
@@ -1488,9 +1973,9 @@ async fn ws_host_session(
     let machine = q.get("machine").cloned().unwrap_or_default();
     let secret = q.get("secret").cloned().unwrap_or_default();
     let ok_secret = r.read_store(|s| {
-        s.machines
-            .get(&machine)
-            .is_some_and(|m| crate::util::constant_time_eq(&m.secret_hash, &sha256_hex(secret.as_bytes())))
+        s.machines.get(&machine).is_some_and(|m| {
+            crate::util::constant_time_eq(&m.secret_hash, &sha256_hex(secret.as_bytes()))
+        })
     });
     let pending = {
         let mut p = r.pending.lock().unwrap();
@@ -1502,9 +1987,10 @@ async fn ws_host_session(
     let Some(pending) = pending else {
         return (StatusCode::FORBIDDEN, "unknown session").into_response();
     };
-    ws.max_message_size(8 << 20).on_upgrade(move |socket| async move {
-        let _ = pending.tx.send(socket);
-    })
+    ws.max_message_size(8 << 20)
+        .on_upgrade(move |socket| async move {
+            let _ = pending.tx.send(socket);
+        })
 }
 
 async fn ws_view(
@@ -1527,10 +2013,15 @@ async fn ws_view(
         Who::Admin => None,
     };
     let view_only = q.get("view_only").is_some_and(|v| v == "1" || v == "true");
-    ws.max_message_size(1 << 20).on_upgrade(move |socket| viewer_loop(r, socket, machine, view_only, None, user, name))
+    ws.max_message_size(1 << 20)
+        .on_upgrade(move |socket| viewer_loop(r, socket, machine, view_only, None, user, name))
 }
 
-async fn ws_guest(State(r): State<Shared>, Path(token): Path<String>, ws: WebSocketUpgrade) -> Response {
+async fn ws_guest(
+    State(r): State<Shared>,
+    Path(token): Path<String>,
+    ws: WebSocketUpgrade,
+) -> Response {
     let now = now_secs();
     let grant = r.with_store(|s| {
         let g = s.grants.get_mut(&token).filter(|g| g.is_active(now))?;
@@ -1538,15 +2029,29 @@ async fn ws_guest(State(r): State<Shared>, Path(token): Path<String>, ws: WebSoc
         Some((g.machine_id.clone(), g.view_only, g.label.clone()))
     });
     let Some((machine, view_only, label)) = grant else {
-        return (StatusCode::FORBIDDEN, "This link has expired or was withdrawn").into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            "This link has expired or was withdrawn",
+        )
+            .into_response();
     };
-    let who = if label.is_empty() { "Temporary link".to_string() } else { format!("Link: {label}") };
-    ws.max_message_size(1 << 20).on_upgrade(move |socket| viewer_loop(r, socket, machine, view_only, Some(token), None, who))
+    let who = if label.is_empty() {
+        "Temporary link".to_string()
+    } else {
+        format!("Link: {label}")
+    };
+    ws.max_message_size(1 << 20).on_upgrade(move |socket| {
+        viewer_loop(r, socket, machine, view_only, Some(token), None, who)
+    })
 }
 
 async fn send_closed(sink: &mut futures_util::stream::SplitSink<WebSocket, Message>, reason: &str) {
-    let m = SessionMsg::Closed { reason: reason.to_string() };
-    let _ = sink.send(Message::Text(serde_json::to_string(&m).unwrap().into())).await;
+    let m = SessionMsg::Closed {
+        reason: reason.to_string(),
+    };
+    let _ = sink
+        .send(Message::Text(serde_json::to_string(&m).unwrap().into()))
+        .await;
     let _ = sink.close().await;
 }
 
@@ -1589,20 +2094,33 @@ async fn viewer_loop(
     // A view-only temporary link stays view-only; everyone else may switch.
     let locked = grant.is_some() && view_only;
     let mut view_only = view_only;
-    let (session_id, host, mut kill) = match r.open_session(&machine, view_only, grant, user, who).await {
-        Ok(x) => x,
-        Err(reason) => {
-            send_closed(&mut vs, &reason).await;
-            return;
-        }
+    let (session_id, host, mut kill) =
+        match r.open_session(&machine, view_only, grant, user, who).await {
+            Ok(x) => x,
+            Err(reason) => {
+                send_closed(&mut vs, &reason).await;
+                return;
+            }
+        };
+    let mode = |v: bool| {
+        Message::Text(
+            serde_json::to_string(&SessionMsg::ViewMode {
+                view_only: v,
+                locked,
+            })
+            .unwrap()
+            .into(),
+        )
     };
-    let mode = |v: bool| Message::Text(serde_json::to_string(&SessionMsg::ViewMode { view_only: v, locked }).unwrap().into());
     let _ = vs.send(mode(view_only)).await;
     let (mut hs, mut hr) = host.split();
     // Direct connections allowed: both sides learn where to ask for their address.
     let stun_port = r.stun_live.load(Ordering::Relaxed);
     if stun_port != 0 {
-        let info = SessionMsg::DirectInfo { stun_port, stun_servers: r.cfg.extra_stun_servers.clone() };
+        let info = SessionMsg::DirectInfo {
+            stun_port,
+            stun_servers: r.cfg.extra_stun_servers.clone(),
+        };
         let info = Message::Text(serde_json::to_string(&info).unwrap().into());
         let _ = vs.send(info.clone()).await;
         let _ = hs.send(info).await;
@@ -1689,8 +2207,12 @@ async fn viewer_loop(
         }
     };
     r.sessions.lock().unwrap().remove(&session_id);
-    let bye = SessionMsg::Closed { reason: "viewer left".into() };
-    let _ = hs.send(Message::Text(serde_json::to_string(&bye).unwrap().into())).await;
+    let bye = SessionMsg::Closed {
+        reason: "viewer left".into(),
+    };
+    let _ = hs
+        .send(Message::Text(serde_json::to_string(&bye).unwrap().into()))
+        .await;
     let _ = hs.close().await;
     drop(to_viewer);
     let vs = match finished {
@@ -1716,7 +2238,10 @@ mod tests {
 
     #[test]
     fn copied_text_only_flows_in_control_sessions() {
-        let clip = serde_json::to_string(&SessionMsg::Clipboard { text: "secret".into() }).unwrap();
+        let clip = serde_json::to_string(&SessionMsg::Clipboard {
+            text: "secret".into(),
+        })
+        .unwrap();
         assert!(!viewer_message_allowed(&clip, true));
         assert!(viewer_message_allowed(&clip, false));
         assert!(!host_message_allowed(&clip, true));
@@ -1729,17 +2254,32 @@ mod tests {
     fn view_only_blocks_input_but_not_acks() {
         let input = r#"{"t":"input","event":{"k":"text","text":"rm -rf"}}"#;
         let ack = r#"{"t":"ack","seq":5}"#;
-        let quality = serde_json::to_string(&SessionMsg::Quality { quality: crate::quality::Quality::default() }).unwrap();
+        let quality = serde_json::to_string(&SessionMsg::Quality {
+            quality: crate::quality::Quality::default(),
+        })
+        .unwrap();
         assert!(!viewer_message_allowed(input, true));
         assert!(viewer_message_allowed(input, false));
         assert!(viewer_message_allowed(ack, true));
         assert!(viewer_message_allowed(&quality, true));
         assert!(!viewer_message_allowed("not json", false));
-        assert!(!viewer_message_allowed(r#"{"t":"closed","reason":"x"}"#, false), "viewer can't fake relay messages");
-        assert!(!viewer_message_allowed(r#"{"t":"direct_info","stun_port":1}"#, false), "only the relay allows direct connections");
+        assert!(
+            !viewer_message_allowed(r#"{"t":"closed","reason":"x"}"#, false),
+            "viewer can't fake relay messages"
+        );
+        assert!(
+            !viewer_message_allowed(r#"{"t":"direct_info","stun_port":1}"#, false),
+            "only the relay allows direct connections"
+        );
         let offer = r#"{"t":"direct_offer","fp":"ab","addrs":["192.168.1.2:5000"]}"#;
-        assert!(viewer_message_allowed(offer, true), "view-only sessions may go direct too (pictures only)");
-        assert!(viewer_message_allowed(r#"{"t":"path_switch","direct":true}"#, true));
+        assert!(
+            viewer_message_allowed(offer, true),
+            "view-only sessions may go direct too (pictures only)"
+        );
+        assert!(viewer_message_allowed(
+            r#"{"t":"path_switch","direct":true}"#,
+            true
+        ));
         let ping = r#"{"t":"input","event":{"k":"ping","mon":0,"x":0.5,"y":0.5}}"#;
         assert!(!viewer_message_allowed(ping, true), "view-only can't ping");
         assert!(viewer_message_allowed(ping, false));
@@ -1752,12 +2292,24 @@ mod tests {
         assert!(sh.contains("TOKEN='abc'"));
         assert!(sh.contains("install --server"));
         let ps = windows_script("https://rd.example.com", "abc");
-        assert!(ps.contains("Tls12"), "Server 2016 needs TLS 1.2 switched on");
+        assert!(
+            ps.contains("Tls12"),
+            "Server 2016 needs TLS 1.2 switched on"
+        );
         assert!(ps.contains("RunAs"));
         assert!(ps.contains("farlink-host.exe"));
-        assert!(ps.contains("Add-MpPreference"), "allows the Farlink folders in Defender");
-        assert!(ps.contains("Test-Path $tmp"), "notices when antivirus removes the download");
-        assert!(ps.contains("$LASTEXITCODE"), "does not claim success when the installer failed");
+        assert!(
+            ps.contains("Add-MpPreference"),
+            "allows the Farlink folders in Defender"
+        );
+        assert!(
+            ps.contains("Test-Path $tmp"),
+            "notices when antivirus removes the download"
+        );
+        assert!(
+            ps.contains("$LASTEXITCODE"),
+            "does not claim success when the installer failed"
+        );
         assert!(ps.find("Done.").unwrap() > ps.find("Get-Service FarlinkHost").unwrap());
         assert!(windows_cmd("https://x.y", "t").contains("https://x.y/install/t/windows.ps1"));
     }
@@ -1772,6 +2324,9 @@ mod tests {
 
     #[test]
     fn escaping() {
-        assert_eq!(html_escape("<b>\"x\"&'"), "&lt;b&gt;&quot;x&quot;&amp;&#39;");
+        assert_eq!(
+            html_escape("<b>\"x\"&'"),
+            "&lt;b&gt;&quot;x&quot;&amp;&#39;"
+        );
     }
 }

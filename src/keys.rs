@@ -134,9 +134,17 @@ mod tests {
     fn keysyms_name_their_keys_back() {
         for name in all_names() {
             let ks = keysym(&name).unwrap();
-            assert_eq!(name_for_keysym(ks).as_deref(), Some(name.as_str()), "{name}");
+            assert_eq!(
+                name_for_keysym(ks).as_deref(),
+                Some(name.as_str()),
+                "{name}"
+            );
         }
-        assert_eq!(name_for_keysym(0x61).as_deref(), Some("A"), "lower-case letter");
+        assert_eq!(
+            name_for_keysym(0x61).as_deref(),
+            Some("A"),
+            "lower-case letter"
+        );
         assert_eq!(name_for_keysym(0xfe20).as_deref(), Some("Tab"), "Shift+Tab");
         assert_eq!(name_for_keysym(0xffea).as_deref(), Some("Alt"), "right Alt");
         assert_eq!(name_for_keysym(0xffc1).as_deref(), Some("F4"));

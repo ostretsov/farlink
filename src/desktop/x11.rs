@@ -13,8 +13,8 @@ use x11rb::protocol::damage::{ConnectionExt as _, ReportLevel};
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xproto::{
-    BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, ConnectionExt as _, ImageFormat, KEY_PRESS_EVENT, KEY_RELEASE_EVENT,
-    MOTION_NOTIFY_EVENT,
+    BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, ConnectionExt as _, ImageFormat, KEY_PRESS_EVENT,
+    KEY_RELEASE_EVENT, MOTION_NOTIFY_EVENT,
 };
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
@@ -48,10 +48,21 @@ impl X11Desktop {
             "cannot open the X11 display (is DISPLAY set and is the session X11, not Wayland?)",
         )?;
         let screen = &conn.setup().roots[screen_num];
-        let (root, screen_w, screen_h) = (screen.root, screen.width_in_pixels, screen.height_in_pixels);
-        conn.xtest_get_version(2, 2)?.reply().context("XTest extension missing")?;
-        let has_xfixes = conn.xfixes_query_version(5, 0).ok().and_then(|c| c.reply().ok()).is_some();
-        let damage = match conn.damage_query_version(1, 1).ok().and_then(|c| c.reply().ok()) {
+        let (root, screen_w, screen_h) =
+            (screen.root, screen.width_in_pixels, screen.height_in_pixels);
+        conn.xtest_get_version(2, 2)?
+            .reply()
+            .context("XTest extension missing")?;
+        let has_xfixes = conn
+            .xfixes_query_version(5, 0)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some();
+        let damage = match conn
+            .damage_query_version(1, 1)
+            .ok()
+            .and_then(|c| c.reply().ok())
+        {
             Some(_) => {
                 let id = conn.generate_id()?;
                 conn.damage_create(id, root, ReportLevel::NON_EMPTY)?;
@@ -81,7 +92,10 @@ impl X11Desktop {
     fn load_keymap(&mut self) -> Result<()> {
         let setup = self.conn.setup();
         let (min, max) = (setup.min_keycode, setup.max_keycode);
-        let reply = self.conn.get_keyboard_mapping(min, max - min + 1)?.reply()?;
+        let reply = self
+            .conn
+            .get_keyboard_mapping(min, max - min + 1)?
+            .reply()?;
         let per = reply.keysyms_per_keycode as usize;
         self.keymap.clear();
         self.spare = None;
@@ -102,7 +116,8 @@ impl X11Desktop {
     }
 
     fn fake(&self, kind: u8, detail: u8, x: i16, y: i16) -> Result<()> {
-        self.conn.xtest_fake_input(kind, detail, x11rb::CURRENT_TIME, self.root, x, y, 0)?;
+        self.conn
+            .xtest_fake_input(kind, detail, x11rb::CURRENT_TIME, self.root, x, y, 0)?;
         Ok(())
     }
 
@@ -122,7 +137,16 @@ impl X11Desktop {
     }
 
     fn key_code(&self, kc: u8, down: bool) -> Result<()> {
-        self.fake(if down { KEY_PRESS_EVENT } else { KEY_RELEASE_EVENT }, kc, 0, 0)
+        self.fake(
+            if down {
+                KEY_PRESS_EVENT
+            } else {
+                KEY_RELEASE_EVENT
+            },
+            kc,
+            0,
+            0,
+        )
     }
 
     fn type_char(&mut self, c: char) -> Result<()> {
@@ -140,7 +164,9 @@ impl X11Desktop {
             return Ok(());
         }
         // Not on the keyboard layout: put it on the spare key for a moment.
-        let Some(spare) = self.spare else { return Ok(()) };
+        let Some(spare) = self.spare else {
+            return Ok(());
+        };
         self.conn.change_keyboard_mapping(1, spare, 2, &[ks, ks])?;
         self.conn.get_input_focus()?.reply()?; // make sure the mapping is applied
         self.key_code(spare, true)?;
@@ -151,7 +177,9 @@ impl X11Desktop {
     }
 
     fn named_key(&self, name: &str, down: bool) -> Result<()> {
-        let Some(ks) = keys::keysym(name) else { return Ok(()) };
+        let Some(ks) = keys::keysym(name) else {
+            return Ok(());
+        };
         if let Some(&(kc, _)) = self.keymap.get(&ks) {
             self.key_code(kc, down)?;
         }
@@ -161,7 +189,9 @@ impl X11Desktop {
 
 impl Desktop for X11Desktop {
     fn changed(&mut self) -> bool {
-        let Some(damage) = self.damage else { return true };
+        let Some(damage) = self.damage else {
+            return true;
+        };
         let mut changed = self.first;
         self.first = false;
         let mut got_damage = false;
@@ -190,7 +220,11 @@ impl Desktop for X11Desktop {
 
     fn monitors(&mut self) -> Result<Vec<MonitorInfo>> {
         let mut out = Vec::new();
-        if let Ok(reply) = self.conn.randr_get_monitors(self.root, true).and_then(|c| Ok(c.reply())) {
+        if let Ok(reply) = self
+            .conn
+            .randr_get_monitors(self.root, true)
+            .and_then(|c| Ok(c.reply()))
+        {
             if let Ok(reply) = reply {
                 let mut mons = reply.monitors;
                 // Left-to-right, top-to-bottom, like the person sees them.
@@ -232,7 +266,15 @@ impl Desktop for X11Desktop {
     fn capture(&mut self, m: &MonitorInfo) -> Result<Frame> {
         let reply = self
             .conn
-            .get_image(ImageFormat::Z_PIXMAP, self.root, m.x as i16, m.y as i16, m.width as u16, m.height as u16, !0)?
+            .get_image(
+                ImageFormat::Z_PIXMAP,
+                self.root,
+                m.x as i16,
+                m.y as i16,
+                m.width as u16,
+                m.height as u16,
+                !0,
+            )?
             .reply()
             .context("reading the screen")?;
         let need = (m.width * m.height * 4) as usize;
@@ -242,12 +284,22 @@ impl Desktop for X11Desktop {
         let mut frame = Frame::from_bgra(m.width, m.height, &reply.data, m.width as usize * 4);
         if self.has_xfixes
             && self.pointer_in_picture
-            && let Ok(cur) = self.conn.xfixes_get_cursor_image().and_then(|c| Ok(c.reply()))
+            && let Ok(cur) = self
+                .conn
+                .xfixes_get_cursor_image()
+                .and_then(|c| Ok(c.reply()))
             && let Ok(cur) = cur
         {
             let left = cur.x as i32 - cur.xhot as i32 - m.x;
             let top = cur.y as i32 - cur.yhot as i32 - m.y;
-            draw_cursor(&mut frame, left, top, cur.width as u32, cur.height as u32, &cur.cursor_image);
+            draw_cursor(
+                &mut frame,
+                left,
+                top,
+                cur.width as u32,
+                cur.height as u32,
+                &cur.cursor_image,
+            );
         }
         Ok(frame)
     }
@@ -277,7 +329,11 @@ impl Desktop for X11Desktop {
                 key
             }
         };
-        Some(PointerPos { x: cur.x as i32, y: cur.y as i32, shape: key })
+        Some(PointerPos {
+            x: cur.x as i32,
+            y: cur.y as i32,
+            shape: key,
+        })
     }
 
     fn pointer_image(&mut self) -> Option<PointerImage> {
@@ -287,17 +343,33 @@ impl Desktop for X11Desktop {
     fn input(&mut self, monitors: &[MonitorInfo], ev: &InputEvent) -> Result<()> {
         match ev {
             InputEvent::MouseMove { mon, x, y } => self.move_to(monitors, *mon, *x, *y)?,
-            InputEvent::MouseButton { mon, x, y, button, down } => {
+            InputEvent::MouseButton {
+                mon,
+                x,
+                y,
+                button,
+                down,
+            } => {
                 self.move_to(monitors, *mon, *x, *y)?;
                 let b = match button {
                     MouseButton::Left => 1,
                     MouseButton::Middle => 2,
                     MouseButton::Right => 3,
                 };
-                self.fake(if *down { BUTTON_PRESS_EVENT } else { BUTTON_RELEASE_EVENT }, b, 0, 0)?;
+                self.fake(
+                    if *down {
+                        BUTTON_PRESS_EVENT
+                    } else {
+                        BUTTON_RELEASE_EVENT
+                    },
+                    b,
+                    0,
+                    0,
+                )?;
             }
             InputEvent::Scroll { dx, dy } => {
-                let steps = |v: f32| (v.abs().round() as u32).clamp(if v != 0.0 { 1 } else { 0 }, 20);
+                let steps =
+                    |v: f32| (v.abs().round() as u32).clamp(if v != 0.0 { 1 } else { 0 }, 20);
                 if *dy > 0.0 {
                     self.tap_button(4, steps(*dy))?;
                 } else if *dy < 0.0 {
@@ -316,7 +388,14 @@ impl Desktop for X11Desktop {
                 }
             }
             InputEvent::CtrlAltDel => {
-                for (k, d) in [("Control", true), ("Alt", true), ("Delete", true), ("Delete", false), ("Alt", false), ("Control", false)] {
+                for (k, d) in [
+                    ("Control", true),
+                    ("Alt", true),
+                    ("Delete", true),
+                    ("Delete", false),
+                    ("Alt", false),
+                    ("Control", false),
+                ] {
                     self.named_key(k, d)?;
                 }
             }
@@ -346,9 +425,20 @@ mod tests {
         for m in &mons {
             let f = d.capture(m).unwrap();
             assert_eq!((f.width, f.height), (m.width, m.height));
-            assert!(f.rgba.chunks_exact(4).any(|p| p[0] != 0 || p[1] != 0 || p[2] != 0), "picture is not all black");
-            println!("{} {}x{} at {},{} primary={}", m.name, m.width, m.height, m.x, m.y, m.primary);
+            assert!(
+                f.rgba
+                    .chunks_exact(4)
+                    .any(|p| p[0] != 0 || p[1] != 0 || p[2] != 0),
+                "picture is not all black"
+            );
+            println!(
+                "{} {}x{} at {},{} primary={}",
+                m.name, m.width, m.height, m.x, m.y, m.primary
+            );
         }
-        assert!(keys::keysym("A").is_some_and(|ks| d.keymap.contains_key(&ks)), "keyboard map loaded");
+        assert!(
+            keys::keysym("A").is_some_and(|ks| d.keymap.contains_key(&ks)),
+            "keyboard map loaded"
+        );
     }
 }
